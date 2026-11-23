@@ -5,6 +5,7 @@
 -- | Rider device (anonymous auth user)    | 90 days after last activity   |
 -- | alert_delivery                        | 30 days                       |
 -- | vehicle_event, boarding_event         | 30 days                       |
+-- | Anonymous user without a device row   | 90 days after last sign-in    |
 -- | Failed invite redemption attempts     | 1 day                         |
 -- | route_recording.track                 | until converted (check constraint) |
 -- Raw vehicle positions are not stored here (Traccar keeps them, 30 days).
@@ -29,6 +30,13 @@ begin
      and u.is_anonymous
      and d.last_seen_at < now() - interval '90 days';
   delete from public.device d where d.last_seen_at < now() - interval '90 days';
+
+  -- Anonymous users that never registered a device (public routes only):
+  -- delete 90 days after their last sign-in. Their sessions go with them.
+  delete from auth.users u
+   where u.is_anonymous
+     and coalesce(u.last_sign_in_at, u.created_at) < now() - interval '90 days'
+     and not exists (select 1 from public.device d where d.id = u.id);
 end;
 $$;
 

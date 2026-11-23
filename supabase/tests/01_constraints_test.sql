@@ -2,7 +2,7 @@
 -- Uses the demo operator from seed.sql.
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(22);
+select plan(24);
 
 -- Every table in public has RLS; anon has no write privileges.
 select is_empty(
@@ -98,6 +98,19 @@ select throws_ok(
   $$ update public.stop_event set state = 'departed', departed_at = now()
       where trip_instance_id = 'd0000000-0000-4000-8000-00000000a001' and stop_sequence = 3 $$,
   '23514', null, 'departed requires arrived_at'
+);
+
+update public.stop_event set state = 'arrived', arrived_at = now()
+ where trip_instance_id = 'd0000000-0000-4000-8000-00000000a001' and stop_sequence = 4;
+select throws_ok(
+  $$ update public.stop_event set state = 'passed', passed_at = now(), arrived_at = null
+      where trip_instance_id = 'd0000000-0000-4000-8000-00000000a001' and stop_sequence = 4 $$,
+  '23514', null, 'an arrived stop cannot become passed, even when arrived_at is cleared'
+);
+select is_empty(
+  $$ select p.proname from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'private' and (p.proacl is null or array_to_string(p.proacl, ',') ~ '(^|,)=') $$,
+  'no function in private is executable by PUBLIC'
 );
 
 -- alert_delivery: one alert per subscription, trip instance, stop and kind.

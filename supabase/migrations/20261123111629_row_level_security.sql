@@ -273,6 +273,50 @@ $$;
 revoke truncate, references, trigger, maintain on all tables in schema public from anon, authenticated;
 revoke insert, update, delete on all tables in schema public from anon;
 
+-- The same for tables added by later migrations.
+alter default privileges for role postgres in schema public
+  revoke truncate, references, trigger, maintain on tables from anon, authenticated;
+alter default privileges for role postgres in schema public
+  revoke insert, update, delete on tables from anon;
+
+-- Access helpers used in policies. Nothing else in `private` is executable by
+-- the API roles.
+revoke execute on all functions in schema private from public;
+grant execute on function
+  private.is_i18n_text(jsonb),
+  private.has_role(uuid, public.staff_role_kind[]),
+  private.is_staff(uuid),
+  private.can_edit(uuid),
+  private.is_owner(uuid),
+  private.route_access(uuid),
+  private.pattern_access(uuid),
+  private.stop_access(uuid),
+  private.shape_access(uuid),
+  private.calendar_access(uuid),
+  private.can_see_operator(uuid),
+  private.is_member(uuid),
+  private.route_topic_access(text)
+to anon, authenticated;
+
+-- Owners edit how their operator looks and behaves, not its slug or plan
+-- (onboarding and billing use the service role).
+revoke update on public.operator from authenticated;
+grant update (name, timezone, languages, branding, default_visibility, boarding_check_enabled)
+  on public.operator to authenticated;
+
+-- traccar_device_id is unique across all operators and decides whose bus a
+-- tracker's positions belong to, so only the service role (onboarding) sets
+-- it. Otherwise an editor could claim another operator's tracker.
+revoke insert, update on public.vehicle from authenticated;
+grant insert (id, operator_id, name, capacity, active) on public.vehicle to authenticated;
+grant update (name, capacity, active) on public.vehicle to authenticated;
+
+-- Invite codes are created only by public.create_invite_code (random code,
+-- hash). Editors may relabel, change limits or revoke, not set hashes or
+-- reset the use counter.
+revoke insert, update on public.invite_code from authenticated;
+grant update (label, expires_at, max_uses, revoked_at) on public.invite_code to authenticated;
+
 -- The exact stop location is hidden from riders who may see arrival times
 -- only. Column privileges: everyone reads stop rows without `location`;
 -- `public.stop_location` returns locations by access level.
@@ -403,11 +447,23 @@ create policy "owners manage vehicle credentials" on public.vehicle_credential
   using (private.is_owner(operator_id))
   with check (private.is_owner(operator_id));
 
--- Drivers record routes; editors turn them into patterns.
-create policy "staff manage route recordings" on public.route_recording
-  for all to authenticated
+-- Drivers record routes; editors turn them into patterns and delete them.
+create policy "staff read route recordings" on public.route_recording
+  for select to authenticated
+  using (private.is_staff(operator_id));
+
+create policy "staff record routes" on public.route_recording
+  for insert to authenticated
+  with check (private.is_staff(operator_id));
+
+create policy "staff update route recordings" on public.route_recording
+  for update to authenticated
   using (private.is_staff(operator_id))
   with check (private.is_staff(operator_id));
+
+create policy "editors delete route recordings" on public.route_recording
+  for delete to authenticated
+  using (private.can_edit(operator_id));
 
 -- -----------------------------------------------------------------------------
 -- Live operation
@@ -425,7 +481,7 @@ create policy "trip instances of visible routes" on public.trip_instance
   );
 
 -- Drivers start trips ("Start morning route", "Start live trip").
-create policy "staff start and update trips" on public.trip_instance
+create policy "staff start trips" on public.trip_instance
   for insert to authenticated
   with check (private.is_staff(operator_id));
 
@@ -529,9 +585,8 @@ create policy "own subscriptions" on public.subscription
   using (device_id = (select auth.uid()))
   with check (device_id = (select auth.uid()) and private.pattern_access(pattern_id) >= 1);
 
-create policy "editors read subscriptions" on public.subscription
-  for select to authenticated
-  using (private.can_edit(operator_id));
+-- Staff do not read subscriptions: device + stop would hint at where a
+-- family lives. Aggregate counts can come later through a view.
 
 create policy "own alert deliveries" on public.alert_delivery
   for select to authenticated

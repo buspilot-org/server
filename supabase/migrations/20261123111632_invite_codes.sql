@@ -53,8 +53,10 @@ alter table private.invite_redemption_failure enable row level security;
 revoke all on private.invite_redemption_failure from public, anon, authenticated;
 
 -- -----------------------------------------------------------------------------
--- Create a code (editors). Runs with the caller's rights, so RLS applies.
--- Returns the plain code once; it cannot be retrieved later.
+-- Create a code (editors). Security definer because API roles cannot insert
+-- into invite_code directly (they could otherwise pick weak codes); the
+-- function checks the editor role itself. Returns the plain code once; it
+-- cannot be retrieved later.
 -- -----------------------------------------------------------------------------
 
 create function public.create_invite_code(
@@ -66,7 +68,7 @@ create function public.create_invite_code(
 returns table (invite_code_id uuid, code text)
 language plpgsql
 volatile
-security invoker
+security definer
 set search_path = ''
 as $$
 declare
@@ -100,7 +102,11 @@ grant execute on function public.create_invite_code(uuid, text, timestamptz, int
 --   already_member  the device already has an active membership in the audience
 --   invalid         unknown, expired, revoked or used-up code (not told apart,
 --                   so the result does not reveal whether a code exists)
---   rate_limited    10 failed attempts within the last hour
+--   revoked         the device's membership in this audience was revoked;
+--                   rejoining needs the operator (a new membership)
+--   rate_limited    10 failed attempts within the last hour (per user; a new
+--                   anonymous sign-in starts a new count, so the sign-in
+--                   CAPTCHA is the real limit — server.md)
 -- Creates the device row if the app has not done so yet.
 create function public.redeem_invite_code(p_code text)
 returns table (status text, operator_id uuid, audience_id uuid)
@@ -117,6 +123,10 @@ begin
   if v_uid is null then
     raise exception 'sign in (anonymously) first' using errcode = 'insufficient_privilege';
   end if;
+
+  -- Serialise attempts of the same user so parallel calls cannot exceed the
+  -- limit.
+  perform pg_advisory_xact_lock(hashtextextended('redeem_invite_code:' || v_uid::text, 0));
 
   select count(*) into v_failures
     from private.invite_redemption_failure f
@@ -148,6 +158,16 @@ begin
     select 1 from public.membership m
      where m.device_id = v_uid
        and m.audience_id = v_invite.audience_id
+       and m.revoked_at is not null
+  ) then
+    return query select 'revoked'::text, null::uuid, null::uuid;
+    return;
+  end if;
+
+  if exists (
+    select 1 from public.membership m
+     where m.device_id = v_uid
+       and m.audience_id = v_invite.audience_id
        and m.revoked_at is null
   ) then
     return query select 'already_member'::text, v_invite.operator_id, v_invite.audience_id;
@@ -165,3 +185,52 @@ $$;
 
 revoke execute on function public.redeem_invite_code(text) from public, anon;
 grant execute on function public.redeem_invite_code(text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- Revoking or leaving a membership removes the device's subscriptions to
+-- routes it can no longer see, so the engine stops sending alerts.
+-- -----------------------------------------------------------------------------
+
+create function private.membership_drop_subscriptions()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if tg_op = 'UPDATE' and not (old.revoked_at is null and new.revoked_at is not null) then
+    return new;
+  end if;
+
+  delete from public.subscription s
+   using public.trip_pattern p
+   join public.route r on r.id = p.route_id
+   join public.operator o on o.id = r.operator_id
+   where s.device_id = old.device_id
+     and p.id = s.pattern_id
+     -- a route of the audience that was left
+     and exists (
+       select 1 from public.audience_route ar
+        where ar.audience_id = old.audience_id and ar.route_id = r.id
+     )
+     -- and not visible any more: not public, no other active membership
+     and not (r.active and coalesce(r.visibility, o.default_visibility) = 'public')
+     and not exists (
+       select 1
+         from public.membership m
+         join public.audience_route ar on ar.audience_id = m.audience_id
+        where m.device_id = old.device_id
+          and m.id <> old.id
+          and m.revoked_at is null
+          and ar.route_id = r.id
+     );
+
+  return coalesce(new, old);
+end;
+$$;
+
+create trigger membership_drop_subscriptions
+  after update of revoked_at or delete on public.membership
+  for each row execute function private.membership_drop_subscriptions();
+
+revoke execute on all functions in schema private from public;

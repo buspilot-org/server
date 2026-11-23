@@ -15,7 +15,7 @@
 --   Active trip instance with a vehicle state on A1, A2, A3 and C1.
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(59);
+select plan(70);
 
 -- Users ----------------------------------------------------------------------
 insert into auth.users (id, email, is_anonymous) values
@@ -361,6 +361,10 @@ select is_empty(
   $$ select 1 from public.route where operator_id = 'd0000000-0000-4000-8000-000000000001' $$,
   'anon sees nothing of the demo school (invited routes only)'
 );
+select is_empty(
+  $$ select 1 from realtime.messages $$,
+  'anon reads no realtime messages directly'
+);
 select throws_ok(
   $$ select * from public.redeem_invite_code('TEST-A1') $$,
   '42501', null, 'anon cannot redeem invite codes (sign in anonymously first)'
@@ -433,7 +437,32 @@ select throws_ok(
      values ('a0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a4', 'editor') $$,
   '42501', null, 'editor cannot manage staff'
 );
-update public.operator set plan = 'pro' where id = 'a0000000-0000-4000-8000-000000000001';
+update public.operator set name = '{"en": "renamed"}' where id = 'a0000000-0000-4000-8000-000000000001';
+select throws_ok(
+  $$ insert into public.invite_code (operator_id, audience_id, code_hash)
+     values ('a0000000-0000-4000-8000-000000000001', 'a5000000-0000-4000-8000-000000000001',
+             private.hash_invite_code('AAAAA')) $$,
+  '42501', null, 'editor cannot insert invite codes with a chosen hash'
+);
+select throws_ok(
+  $$ update public.invite_code set uses = 0 $$,
+  '42501', null, 'editor cannot reset the use counter of invite codes'
+);
+select lives_ok(
+  $$ update public.invite_code set revoked_at = now() where audience_id = 'a5000000-0000-4000-8000-000000000001' $$,
+  'editor can revoke invite codes'
+);
+select throws_ok(
+  $$ insert into public.vehicle (operator_id, name, traccar_device_id)
+     values ('a0000000-0000-4000-8000-000000000001', 'bus', '99999999') $$,
+  '42501', null, 'editor cannot set traccar_device_id (service role only)'
+);
+select lives_ok(
+  $$ insert into public.vehicle (operator_id, name) values ('a0000000-0000-4000-8000-000000000001', 'bus 4') $$,
+  'editor can add a vehicle'
+);
+update public.membership set revoked_at = now()
+ where device_id = 'f0000000-0000-4000-8000-000000000002' and revoked_at is null;
 
 -- owner
 select set_config('request.jwt.claims', '{"sub": "e0000000-0000-4000-8000-0000000000a1", "role": "authenticated"}', true);
@@ -452,6 +481,20 @@ select throws_ok(
   $$ insert into public.staff_role (operator_id, user_id, role)
      values ('b0000000-0000-4000-8000-000000000001', 'e0000000-0000-4000-8000-0000000000a1', 'owner') $$,
   '42501', null, 'owner cannot grant itself a role at another operator'
+);
+
+select throws_ok(
+  $$ update public.operator set plan = 'enterprise' where id = 'a0000000-0000-4000-8000-000000000001' $$,
+  '42501', null, 'owner cannot change the plan'
+);
+select lives_ok(
+  $$ update public.staff_role set role = 'editor'
+      where user_id = 'e0000000-0000-4000-8000-0000000000a4' $$,
+  'owner can change another staff member''s role'
+);
+select throws_ok(
+  $$ delete from public.staff_role where user_id = 'e0000000-0000-4000-8000-0000000000a1' $$,
+  '23514', null, 'the last owner cannot remove itself'
 );
 
 -- owner of operator B
@@ -481,7 +524,16 @@ select is(
 select is(
   (select plan from public.operator where id = 'a0000000-0000-4000-8000-000000000001'),
   'demo',
+  'plan is unchanged'
+);
+select is(
+  (select name ->> 'en' from public.operator where id = 'a0000000-0000-4000-8000-000000000001'),
+  'A',
   'editor''s update of the operator changed nothing (owners only)'
+);
+select is_empty(
+  $$ select 1 from public.subscription where device_id = 'f0000000-0000-4000-8000-000000000002' $$,
+  'revoking rider2''s membership removed its subscription to A2'
 );
 
 select * from finish();

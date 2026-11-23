@@ -2,7 +2,7 @@
 -- seed.sql and a few test codes.
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(15);
+select plan(19);
 
 insert into auth.users (id, is_anonymous) values
   ('f0000000-0000-4000-8000-0000000000d1', true),
@@ -56,6 +56,37 @@ select is(
   (select uses from public.invite_code where code_hash = private.hash_invite_code('DEMO-KOBE-2026')),
   1,
   'uses counts new memberships only'
+);
+
+-- Revoked members cannot rejoin with the same code.
+update public.membership set revoked_at = now()
+ where device_id = 'f0000000-0000-4000-8000-0000000000d1';
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub": "f0000000-0000-4000-8000-0000000000d1", "role": "authenticated", "is_anonymous": true}', true);
+select is((select status from public.redeem_invite_code('DEMO-KOBE-2026')), 'revoked', 'a revoked member cannot rejoin');
+select is_empty(
+  $$ select 1 from public.route where operator_id = 'd0000000-0000-4000-8000-000000000001' $$,
+  'after revocation, the rider sees no route of the demo school'
+);
+reset role;
+
+-- Retention: inactive devices and anonymous users without a device go.
+insert into auth.users (id, is_anonymous, created_at) values
+  ('f0000000-0000-4000-8000-0000000000e1', true, now() - interval '200 days'),
+  ('f0000000-0000-4000-8000-0000000000e2', true, now() - interval '200 days'),
+  ('f0000000-0000-4000-8000-0000000000e3', true, now() - interval '200 days');
+insert into public.device (id, last_seen_at) values
+  ('f0000000-0000-4000-8000-0000000000e1', now() - interval '91 days'),
+  ('f0000000-0000-4000-8000-0000000000e2', now() - interval '10 days');
+select private.purge_expired_data();
+select set_eq(
+  $$ select id from auth.users where id::text like 'f0000000-0000-4000-8000-0000000000e_' $$,
+  array['f0000000-0000-4000-8000-0000000000e2']::uuid[],
+  'purge deletes inactive devices and old anonymous users without a device'
+);
+select throws_ok(
+  $$ update public.device set last_seen_at = '9999-01-01' where id = 'f0000000-0000-4000-8000-0000000000e2' $$,
+  '23514', null, 'last_seen_at cannot be pushed into the future'
 );
 
 -- Throttling: 10 failures within an hour block further attempts, even with a

@@ -141,6 +141,34 @@ create trigger staff_role_reject_anonymous
   before insert or update of user_id on public.staff_role
   for each row execute function private.staff_role_reject_anonymous();
 
+-- Every operator keeps at least one owner. Deleting the operator itself
+-- (cascade) is allowed.
+create function private.staff_role_keep_owner()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if old.role = 'owner'
+     and (tg_op = 'DELETE' or new.role <> 'owner' or new.operator_id <> old.operator_id)
+     and exists (select 1 from public.operator o where o.id = old.operator_id)
+     and not exists (
+       select 1 from public.staff_role sr
+        where sr.operator_id = old.operator_id
+          and sr.role = 'owner'
+          and sr.user_id <> old.user_id
+     ) then
+    raise exception 'an operator needs at least one owner' using errcode = 'check_violation';
+  end if;
+  return coalesce(new, old);
+end;
+$$;
+
+create trigger staff_role_keep_owner
+  after update or delete on public.staff_role
+  for each row execute function private.staff_role_keep_owner();
+
 -- -----------------------------------------------------------------------------
 -- Schedule (GTFS part)
 -- -----------------------------------------------------------------------------
@@ -446,6 +474,12 @@ begin
   if old.state in ('departed', 'passed') and new.state <> old.state then
     raise exception 'stop event state % is final', old.state using errcode = 'check_violation';
   end if;
+  -- A stop that was arrived at can only be departed, never "passed without
+  -- stopping" (clearing arrived_at does not help).
+  if old.arrived_at is not null and new.state = 'passed' then
+    raise exception 'stop event was arrived at; it can be departed, not passed'
+      using errcode = 'check_violation';
+  end if;
   -- Enum order: upcoming < approaching < arrived < departed < passed.
   if new.state < old.state then
     raise exception 'stop event state cannot go back from % to %', old.state, new.state
@@ -456,7 +490,7 @@ end;
 $$;
 
 create trigger stop_event_forward_only
-  before update of state on public.stop_event
+  before update on public.stop_event
   for each row execute function private.stop_event_forward_only();
 
 -- Current state per vehicle, written by the engine. History stays in Traccar.
@@ -533,7 +567,9 @@ create table public.device (
   -- BCP 47 language tag for notifications.
   language text check (language ~ '^[a-z]{2,3}(-[A-Za-z0-9]{1,8})*$'),
   created_at timestamptz not null default now(),
-  last_seen_at timestamptz not null default now()
+  -- Clients may touch it, but not push it into the future to escape the
+  -- 90-day retention.
+  last_seen_at timestamptz not null default now() check (last_seen_at <= now() + interval '1 day')
 );
 
 create index device_last_seen_at_idx on public.device (last_seen_at);
@@ -714,3 +750,9 @@ begin
   end loop;
 end;
 $$;
+
+-- Functions in `private` are not executable by PUBLIC. (Per-schema default
+-- privileges cannot remove the global PUBLIC EXECUTE, so each migration that
+-- adds private functions revokes it.) The RLS migration grants the access
+-- helpers to the API roles.
+revoke execute on all functions in schema private from public;
