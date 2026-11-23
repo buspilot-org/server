@@ -366,8 +366,10 @@ export class Engine {
         progress = { ...progress, ...state, stops: progress.stops };
         // Fixes held for confirmation (e.g. a stop dwell) count now, in order.
         let heldProgress = progressBefore;
+        const lastStop = pattern.stops[pattern.stops.length - 1];
         for (const h of confirmedHeld) {
           heldProgress = Math.max(heldProgress, h.m);
+          if (lastStop && h.m >= lastStop.distM - t.arrivedRadiusM) progress.reachedFinalStop = true;
           const r = updateStops(pattern.stops, progress.stops, { m: h.m, progressM: heldProgress, speedKmh: h.speedKmh, at: h.at, leftFinalStop: false }, t);
           progress.stops = r.stops;
           changes.push(...r.changes);

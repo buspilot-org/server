@@ -92,15 +92,42 @@ export function matchPosition(
     ? ((Math.atan2(xy.x - prev.lastFixXY.x, xy.y - prev.lastFixXY.y) * 180) / Math.PI + 360) % 360
     : null;
 
-  // Points clamped to the start of the window are not passes: the pass's
-  // nearest point lies behind, where the bus cannot be.
-  const wide = shape.candidates(xy, from, to, t.offRouteM).filter((c) => from <= 0 || c.m > from + 0.5);
+  // Passes from ambiguityBehindM behind the progress to the end of the
+  // window. A point clamped to the start of that range is not a pass (its
+  // nearest point lies further behind, where the bus cannot be).
+  const searchFrom = Math.max(0, prev.progressM - t.ambiguityBehindM);
+  const all = shape.candidates(xy, searchFrom, to, t.offRouteM).filter((c) => searchFrom <= 0 || c.m > searchFrom + 0.5);
+  const wide = all.filter((c) => c.m >= from - 0.5);
   const onRoute = wide.filter((c) => c.distance <= t.onRouteM && headingOk(c));
+
+  // A match behind the window: the bus is at (or GPS puts it a little
+  // behind) its progress on the current pass, e.g. after one fix too far
+  // ahead, or reversing. On route, but it never advances progress; it beats
+  // a later pass that is not closer. No heading check (reversing).
+  const behindMatch = all
+    .filter((c) => c.m < from - 0.5 && c.distance <= t.onRouteM)
+    .sort((a, b) => a.distance - b.distance)[0];
+  const nearestAhead = [...onRoute].sort((a, b) => a.distance - b.distance)[0];
+  if (behindMatch !== undefined && (nearestAhead === undefined || behindMatch.distance <= nearestAhead.distance)) {
+    next.awaySince = null;
+    next.m = behindMatch.m;
+    next.pendingJump = null;
+    return next;
+  }
+
   if (onRoute.length === 0) {
-    if (wide.length === 0) {
+    if (all.length === 0) {
       next.awaySince = prev.awaySince ?? at;
       if (next.offRouteSince === null && secondsBetween(next.awaySince, at) >= t.offRouteAfterS) {
         next.offRouteSince = next.awaySince;
+      }
+      const pending = prev.pendingJump;
+      if (pending !== null && shape.length - pending.m <= t.arrivedRadiusM) {
+        // Held at the end of the route (a final stop right after a turn) and
+        // now leaving it: there is no later pass to confuse it with.
+        next.progressM = Math.max(prev.progressM, pending.m);
+        next.progressAt = pending.at;
+        next.confirmedHeld = pending.held;
       }
       next.pendingJump = null;
     }
@@ -119,10 +146,7 @@ export function matchPosition(
   if (chosen === null) return next;
 
   const isJump = chosen.m - prev.progressM > t.onRouteM + (dtFix * t.jumpSpeedKmh) / 3.6;
-  const behind = Math.max(0, prev.progressM - t.ambiguityBehindM);
-  const ambiguous = shape
-    .candidates(xy, behind, chosen.m, t.offRouteM)
-    .some((c) => c.m < chosen.m - t.onRouteM && (behind === 0 || c.m > behind + 0.5));
+  const ambiguous = all.some((c) => c.m < chosen.m - t.onRouteM);
   const offRoute = prev.offRouteSince !== null;
 
   if (!isJump && !ambiguous && !offRoute) {
@@ -156,8 +180,10 @@ export function matchPosition(
       }
     : { firstM: chosen.m, m: chosen.m, count: 1, moving, at, held: [heldFix] };
   const p = next.pendingJump;
+  // Near the end of the route there may be less line left than the advance.
+  const advanceNeeded = Math.min(t.jumpConfirmMinAdvanceM, Math.max(0, shape.length - p.firstM - 1));
   const confirmed = p.count >= needed
-    && (!mustAdvance || (chosen.m - p.firstM >= t.jumpConfirmMinAdvanceM && p.moving >= needed - 1));
+    && (!mustAdvance || (chosen.m - p.firstM >= advanceNeeded && p.moving >= needed - 1));
   if (confirmed) {
     next.m = chosen.m;
     next.progressM = Math.max(prev.progressM, chosen.m);

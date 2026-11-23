@@ -729,3 +729,57 @@ describe('replay: fourth review findings', () => {
     assert.equal(s.engine.trips.get('T1')?.progress.status, 'active');
   });
 });
+
+describe('replay: fifth review findings', () => {
+  const one = (): RouteDef => germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]);
+  const after = (t: Track, i: number): Date => new Date(t.time.getTime() + i * 5000);
+
+  it('GPS drifting 50 m back along the street (or reversing) does not move onto the return street', async () => {
+    const s = await Scenario.create(one());
+    const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 60_000));
+    t.dwell(120).drive(400, 30).dwell(5);
+    await s.feed(t.fixes);
+    await s.feed([
+      { t: after(t, 1), xy: { x: 368, y: 0 }, speedKmh: 0 },
+      { t: after(t, 2), xy: { x: 358, y: 0 }, speedKmh: 7 },
+      { t: after(t, 3), xy: { x: 346, y: 0 }, speedKmh: 7 },
+      { t: after(t, 4), xy: { x: 340, y: 15 }, speedKmh: 7 },
+    ]);
+    assert.ok(s.store.instance('T1').progressM < 450);
+    assert.deepEqual(s.transitions('T1').filter((x) => !x.startsWith('1:')), []);
+  });
+
+  it('one fix 30 m too far ahead, then a dwell just short of the stop: arrived', async () => {
+    const def = one();
+    def.stops = def.stops.map((x) => (x.sequence === 2 ? { ...x, at: { x: 600, y: 0 } } : x));
+    const s = await Scenario.create(def);
+    const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 60_000));
+    t.dwell(120).drive(560, 30);
+    await s.feed(t.fixes);
+    await s.feed([{ t: after(t, 1), xy: { x: 632, y: 0 }, speedKmh: 8 }]);
+    await s.feed(Array.from({ length: 30 }, (_, i) => ({ t: after(t, i + 2), xy: { x: 595, y: 0 }, speedKmh: 0 })));
+    assert.equal(s.state('T1', 2), 'arrived');
+    assert.equal(s.store.instance('T1').offRouteSince, null, 'not off route while standing at the stop');
+  });
+
+  for (const intervalS of [5, 60]) {
+    it(`a final stop 80 m after a U-turn (${intervalS}-s tracker): arrived, departed, trip completed`, async () => {
+      const def: RouteDef = {
+        shape: [{ x: 0, y: 0 }, { x: 900, y: 0 }, { x: 900, y: 40 }, { x: 860, y: 40 }],
+        stops: [
+          { sequence: 1, at: { x: 0, y: 0 }, arrivalOffsetS: 0, departureOffsetS: 60 },
+          { sequence: 2, at: { x: 500, y: 0 }, arrivalOffsetS: 180, departureOffsetS: 200 },
+          { sequence: 3, at: { x: 860, y: 40 }, arrivalOffsetS: 400, departureOffsetS: 400 },
+        ],
+        trips: [{ id: 'T1', serviceDate: DATE, start: '07:30' }],
+      };
+      const s = await Scenario.create(def);
+      const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 120_000), { intervalS });
+      t.dwell(180).drive(495, 30).dwell(intervalS === 5 ? 30 : 120).drive(s.shape.length - 2, 20).dwell(120);
+      t.goTo({ x: 860, y: 200 }, 20).dwell(intervalS * 2);
+      await s.feed(t.fixes);
+      assert.deepEqual(s.transitions('T1'), ['1:arrived', '1:departed', '2:arrived', '2:departed', '3:arrived', '3:departed']);
+      assert.equal(s.store.instance('T1').status, 'completed');
+    });
+  }
+});

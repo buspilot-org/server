@@ -64,7 +64,9 @@ export function updateStops(
       } else if (ps === arriving) {
         next = { ...sp, state: 'arrived', arrivedAt: input.at };
       }
-    } else if (beyond(t.departedMarginM)) {
+    } else if ((input.m ?? input.progressM) > ps.distM + t.departedMarginM || (isLast && input.leftFinalStop)) {
+      // Departed: where the bus is now, not the progress (one fix too far
+      // ahead must not depart a bus still standing at the stop).
       next = { ...sp, state: 'departed', departedAt: input.at };
     }
     return next;
