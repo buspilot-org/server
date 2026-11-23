@@ -195,8 +195,12 @@ describe('PgStore and engine against the seeded database', () => {
       ],
       etas: [{ tripInstanceId: inst.id, sequence: 4, eta: START }],
     };
+    assert.deepEqual(await store.persist(backwards), { tripApplied: true }, 'its own (completed) trip');
     await store.persist(backwards);
-    await store.persist(backwards);
+    assert.deepEqual(await stopEvents(), before);
+    // A vehicle that does not run the trip changes nothing.
+    const stranger: Writes = { ...backwards, vehicleId: 'e0000000-0000-4000-8000-0000000007ff', vehicleState: null };
+    assert.deepEqual(await store.persist(stranger), { tripApplied: false });
     assert.deepEqual(await stopEvents(), before);
     const after = await instance();
     assert.equal(after.status, 'completed');

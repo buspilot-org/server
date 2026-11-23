@@ -127,7 +127,11 @@ export class Engine {
       const scheduledVehicleId = row.vehicleId ?? row.defaultVehicleId;
       const existing = this.#trips.get(instance.id);
       if (!existing) {
-        this.#trips.set(instance.id, { instance, scheduledVehicleId, progress: progressFromRow(row, instance.pattern) });
+        const progress = progressFromRow(row, instance.pattern);
+        // After a restart: the last fix of the vehicle, not only the last accepted one.
+        const vehicleFix = progress.vehicleId === null ? undefined : this.#lastFix.get(progress.vehicleId)?.at;
+        if (progress.status === 'active' && vehicleFix && (!progress.lastFixAt || vehicleFix > progress.lastFixAt)) progress.lastFixAt = vehicleFix;
+        this.#trips.set(instance.id, { instance, scheduledVehicleId, progress });
         continue;
       }
       existing.instance = instance;
@@ -140,6 +144,11 @@ export class Engine {
       } else if (mem.status === 'active' && (row.status === 'cancelled' || row.status === 'completed')) {
         existing.progress = { ...existing.progress, status: row.status, endedAt: row.endedAt ?? existing.progress.endedAt };
         this.#log.info('trip ended in the database', { tripInstanceId: instance.id, status: row.status });
+      } else if (mem.status === 'active' && (row.status !== 'active' || row.vehicleId !== mem.vehicleId)) {
+        // The database disagrees about who runs the trip (a staff assignment
+        // or driver start elsewhere, or a lost race): the database wins.
+        existing.progress = progressFromRow(row, instance.pattern);
+        this.#log.warn('trip taken over from the database', { tripInstanceId: instance.id, status: row.status });
       }
     }
     // Drop instances that left the snapshot (past service dates, inactive
@@ -204,8 +213,8 @@ export class Engine {
         const base = tr.progress;
         if (base.status !== 'active' || windowOpen(tr.instance, now, this.#t)) return;
         const next = complete(base, now);
-        await this.#store.persist({ vehicleId, vehicleState: null, trip: tripWrite(tr, next), stopEvents: [], etas: [] });
-        this.#commit(tr, { base, next });
+        const res = await this.#store.persist({ vehicleId, vehicleState: null, trip: tripWrite(tr, next), stopEvents: [], etas: [] });
+        if (res.tripApplied) this.#commit(tr, { base, next });
         this.#log.info('trip completed', { tripInstanceId: tr.instance.id, reason: 'window_closed' });
       }));
     }
@@ -392,15 +401,26 @@ export class Engine {
       recordedAt: at,
     };
 
+    let tripApplied = true;
     if (!isEmpty(writes)) {
       try {
-        await this.#store.persist(writes);
+        tripApplied = (await this.#store.persist(writes)).tripApplied;
       } catch (err) {
         this.metrics.positionsFailed++;
         throw err;
       }
     }
-    for (const [tr, u] of updates) this.#commit(tr, u);
+    for (const [tr, u] of updates) {
+      if (!tripApplied && writes.trip?.id === tr.instance.id) {
+        // Another vehicle runs this trip (or it was cancelled): the database
+        // did not take the change, so memory does not either. The next
+        // reload brings the database's state.
+        this.metrics.concurrentTripUpdates++;
+        this.#log.warn('trip write not applied; change not kept', { tripInstanceId: tr.instance.id, vehicleId: vehicle.id });
+        continue;
+      }
+      this.#commit(tr, u);
+    }
     if (streaks !== null) this.#streaks.set(vehicle.id, streaks);
     else this.#streaks.delete(vehicle.id);
     this.#lastFix.set(vehicle.id, { at, positionId: p.positionId });

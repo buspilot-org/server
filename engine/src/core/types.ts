@@ -78,6 +78,8 @@ export interface PendingJump {
   firstM: number;
   m: number;
   count: number;
+  /** Fixes of the confirmation with the bus moving (speed ≥ arrivedMaxSpeedKmh). */
+  moving: number;
   at: Date;
 }
 

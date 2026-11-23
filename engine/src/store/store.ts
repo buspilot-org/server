@@ -84,6 +84,10 @@ export interface SnapshotRows {
   instances: InstanceRow[];
 }
 
+export interface PersistResult {
+  tripApplied: boolean;
+}
+
 export interface Store {
   /**
    * Everything the engine caches: active vehicles, shapes, patterns and the
@@ -91,8 +95,12 @@ export interface Store {
    * made elsewhere are seen) on service dates around `now`.
    */
   loadSnapshot(now: Date): Promise<SnapshotRows>;
-  /** Writes one position's (or tick's) changes in one transaction. Idempotent. */
-  persist(writes: Writes): Promise<void>;
+  /**
+   * Writes one position's (or tick's) changes in one transaction. Idempotent.
+   * `tripApplied` is false if the trip row was not updated because another
+   * vehicle runs the trip, or it is cancelled (true when there was no trip write).
+   */
+  persist(writes: Writes): Promise<PersistResult>;
   /** Creates trip instances and their stop events for today and tomorrow (operator-local). Returns the number created. */
   createTripInstances(now: Date): Promise<number>;
   ping(): Promise<void>;

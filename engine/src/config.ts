@@ -28,11 +28,15 @@ export interface Thresholds {
   /** Consecutive on-route fixes needed to leave the off-route state. */
   backOnRouteFixes: number;
 
-  /** A forward move larger than this is a jump (m)… */
-  jumpM: number;
-  /** …unless the time since the previous fix at this speed covers it (km/h), e.g. a tracker reporting every minute. */
+  /**
+   * A forward move further than onRouteM plus the time since the previous
+   * fix at this speed is a jump (km/h). Covers trackers reporting every
+   * minute at normal speeds.
+   */
   jumpSpeedKmh: number;
-  /** Consistent fixes needed before a jump is accepted. */
+  /** An earlier pass of the route this far behind the progress still makes a position ambiguous (m). */
+  ambiguityBehindM: number;
+  /** Consistent fixes needed before a jump or an ambiguous position is accepted; all but one must be moving. */
   jumpConfirmFixes: number;
   /** A confirmation must cover at least this distance along the route (m): a standing bus confirms nothing. */
   jumpConfirmMinAdvanceM: number;
@@ -87,8 +91,8 @@ export const defaultThresholds: Thresholds = {
   offRouteM: 100,
   offRouteAfterS: 60,
   backOnRouteFixes: 3,
-  jumpM: 500,
-  jumpSpeedKmh: 50,
+  jumpSpeedKmh: 80,
+  ambiguityBehindM: 130,
   jumpConfirmFixes: 3,
   jumpConfirmMinAdvanceM: 20,
   headingCheckMinSpeedKmh: 10,

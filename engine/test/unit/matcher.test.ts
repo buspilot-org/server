@@ -108,9 +108,9 @@ describe('route matcher', () => {
   });
 
   it('the GPS course must match the direction of the route', () => {
-    // Driving west at x = 1200 with progress 1000: the outbound street (east)
-    // is 0 m away but the wrong direction; the return street is the match.
-    const westbound = matchPosition(shape, state(3900, { progressAt: sec(0) }), fix({ x: 1950, y: 20 }, 5, 30, 270), null, t);
+    // Driving west at x = 1950 (m = 4090 on the way back), 20 m from both
+    // streets: the outbound street is the wrong direction.
+    const westbound = matchPosition(shape, state(4060), fix({ x: 1950, y: 20 }, 5, 30, 270), null, t);
     assert.ok(westbound.m !== null && Math.abs(westbound.m - 4090) < 1);
     const wrongWay = matchPosition(shape, state(1000), fix({ x: 1100, y: 0 }, 5, 30, 270), null, t);
     assert.equal(wrongWay.m, null, 'driving against the route: hold');

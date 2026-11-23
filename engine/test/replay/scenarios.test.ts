@@ -520,9 +520,10 @@ describe('replay: review findings', () => {
     s.store.instance('T1').vehicleId = VEHICLE_2; // Bus 1 is broken today
     await s.engine.reload();
     const fixes = normalRun(s, 'T1').fixes;
-    await s.feed(fixes.slice(0, 40)); // Bus 1 drives the route anyway
+    const driven = fixes.findIndex((f) => f.xy.x >= 300 && f.xy.y < 30); // 300 m along the first street
+    await s.feed(fixes.slice(0, driven)); // Bus 1 drives the route anyway
     assert.equal(s.store.instance('T1').status, 'planned');
-    await s.feed(fixes.slice(40).map((f) => ({ ...f, deviceId: DEVICE_2 })));
+    await s.feed(fixes.slice(driven).map((f) => ({ ...f, deviceId: DEVICE_2 })));
     assert.equal(s.store.instance('T1').vehicleId, VEHICLE_2);
     assert.notEqual(s.store.instance('T1').status, 'planned');
   });
@@ -563,5 +564,82 @@ describe('replay: review findings', () => {
       '1:arrived', '1:departed', '2:arrived', '2:departed', '3:arrived', '3:departed',
       '4:arrived', '4:departed', '5:arrived', '5:departed', '6:arrived', '6:departed',
     ]);
+  });
+});
+
+describe('replay: third review findings', () => {
+  async function outboundTo(m: number): Promise<{ s: Scenario; t: Track }> {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 60_000));
+    t.dwell(120).drive(m, 30);
+    await s.feed(t.fixes);
+    return { s, t };
+  }
+
+  for (const [label, afterS, speedKmh, course] of [
+    ['standing, 5 s later', 5, 0, null],
+    ['driving west, 5 s later', 5, 20, 270],
+    ['after a 30 s gap', 30, 0, null],
+  ] as const) {
+    it(`one bad fix on the return street, 125 m behind the progress (${label}), changes nothing`, async () => {
+      const { s, t } = await outboundTo(800);
+      const before = s.store.instance('T1').progressM;
+      await s.feed([{ t: new Date(t.time.getTime() + afterS * 1000), xy: { x: 675, y: 40 }, speedKmh, course }]);
+      assert.equal(s.store.instance('T1').progressM, before);
+      assert.equal(s.state('T1', 2), 'upcoming');
+    });
+  }
+
+  it('a standing bus with jittering GPS on the return street confirms nothing', async () => {
+    const { s, t } = await outboundTo(400);
+    const xs = [400, 395, 405, 398, 402, 380, 420, 390, 430, 385, 425, 400];
+    await s.feed(xs.map((x, i) => ({ t: new Date(t.time.getTime() + (i + 1) * 5000), xy: { x, y: 60 }, speedKmh: 0 })));
+    assert.ok(s.store.instance('T1').progressM < 450);
+    assert.equal(s.state('T1', 3), 'upcoming');
+  });
+
+  it('a 60-s tracker with a stop on the return street close to the way out', async () => {
+    const def = germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]);
+    def.stops = def.stops.map((x) => (x.sequence === 3 ? { ...x, at: { x: 700, y: 40 } } : x)); // m = 1140
+    const s = await Scenario.create(def);
+    const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 120_000), { intervalS: 60 });
+    t.dwell(180);
+    for (const m of [STOP_M[2], 1140, STOP_M[4], STOP_M[5]]) t.drive(m - 5, 30).dwell(120);
+    t.goTo({ x: 800, y: 480 }, 10).dwell(120);
+    await s.feed(t.fixes);
+    assert.deepEqual(s.transitions('T1'), FULL_RUN);
+  });
+});
+
+describe('replay: database wins over memory', () => {
+  it('staff assign bus 2 just before bus 1 starts an any-vehicle trip: bus 1 is not kept, bus 2 runs it', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30', vehicleId: null }]));
+    s.store.instance('T1').vehicleId = VEHICLE_2; // in the database, not yet reloaded
+    const fixes = normalRun(s, 'T1').fixes;
+    const driven = fixes.findIndex((f) => f.xy.x >= 300 && f.xy.y < 30); // 300 m along the first street
+    await s.feed(fixes.slice(0, driven)); // bus 1 drives the start of the route
+    assert.equal(s.store.instance('T1').status, 'planned');
+    assert.notEqual(s.engine.trips.get('T1')?.progress.status, 'active', 'the refused start is not kept');
+    assert.deepEqual(s.transitions('T1'), []);
+    assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, null);
+
+    await s.engine.reload();
+    await s.feed(fixes.map((f) => ({ ...f, deviceId: DEVICE_2 })));
+    assert.equal(s.store.instance('T1').vehicleId, VEHICLE_2);
+    assert.deepEqual(s.transitions('T1'), FULL_RUN);
+  });
+
+  it('an active trip whose vehicle changed in the database is taken from the database on reload', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    const fixes = normalRun(s, 'T1').fixes;
+    const driven = fixes.findIndex((f) => f.xy.x >= 300 && f.xy.y < 30); // 300 m along the first street
+    await s.feed(fixes.slice(0, driven));
+    assert.equal(s.engine.trips.get('T1')?.progress.vehicleId, VEHICLE);
+    s.store.instance('T1').vehicleId = VEHICLE_2; // e.g. a driver start on bus 2 in the app
+    await s.engine.reload();
+    assert.equal(s.engine.trips.get('T1')?.progress.vehicleId, VEHICLE_2);
+    const before = s.transitions('T1').length;
+    await s.feed(fixes.slice(driven)); // bus 1 keeps driving: no more events from it
+    assert.equal(s.transitions('T1').length, before);
   });
 });

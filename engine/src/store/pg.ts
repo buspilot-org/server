@@ -14,7 +14,7 @@
  */
 import postgres from 'postgres';
 import type { StopState, TripStatus, Writes } from '../core/types.ts';
-import type { InstanceRow, SnapshotRows, Store } from './store.ts';
+import type { InstanceRow, PersistResult, SnapshotRows, Store } from './store.ts';
 
 type Sql = postgres.Sql;
 
@@ -116,8 +116,8 @@ export class PgStore implements Store {
     };
   }
 
-  async persist(w: Writes): Promise<void> {
-    await this.sql.begin(async (sql) => {
+  async persist(w: Writes): Promise<PersistResult> {
+    return this.sql.begin(async (sql) => {
       const v = w.vehicleId;
       // Claim the trip for this vehicle first. The row lock makes a second
       // vehicle starting the same "any vehicle" trip wait for this
@@ -133,7 +133,7 @@ export class PgStore implements Store {
         exists (select 1 from public.trip_instance ti
                  where ti.id = ${tripInstanceId} and ti.vehicle_id = ${v} and ti.status in ('planned', 'active'))`;
 
-      const queries: Promise<unknown>[] = [];
+      const queries: postgres.PendingQuery<postgres.Row[]>[] = [];
       const vs = w.vehicleState;
       if (vs) {
         const tripId = vs.tripInstanceId;
@@ -189,7 +189,9 @@ export class PgStore implements Store {
              and ${runs(tripInstanceId)}`);
       }
       const tr = w.trip;
+      let tripIndex = -1;
       if (tr) {
+        tripIndex = queries.length;
         queries.push(sql`
           update public.trip_instance set
             status = case
@@ -204,9 +206,14 @@ export class PgStore implements Store {
             off_route_since = case when status = 'completed' then off_route_since else ${tr.offRouteSince}::timestamptz end,
             started_at = coalesce(started_at, ${tr.startedAt}::timestamptz),
             ended_at = coalesce(ended_at, ${tr.endedAt}::timestamptz)
-          where id = ${tr.id} and status <> 'cancelled' and vehicle_id = ${v}`);
+          where id = ${tr.id} and status <> 'cancelled' and vehicle_id = ${v}
+          returning id`);
       }
-      await Promise.all(queries);
+      // Queries run in the order they were added (postgres.js sends a query
+      // when it is first awaited, and Promise.all awaits in array order).
+      const results = await Promise.all(queries);
+      const tripRows = tripIndex >= 0 ? results[tripIndex] : undefined;
+      return { tripApplied: tripIndex < 0 || (Array.isArray(tripRows) && tripRows.length > 0) };
     });
   }
 

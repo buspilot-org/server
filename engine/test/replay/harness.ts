@@ -10,7 +10,7 @@ import type { StopState, TripStatus, Writes } from '../../src/core/types.ts';
 import { stopStateRank } from '../../src/core/types.ts';
 import { LocalPlane, Polyline, distance, type XY } from '../../src/geo/plane.ts';
 import { silentLogger } from '../../src/log.ts';
-import type { InstanceRow, SnapshotRows, Store } from '../../src/store/store.ts';
+import type { InstanceRow, PersistResult, SnapshotRows, Store } from '../../src/store/store.ts';
 
 export const TZ = 'Asia/Tokyo';
 export const OPERATOR = 'op-1';
@@ -62,7 +62,7 @@ export class MemoryStore implements Store {
     return Promise.resolve(copy);
   }
 
-  persist(w: Writes): Promise<void> {
+  persist(w: Writes): Promise<PersistResult> {
     this.persistCalls++;
     if (this.failNext > 0) {
       this.failNext--;
@@ -107,10 +107,12 @@ export class MemoryStore implements Store {
         this.etaWrites++;
       }
     }
+    let tripApplied = true;
     if (w.trip) {
       const tr = w.trip;
       const row = this.instance(tr.id);
-      if (row.status !== 'cancelled' && row.vehicleId === v) {
+      tripApplied = row.status !== 'cancelled' && row.vehicleId === v;
+      if (tripApplied) {
         const oldStatus = row.status;
         const rank: Record<TripStatus, number> = { planned: 0, active: 1, completed: 2, cancelled: 3 };
         if (rank[tr.status] > rank[row.status] && tr.status !== 'cancelled') row.status = tr.status;
@@ -125,7 +127,7 @@ export class MemoryStore implements Store {
         row.endedAt ??= tr.endedAt;
       }
     }
-    return Promise.resolve();
+    return Promise.resolve({ tripApplied });
   }
 
   createTripInstances(): Promise<number> {
@@ -329,11 +331,13 @@ export class Track {
     return this.#t;
   }
 
-  #emit(xy: XY, speedKmh: number): void {
+  /** One fix. The course is the direction of travel at that moment (given), or the chord from the previous fix. */
+  #emit(xy: XY, speedKmh: number, direction?: number): void {
     this.#t = new Date(this.#t.getTime() + this.#intervalS * 1000);
     const dx = xy.x - this.#xy.x;
     const dy = xy.y - this.#xy.y;
-    const course = speedKmh > 0 && (dx !== 0 || dy !== 0) ? ((Math.atan2(dx, dy) * 180) / Math.PI + 360) % 360 : null;
+    const chord = dx !== 0 || dy !== 0 ? ((Math.atan2(dx, dy) * 180) / Math.PI + 360) % 360 : null;
+    const course = speedKmh > 0 ? (direction ?? chord) : null;
     this.#xy = xy;
     this.fixes.push({ t: this.#t, xy, speedKmh, course });
   }
@@ -347,7 +351,9 @@ export class Track {
       m = Math.min(toM, m + step);
       const p = this.#shape.pointAt(m);
       const n = noise?.(i++) ?? { x: 0, y: 0 };
-      this.#emit({ x: p.x + n.x, y: p.y + n.y }, speedKmh);
+      // Like a GPS course: the direction of the street at this point.
+      const direction = this.#shape.nearest(p, m - 0.5, m)?.bearing;
+      this.#emit({ x: p.x + n.x, y: p.y + n.y }, speedKmh, direction);
     }
     this.#m = m;
     return this;
