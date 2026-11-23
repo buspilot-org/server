@@ -70,6 +70,8 @@ export interface Projection {
   m: number;
   distance: number;
   bearing: number;
+  /** At a vertex: the bearing of the other segment meeting there. */
+  otherBearing?: number;
 }
 
 /** Smallest angle between two bearings (0–180°). */
@@ -209,10 +211,17 @@ export class Polyline {
       t = Math.min(Math.max(t, tMin), tMax);
       const q = { x: a.x + dx * t, y: a.y + dy * t };
       const d = distance(p, q);
-      const bearing = ((Math.atan2(dx, dy) * 180) / Math.PI + 360) % 360;
-      visit({ m: m0 + segM * t, distance: d, bearing });
+      const bearing = segmentBearing(a, b);
+      const proj: Projection = { m: m0 + segM * t, distance: d, bearing };
+      if (t === 0 && i > 0) proj.otherBearing = segmentBearing(at(this.points, i - 1), a);
+      if (t === 1 && i < this.points.length - 2) proj.otherBearing = segmentBearing(b, at(this.points, i + 2));
+      visit(proj);
     }
   }
+}
+
+function segmentBearing(a: XY, b: XY): number {
+  return ((Math.atan2(b.x - a.x, b.y - a.y) * 180) / Math.PI + 360) % 360;
 }
 
 function at<T>(arr: readonly T[], i: number): T {

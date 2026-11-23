@@ -10,7 +10,7 @@ const shape = new Polyline([{ x: 0, y: 0 }, { x: 3000, y: 0 }, { x: 3000, y: 40 
 const start = new Date('2026-11-24T22:30:00Z');
 const sec = (s: number): Date => new Date(start.getTime() + s * 1000);
 const state = (progressM: number, extra: Partial<MatchState> = {}): MatchState => ({
-  progressM, progressAt: start, awaySince: null, offRouteSince: null, pendingJump: null, ...extra,
+  progressM, progressAt: start, lastFixAt: start, awaySince: null, offRouteSince: null, pendingJump: null, ...extra,
 });
 const fix = (xy: XY, s: number, speedKmh = 30, course: number | null = null) => ({ xy, at: sec(s), speedKmh, course });
 
@@ -68,15 +68,43 @@ describe('route matcher', () => {
     assert.equal(r.m, 1750);
   });
 
-  it('German School: biased GPS near the return street does not move a slow bus onto it', () => {
-    // The bus waits on the outbound street at x = 400 (m = 400); GPS puts it
-    // 55 m from its street and 15 m from the return street (stop 3's side).
-    const { s, ms } = run(state(400), [0, 5, 10, 15, 20, 25].map((i) => fix({ x: 400, y: 55 }, 5 + i, 0)));
-    assert.deepEqual(ms, Array(6).fill(null));
-    assert.equal(s.progressM, 400);
-    // Same while creeping forward slowly.
-    const slow = run(state(400), [0, 1, 2, 3, 4].map((i) => fix({ x: 400 + i * 4, y: 55 }, 5 + i * 5, 3)));
-    assert.equal(slow.s.progressM, 400);
+  describe('German School: GPS pulled towards the return street', () => {
+    // Out along y = 0 to x = 900, back along y = 40: from x = 400 on the way
+    // out (m = 400), the return pass (m = 1440) is inside the window.
+    const school = new Polyline([{ x: 0, y: 0 }, { x: 900, y: 0 }, { x: 900, y: 40 }, { x: 0, y: 40 }]);
+    const biased = (s: number, speed = 0) => ({ xy: { x: 400, y: 55 }, at: sec(s), speedKmh: speed, course: null });
+    const runOn = (s0: MatchState, fixes: ReturnType<typeof biased>[]): MatchState =>
+      fixes.reduce<MatchState>((s, f) => matchPosition(school, s, f, null, t), s0);
+
+    it('a bus standing there for minutes stays on its street', () => {
+      const s = runOn(state(400), Array.from({ length: 60 }, (_, i) => biased(5 + i * 5)));
+      assert.equal(s.progressM, 400);
+    });
+
+    it('one biased fix after a long gap does not move it either', () => {
+      const r = matchPosition(school, state(400), biased(90), null, t);
+      assert.equal(r.m, null);
+      assert.equal(r.progressM, 400);
+    });
+
+    it('creeping forward slowly: the return pass moves backwards, nothing is confirmed', () => {
+      const s = runOn(state(400), Array.from({ length: 10 }, (_, i) => ({ ...biased(5 + i * 5, 3), xy: { x: 400 + i * 4, y: 55 } })));
+      assert.equal(s.progressM, 400);
+    });
+
+    it('really driving on the return street is accepted after confirmation', () => {
+      // After a 40 s gap the bus is on the return street, driving west.
+      const fixes = [1500, 1530, 1560].map((m, i) => ({ xy: { x: 940 - (m - 900), y: 40 }, at: sec(40 + i * 5), speedKmh: 25, course: 270 }));
+      let s: MatchState = state(400);
+      const ms: (number | null)[] = [];
+      for (const f of fixes) {
+        const r = matchPosition(school, s, f, null, t);
+        ms.push(r.m);
+        s = r;
+      }
+      assert.deepEqual(ms.slice(0, 2), [null, null]);
+      assert.ok(Math.abs(s.progressM - 1560) < 1, String(s.progressM));
+    });
   });
 
   it('the GPS course must match the direction of the route', () => {

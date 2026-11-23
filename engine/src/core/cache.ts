@@ -12,14 +12,24 @@ import type { Operator, Pattern, PatternStop, TripInstance, TripProgress, Vehicl
 
 /** A stop without dist_along_shape is matched to a pass of the shape within this distance (m)… */
 const STOP_MATCH_M = 100;
-/** …preferring the earliest pass at most this much farther than the closest (m). */
+/** …among the passes at most this much farther than the closest (both sides of a street) (m)… */
 const STOP_TIE_M = 15;
 
-function projectStop(shape: Polyline, point: XY, fromM: number): number | null {
+/**
+ * …the one closest to where the schedule puts the stop: the remaining shape
+ * shared out in proportion to the remaining scheduled time.
+ */
+function projectStop(shape: Polyline, point: XY, fromM: number, timeShare: number): number | null {
   const passes = shape.candidates(point, fromM, shape.length, STOP_MATCH_M);
   if (passes.length === 0) return shape.nearest(point, fromM, shape.length)?.m ?? null;
   const best = Math.min(...passes.map((c) => c.distance));
-  return passes.find((c) => c.distance <= best + STOP_TIE_M)?.m ?? null;
+  const expected = fromM + timeShare * (shape.length - fromM);
+  let chosen: number | null = null;
+  for (const c of passes) {
+    if (c.distance > best + STOP_TIE_M) continue;
+    if (chosen === null || Math.abs(c.m - expected) < Math.abs(chosen - expected)) chosen = c.m;
+  }
+  return chosen;
 }
 
 export interface Cache {
@@ -29,6 +39,8 @@ export interface Cache {
   instances: Map<string, { instance: TripInstance; row: InstanceRow }>;
   /** Patterns that could not be built (no shape, too few stops); their trips are ignored. */
   skippedPatterns: string[];
+  /** Pattern stops without dist_along_shape (projected by the engine). */
+  stopsWithoutDist: number;
 }
 
 export function buildCache(rows: SnapshotRows): Cache {
@@ -59,6 +71,7 @@ export function buildCache(rows: SnapshotRows): Cache {
 
   const patterns = new Map<string, Pattern>();
   const skippedPatterns: string[] = [];
+  let missingDist = 0;
   for (const p of rows.patterns) {
     const op = operators.get(p.operatorId);
     const shapeRow = p.shapeId === null ? undefined : shapes.get(p.shapeId);
@@ -74,11 +87,17 @@ export function buildCache(rows: SnapshotRows): Cache {
     // Stops without dist_along_shape are projected onto the shape after the
     // previous stop (so a loop's second visit lands on the second pass). Where
     // two passes are about equally close (both directions of a street), the
-    // earlier one wins; a stop clearly on one side keeps its own pass.
+    // schedule decides; a stop clearly on one side keeps its own pass.
+    // Import or route setup should store dist_along_shape; this is a fallback.
     let prevDist = 0;
+    let prevOffset = 0;
+    const lastOffset = stopRows[stopRows.length - 1]?.arrivalOffsetS ?? 0;
     const stops: PatternStop[] = stopRows.map((r) => {
       const point = op.plane.toXY({ lon: r.lon, lat: r.lat });
-      let distM = r.distAlongShape ?? projectStop(shape, point, prevDist) ?? prevDist;
+      const timeShare = lastOffset > prevOffset ? (r.arrivalOffsetS - prevOffset) / (lastOffset - prevOffset) : 0;
+      if (r.distAlongShape === null) missingDist++;
+      let distM = r.distAlongShape ?? projectStop(shape, point, prevDist, timeShare) ?? prevDist;
+      prevOffset = r.arrivalOffsetS;
       distM = Math.min(Math.max(distM, prevDist), shape.length);
       prevDist = distM;
       return { sequence: r.sequence, distM, arrivalOffsetS: r.arrivalOffsetS, departureOffsetS: r.departureOffsetS, point };
@@ -107,7 +126,7 @@ export function buildCache(rows: SnapshotRows): Cache {
     });
   }
 
-  return { operators, vehiclesByDevice, patterns, instances, skippedPatterns };
+  return { operators, vehiclesByDevice, patterns, instances, skippedPatterns, stopsWithoutDist: missingDist };
 }
 
 /** Trip progress as stored in the database (after a restart or for a new instance). */
@@ -123,6 +142,7 @@ export function progressFromRow(row: InstanceRow, pattern: Pattern): TripProgres
     endedAt: row.endedAt,
     progressM: row.progressM,
     progressAt: row.progressAt,
+    lastFixAt: row.progressAt,
     lastConfirmedStopSequence: row.lastConfirmedStopSequence,
     awaySince: row.offRouteSince,
     offRouteSince: row.offRouteSince,

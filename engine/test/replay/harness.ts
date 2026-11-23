@@ -68,39 +68,30 @@ export class MemoryStore implements Store {
       this.failNext--;
       return Promise.reject(new Error('simulated database failure'));
     }
-    const cancelled = (id: string): boolean => this.instance(id).status === 'cancelled';
+    const v = w.vehicleId;
+    // Same order and guards as PgStore: claim, vehicle state, stop events, ETAs, trip.
+    if (w.trip && w.trip.status !== 'planned') {
+      const row = this.instance(w.trip.id);
+      if (row.vehicleId === null && row.status === 'planned') row.vehicleId = v;
+    }
+    const runs = (id: string): boolean => {
+      const row = this.instance(id);
+      return row.vehicleId === v && (row.status === 'planned' || row.status === 'active');
+    };
     if (w.vehicleState) {
       const vs = w.vehicleState;
       const prev = this.vehicleState.get(vs.vehicleId);
-      const tripInstanceId = vs.tripInstanceId !== null && cancelled(vs.tripInstanceId) ? null : vs.tripInstanceId;
+      const tripInstanceId = vs.tripInstanceId !== null && runs(vs.tripInstanceId) ? vs.tripInstanceId : null;
       if (!prev || prev.recordedAt < vs.recordedAt) this.vehicleState.set(vs.vehicleId, { ...vs, tripInstanceId });
     }
-    if (w.trip) {
-      const tr = w.trip;
-      const row = this.instance(tr.id);
-      if (row.status !== 'cancelled') {
-        const oldStatus = row.status;
-        const rank: Record<TripStatus, number> = { planned: 0, active: 1, completed: 2, cancelled: 3 };
-        if (rank[tr.status] > rank[row.status] && tr.status !== 'cancelled') row.status = tr.status;
-        if (oldStatus === 'planned') row.startedBy = tr.startedBy;
-        row.vehicleId ??= tr.vehicleId;
-        row.progressM = Math.max(row.progressM, tr.progressM);
-        if (tr.progressAt && (!row.progressAt || tr.progressAt > row.progressAt)) row.progressAt = tr.progressAt;
-        if (tr.lastConfirmedStopSequence !== null) {
-          row.lastConfirmedStopSequence = Math.max(row.lastConfirmedStopSequence ?? -1, tr.lastConfirmedStopSequence);
-        }
-        if (oldStatus !== 'completed') row.offRouteSince = tr.offRouteSince;
-        row.startedAt ??= tr.startedAt;
-        row.endedAt ??= tr.endedAt;
-      }
-    }
     for (const e of w.stopEvents) {
+      if (!runs(e.tripInstanceId)) continue;
       const row = this.instance(e.tripInstanceId);
-      if (row.status === 'cancelled') continue;
       const ev = row.stopEvents.find((x) => x.sequence === e.sequence);
       if (!ev) throw new Error(`missing stop event ${e.sequence}`);
       if (stopStateRank[ev.state] >= stopStateRank[e.state] || ev.state === 'departed' || ev.state === 'passed') continue;
       if (e.state === 'passed' && ev.arrivedAt !== null) continue;
+      if (e.state === 'departed' && (ev.arrivedAt ?? e.arrivedAt) === null) continue;
       ev.state = e.state;
       ev.arrivedAt ??= e.arrivedAt;
       ev.departedAt ??= e.departedAt;
@@ -109,11 +100,29 @@ export class MemoryStore implements Store {
       this.transitions.push({ tripInstanceId: e.tripInstanceId, sequence: e.sequence, state: e.state, at: at ?? new Date(0) });
     }
     for (const e of w.etas) {
-      const row = this.instance(e.tripInstanceId);
-      const ev = row.stopEvents.find((x) => x.sequence === e.sequence);
-      if (ev && row.status !== 'cancelled' && (ev.state === 'upcoming' || ev.state === 'approaching')) {
+      if (!runs(e.tripInstanceId)) continue;
+      const ev = this.instance(e.tripInstanceId).stopEvents.find((x) => x.sequence === e.sequence);
+      if (ev && (ev.state === 'upcoming' || ev.state === 'approaching')) {
         ev.eta = e.eta;
         this.etaWrites++;
+      }
+    }
+    if (w.trip) {
+      const tr = w.trip;
+      const row = this.instance(tr.id);
+      if (row.status !== 'cancelled' && row.vehicleId === v) {
+        const oldStatus = row.status;
+        const rank: Record<TripStatus, number> = { planned: 0, active: 1, completed: 2, cancelled: 3 };
+        if (rank[tr.status] > rank[row.status] && tr.status !== 'cancelled') row.status = tr.status;
+        if (oldStatus === 'planned') row.startedBy = tr.startedBy;
+        row.progressM = Math.max(row.progressM, tr.progressM);
+        if (tr.progressAt && (!row.progressAt || tr.progressAt > row.progressAt)) row.progressAt = tr.progressAt;
+        if (tr.lastConfirmedStopSequence !== null) {
+          row.lastConfirmedStopSequence = Math.max(row.lastConfirmedStopSequence ?? -1, tr.lastConfirmedStopSequence);
+        }
+        if (oldStatus !== 'completed') row.offRouteSince = tr.offRouteSince;
+        row.startedAt ??= tr.startedAt;
+        row.endedAt ??= tr.endedAt;
       }
     }
     return Promise.resolve();

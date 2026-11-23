@@ -74,6 +74,8 @@ export interface StopProgress {
 }
 
 export interface PendingJump {
+  /** Position of the first fix of the confirmation. */
+  firstM: number;
   m: number;
   count: number;
   at: Date;
@@ -89,6 +91,8 @@ export interface TripProgress {
   progressM: number;
   /** Fix time of the last accepted progress. */
   progressAt: Date | null;
+  /** Fix time of the last position received during the trip (accepted or not). */
+  lastFixAt: Date | null;
   lastConfirmedStopSequence: number | null;
   /** Since when the bus has been more than offRouteM from the route (not yet off route). */
   awaySince: Date | null;
@@ -173,6 +177,11 @@ export interface EtaWrite {
 
 /** Everything one position (or one tick) changes; written in one transaction. */
 export interface Writes {
+  /**
+   * The vehicle these changes come from. Trip, stop event and ETA writes only
+   * apply to a trip instance this vehicle runs (or that no vehicle runs yet).
+   */
+  vehicleId: string;
   vehicleState: VehicleStateWrite | null;
   trip: TripWrite | null;
   stopEvents: StopEventWrite[];

@@ -6,21 +6,24 @@
  *
  * Where the route passes the same place twice (a loop, both directions of a
  * street), a wrong match on the later pass would fire later stops too early
- * (the German School problem). Three things guard against it:
+ * (the German School problem). Guards:
  * - the GPS course must match the direction of the route when moving;
- * - a forward move that is more than the bus can plausibly have driven since
- *   the last accepted fix is a jump, accepted only after several fixes that
- *   keep moving forward on that section (a standing bus confirms nothing);
- * - no jump is counted while a nearer pass is still within offRouteM (the
- *   position is ambiguous then: hold).
+ * - the match nearest ahead of the progress wins;
+ * - a position that also lies within offRouteM of an earlier pass is
+ *   ambiguous: moving onto the later pass needs jumpConfirmFixes fixes that
+ *   together move forward along it (a standing bus confirms nothing), however
+ *   long the bus has been standing;
+ * - a forward move larger than jumpM and than the bus can have driven since
+ *   the previous fix (at jumpSpeedKmh) is a jump and needs the same
+ *   confirmation.
  */
 import type { Thresholds } from '../config.ts';
 import type { Polyline, Projection, XY } from '../geo/plane.ts';
 import { bearingDifference } from '../geo/plane.ts';
 import { secondsBetween } from './time.ts';
-import type { PendingJump, TripProgress } from './types.ts';
+import type { TripProgress } from './types.ts';
 
-export type MatchState = Pick<TripProgress, 'progressM' | 'progressAt' | 'awaySince' | 'offRouteSince' | 'pendingJump'>;
+export type MatchState = Pick<TripProgress, 'progressM' | 'progressAt' | 'lastFixAt' | 'awaySince' | 'offRouteSince' | 'pendingJump'>;
 
 export interface MatchResult extends MatchState {
   /** Accepted position along the route for this fix; null if not accepted (away, held or unconfirmed). */
@@ -51,17 +54,6 @@ export function pickCandidate(
   return ties.reduce((best, c) => (Math.abs(c.m - expectedM) < Math.abs(best.m - expectedM) ? c : best));
 }
 
-/**
- * Whether a fix continues a pending confirmation. Jump confirmations must move
- * forward (a standing bus with biased GPS confirms nothing); rejoining the
- * route nearby after being off route may stand still (e.g. at the next stop).
- */
-function consistent(pending: PendingJump, m: number, at: Date, isJump: boolean, t: Thresholds): boolean {
-  const dt = Math.max(0, secondsBetween(pending.at, at));
-  const minAdvance = isJump ? t.jumpConfirmMinAdvanceM : -t.windowBehindM;
-  return m >= pending.m + minAdvance && m <= pending.m + dt * t.windowMaxSpeedMps + t.onRouteM;
-}
-
 export function matchPosition(
   shape: Polyline,
   prev: MatchState,
@@ -70,14 +62,18 @@ export function matchPosition(
   t: Thresholds,
 ): MatchResult {
   const { xy, at } = fix;
-  const dt = prev.progressAt ? Math.max(0, secondsBetween(prev.progressAt, at)) : 0;
+  const since = (d: Date | null): number => (d ? Math.max(0, secondsBetween(d, at)) : 0);
+  const dtAccepted = since(prev.progressAt);
+  const dtFix = since(prev.lastFixAt ?? prev.progressAt);
   const from = prev.progressM - t.windowBehindM;
-  const to = prev.progressM + Math.max(t.windowAheadM, dt * t.windowMaxSpeedMps);
-  const next: MatchResult = { ...prev, m: null };
+  const to = prev.progressM + Math.max(t.windowAheadM, dtAccepted * t.windowMaxSpeedMps);
+  const next: MatchResult = { ...prev, lastFixAt: at, m: null };
 
-  const headingKnown = fix.course !== null && fix.speedKmh >= t.headingCheckMinSpeedKmh;
+  const course = fix.speedKmh >= t.headingCheckMinSpeedKmh ? fix.course : null;
   const headingOk = (c: Projection): boolean =>
-    !headingKnown || bearingDifference(c.bearing, fix.course ?? 0) <= t.headingToleranceDeg;
+    course === null
+    || bearingDifference(c.bearing, course) <= t.headingToleranceDeg
+    || (c.otherBearing !== undefined && bearingDifference(c.otherBearing, course) <= t.headingToleranceDeg);
 
   const wide = shape.candidates(xy, from, to, t.offRouteM, t.onRouteM);
   const onRoute = wide.filter((c) => c.distance <= t.onRouteM && headingOk(c));
@@ -94,19 +90,16 @@ export function matchPosition(
   }
 
   next.awaySince = null;
-  const jumpLimit = Math.max(t.jumpM, (dt * t.jumpSpeedKmh) / 3.6);
+  const jumpLimit = Math.max(t.jumpM, (dtFix * t.jumpSpeedKmh) / 3.6);
   const near = onRoute.filter((c) => c.m - prev.progressM <= jumpLimit);
   const isJump = near.length === 0;
-  if (isJump && wide.some((c) => c.m - prev.progressM <= jumpLimit)) {
-    // A nearer pass is still close (50–100 m, or the course does not fit it):
-    // too ambiguous to count towards a jump.
-    return next;
-  }
   const chosen = pickCandidate(isJump ? onRoute : near, prev.progressM, expectedM, t.tieMarginM);
   if (chosen === null) return next;
-
+  // An earlier pass of the route is also close: the position is ambiguous.
+  const ambiguous = wide.some((c) => c.m < chosen.m - t.onRouteM);
   const offRoute = prev.offRouteSince !== null;
-  if (!isJump && !offRoute) {
+
+  if (!isJump && !ambiguous && !offRoute) {
     next.m = chosen.m;
     next.progressM = Math.max(prev.progressM, chosen.m);
     next.progressAt = at;
@@ -114,13 +107,20 @@ export function matchPosition(
     return next;
   }
 
-  // A jump, or back on the route after being off route: confirm first.
-  const needed = offRoute ? Math.max(t.backOnRouteFixes, isJump ? t.jumpConfirmFixes : 0) : t.jumpConfirmFixes;
+  // Confirm first: a jump or an ambiguous position needs fixes moving
+  // forward on the new section; rejoining after off route needs fixes on the
+  // route (standing is fine there, e.g. at the next stop).
+  const mustAdvance = isJump || ambiguous;
+  const needed = Math.max(offRoute ? t.backOnRouteFixes : 0, mustAdvance ? t.jumpConfirmFixes : 0);
   const pending = prev.pendingJump;
-  next.pendingJump = pending && consistent(pending, chosen.m, at, isJump, t)
-    ? { m: chosen.m, count: pending.count + 1, at }
-    : { m: chosen.m, count: 1, at };
-  if (next.pendingJump.count >= needed) {
+  const continues = pending !== null
+    && chosen.m >= pending.m - t.windowBehindM
+    && chosen.m <= pending.m + since(pending.at) * t.windowMaxSpeedMps + t.onRouteM;
+  next.pendingJump = continues
+    ? { firstM: pending.firstM, m: Math.max(pending.m, chosen.m), count: pending.count + 1, at }
+    : { firstM: chosen.m, m: chosen.m, count: 1, at };
+  const advanced = chosen.m - next.pendingJump.firstM >= t.jumpConfirmMinAdvanceM;
+  if (next.pendingJump.count >= needed && (!mustAdvance || advanced)) {
     next.m = chosen.m;
     next.progressM = Math.max(prev.progressM, chosen.m);
     next.progressAt = at;

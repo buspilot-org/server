@@ -30,11 +30,11 @@ export interface Thresholds {
 
   /** A forward move larger than this is a jump (m)… */
   jumpM: number;
-  /** …unless the time since the last accepted fix at this speed covers it (km/h), e.g. a tracker reporting every minute. */
+  /** …unless the time since the previous fix at this speed covers it (km/h), e.g. a tracker reporting every minute. */
   jumpSpeedKmh: number;
   /** Consistent fixes needed before a jump is accepted. */
   jumpConfirmFixes: number;
-  /** Each confirming fix must be at least this far ahead of the previous one (m): a standing bus confirms nothing. */
+  /** A confirmation must cover at least this distance along the route (m): a standing bus confirms nothing. */
   jumpConfirmMinAdvanceM: number;
   /** Above this speed the GPS course must match the direction of the route (km/h)… */
   headingCheckMinSpeedKmh: number;
@@ -90,7 +90,7 @@ export const defaultThresholds: Thresholds = {
   jumpM: 500,
   jumpSpeedKmh: 50,
   jumpConfirmFixes: 3,
-  jumpConfirmMinAdvanceM: 5,
+  jumpConfirmMinAdvanceM: 20,
   headingCheckMinSpeedKmh: 10,
   headingToleranceDeg: 90,
   tieMarginM: 100,

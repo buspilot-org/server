@@ -132,10 +132,12 @@ export class Engine {
       }
       existing.instance = instance;
       existing.scheduledVehicleId = scheduledVehicleId;
-      const mem = existing.progress.status;
-      if (mem === 'planned') {
-        existing.progress = progressFromRow(row, instance.pattern);
-      } else if (mem === 'active' && (row.status === 'cancelled' || row.status === 'completed')) {
+      const mem = existing.progress;
+      if (mem.status === 'planned' || mem.status === 'cancelled') {
+        // Take the row only if it changed, so a trip start being written
+        // right now is not discarded by a stale copy.
+        if (row.status !== mem.status || row.vehicleId !== mem.vehicleId) existing.progress = progressFromRow(row, instance.pattern);
+      } else if (mem.status === 'active' && (row.status === 'cancelled' || row.status === 'completed')) {
         existing.progress = { ...existing.progress, status: row.status, endedAt: row.endedAt ?? existing.progress.endedAt };
         this.#log.info('trip ended in the database', { tripInstanceId: instance.id, status: row.status });
       }
@@ -150,6 +152,9 @@ export class Engine {
     }
     this.#cache = cache;
     this.metrics.lastReloadAt = this.#clock.now().toISOString();
+    if (cache.stopsWithoutDist > 0) {
+      this.#log.warn('pattern stops without dist_along_shape are projected by the engine', { count: cache.stopsWithoutDist });
+    }
     if (cache.skippedPatterns.length > 0) {
       this.#log.warn('patterns without shape or stops are ignored', { count: cache.skippedPatterns.length });
     }
@@ -199,7 +204,7 @@ export class Engine {
         const base = tr.progress;
         if (base.status !== 'active' || windowOpen(tr.instance, now, this.#t)) return;
         const next = complete(base, now);
-        await this.#store.persist({ vehicleState: null, trip: tripWrite(tr, next), stopEvents: [], etas: [] });
+        await this.#store.persist({ vehicleId, vehicleState: null, trip: tripWrite(tr, next), stopEvents: [], etas: [] });
         this.#commit(tr, { base, next });
         this.#log.info('trip completed', { tripInstanceId: tr.instance.id, reason: 'window_closed' });
       }));
@@ -261,7 +266,7 @@ export class Engine {
     const xy = operator.plane.toXY(p);
     const updates = new Map<TripRuntime, PendingUpdate>();
     let streaks: Map<string, StartStreak> | null = null;
-    const writes: Writes = { vehicleState: null, trip: null, stopEvents: [], etas: [] };
+    const writes: Writes = { vehicleId: vehicle.id, vehicleState: null, trip: null, stopEvents: [], etas: [] };
     const logs: [string, Record<string, string | number>][] = [];
 
     // 1. Trip assignment.
@@ -298,6 +303,7 @@ export class Engine {
           startedAt: at,
           progressM: Math.max(trip.progress.progressM, chosen.startM),
           progressAt: at,
+          lastFixAt: at,
           awaySince: null,
           offRouteSince: null,
           pendingJump: null,

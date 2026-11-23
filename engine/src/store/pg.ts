@@ -5,8 +5,10 @@
  * All writes are idempotent, so a retried position or a replay after a
  * restart cannot move anything backwards:
  * - progress_m only grows (`greatest`), trip status only moves
- *   planned → active → completed; a cancelled trip is never touched (no
- *   progress, stop events or ETAs, and vehicle_state does not link to it);
+ *   planned → active → completed;
+ * - only the vehicle that runs a trip writes to it: a cancelled or completed
+ *   trip, or one another vehicle runs, gets no progress, stop events or
+ *   ETAs, and vehicle_state does not link to it;
  * - stop events only move forward (`state < new state`), final states stay;
  * - vehicle_state only takes newer fixes.
  */
@@ -116,15 +118,31 @@ export class PgStore implements Store {
 
   async persist(w: Writes): Promise<void> {
     await this.sql.begin(async (sql) => {
+      const v = w.vehicleId;
+      // Claim the trip for this vehicle first. The row lock makes a second
+      // vehicle starting the same "any vehicle" trip wait for this
+      // transaction, and then see that the trip is taken.
+      if (w.trip && w.trip.status !== 'planned') {
+        await sql`
+          update public.trip_instance set vehicle_id = ${v}
+           where id = ${w.trip.id} and vehicle_id is null and status = 'planned'`;
+      }
+      // Only a trip this vehicle runs, not cancelled or completed (the trip
+      // row itself is updated last, so this transaction may complete it).
+      const runs = (tripInstanceId: string) => sql`
+        exists (select 1 from public.trip_instance ti
+                 where ti.id = ${tripInstanceId} and ti.vehicle_id = ${v} and ti.status in ('planned', 'active'))`;
+
       const queries: Promise<unknown>[] = [];
       const vs = w.vehicleState;
       if (vs) {
+        const tripId = vs.tripInstanceId;
         queries.push(sql`
           insert into public.vehicle_state
             (vehicle_id, operator_id, trip_instance_id, location, speed_kmh, heading, accuracy_m, recorded_at)
           values (
             ${vs.vehicleId}, ${vs.operatorId},
-            (select id from public.trip_instance where id = ${vs.tripInstanceId}::uuid and status <> 'cancelled'),
+            ${tripId === null ? null : sql`(select ${tripId}::uuid where ${runs(tripId)})`},
             extensions.st_setsrid(extensions.st_makepoint(${vs.lon}, ${vs.lat}), 4326)::extensions.geography,
             ${vs.speedKmh}, ${vs.heading}, ${vs.accuracyM}, ${vs.recordedAt}
           )
@@ -137,32 +155,13 @@ export class PgStore implements Store {
             recorded_at = excluded.recorded_at
           where public.vehicle_state.recorded_at < excluded.recorded_at`);
       }
-      const tr = w.trip;
-      if (tr) {
-        queries.push(sql`
-          update public.trip_instance set
-            status = case
-              when status = 'planned' then ${tr.status}::public.trip_instance_status
-              when status = 'active' and ${tr.status} = 'completed' then 'completed'::public.trip_instance_status
-              else status
-            end,
-            vehicle_id = coalesce(vehicle_id, ${tr.vehicleId}::uuid),
-            started_by = case when status = 'planned' then ${tr.startedBy}::public.trip_started_by else started_by end,
-            progress_m = greatest(progress_m, ${tr.progressM}),
-            progress_at = greatest(progress_at, ${tr.progressAt}::timestamptz),
-            last_confirmed_stop_sequence = greatest(last_confirmed_stop_sequence, ${tr.lastConfirmedStopSequence}::integer),
-            off_route_since = case when status = 'completed' then off_route_since else ${tr.offRouteSince}::timestamptz end,
-            started_at = coalesce(started_at, ${tr.startedAt}::timestamptz),
-            ended_at = coalesce(ended_at, ${tr.endedAt}::timestamptz)
-          where id = ${tr.id} and status <> 'cancelled'`);
-      }
       for (const e of w.stopEvents) {
         queries.push(sql`
           insert into public.stop_event
             (operator_id, trip_instance_id, stop_sequence, state, arrived_at, departed_at, passed_at)
           select ti.operator_id, ti.id, ${e.sequence}, ${e.state}::public.stop_event_state,
                  ${e.arrivedAt}::timestamptz, ${e.departedAt}::timestamptz, ${e.passedAt}::timestamptz
-            from public.trip_instance ti where ti.id = ${e.tripInstanceId} and ti.status <> 'cancelled'
+            from public.trip_instance ti where ti.id = ${e.tripInstanceId} and ${runs(e.tripInstanceId)}
           on conflict (trip_instance_id, stop_sequence) do update set
             state = excluded.state,
             arrived_at = coalesce(public.stop_event.arrived_at, excluded.arrived_at),
@@ -173,23 +172,39 @@ export class PgStore implements Store {
             and (excluded.state <> 'passed' or public.stop_event.arrived_at is null)
             and (excluded.state <> 'departed' or coalesce(public.stop_event.arrived_at, excluded.arrived_at) is not null)`);
       }
-      if (w.etas.length > 0) {
-        const byTrip = new Map<string, { seqs: number[]; etas: string[] }>();
-        for (const e of w.etas) {
-          const entry = byTrip.get(e.tripInstanceId) ?? { seqs: [], etas: [] };
-          entry.seqs.push(e.sequence);
-          entry.etas.push(e.eta.toISOString());
-          byTrip.set(e.tripInstanceId, entry);
-        }
-        for (const [tripInstanceId, { seqs, etas }] of byTrip) {
-          queries.push(sql`
-            update public.stop_event se set eta = v.eta
-              from unnest(${seqs}::integer[], ${etas}::timestamptz[]) as v(stop_sequence, eta)
-             where se.trip_instance_id = ${tripInstanceId}
-               and se.stop_sequence = v.stop_sequence
-               and se.state in ('upcoming', 'approaching')
-               and exists (select 1 from public.trip_instance ti where ti.id = se.trip_instance_id and ti.status <> 'cancelled')`);
-        }
+      const byTrip = new Map<string, { seqs: number[]; etas: string[] }>();
+      for (const e of w.etas) {
+        const entry = byTrip.get(e.tripInstanceId) ?? { seqs: [], etas: [] };
+        entry.seqs.push(e.sequence);
+        entry.etas.push(e.eta.toISOString());
+        byTrip.set(e.tripInstanceId, entry);
+      }
+      for (const [tripInstanceId, { seqs, etas }] of byTrip) {
+        queries.push(sql`
+          update public.stop_event se set eta = v.eta
+            from unnest(${seqs}::integer[], ${etas}::timestamptz[]) as v(stop_sequence, eta)
+           where se.trip_instance_id = ${tripInstanceId}
+             and se.stop_sequence = v.stop_sequence
+             and se.state in ('upcoming', 'approaching')
+             and ${runs(tripInstanceId)}`);
+      }
+      const tr = w.trip;
+      if (tr) {
+        queries.push(sql`
+          update public.trip_instance set
+            status = case
+              when status = 'planned' then ${tr.status}::public.trip_instance_status
+              when status = 'active' and ${tr.status} = 'completed' then 'completed'::public.trip_instance_status
+              else status
+            end,
+            started_by = case when status = 'planned' then ${tr.startedBy}::public.trip_started_by else started_by end,
+            progress_m = greatest(progress_m, ${tr.progressM}),
+            progress_at = greatest(progress_at, ${tr.progressAt}::timestamptz),
+            last_confirmed_stop_sequence = greatest(last_confirmed_stop_sequence, ${tr.lastConfirmedStopSequence}::integer),
+            off_route_since = case when status = 'completed' then off_route_since else ${tr.offRouteSince}::timestamptz end,
+            started_at = coalesce(started_at, ${tr.startedAt}::timestamptz),
+            ended_at = coalesce(ended_at, ${tr.endedAt}::timestamptz)
+          where id = ${tr.id} and status <> 'cancelled' and vehicle_id = ${v}`);
       }
       await Promise.all(queries);
     });

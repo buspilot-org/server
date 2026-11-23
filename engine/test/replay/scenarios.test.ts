@@ -416,8 +416,8 @@ describe('replay: review findings', () => {
     const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 60_000));
     t.dwell(120).drive(400, 30);
     await s.feed(t.fixes);
-    // 60 s standing at x = 400; GPS 55 m from the outbound street, 15 m from the return street (stop 3).
-    const waiting: Fix[] = Array.from({ length: 12 }, (_, i) => ({
+    // 3 minutes standing at x = 400; GPS 55 m from the outbound street, 15 m from the return street (stop 3).
+    const waiting: Fix[] = Array.from({ length: 36 }, (_, i) => ({
       t: new Date(t.time.getTime() + (i + 1) * 5000), xy: { x: 400, y: 55 }, speedKmh: 0,
     }));
     await s.feed(waiting);
@@ -430,6 +430,17 @@ describe('replay: review findings', () => {
       .drive(STOP_M[5] - 2, 30).dwell(60).goTo({ x: 800, y: 480 }, 15);
     await s.feed(rest.fixes);
     assert.deepEqual(s.transitions('T1'), FULL_RUN);
+  });
+
+  it('German School: after a gap, a single fix pulled onto the return street changes nothing', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 60_000));
+    t.dwell(120).drive(400, 30);
+    await s.feed(t.fixes);
+    await s.feed([{ t: new Date(t.time.getTime() + 90_000), xy: { x: 400, y: 55 }, speedKmh: 0 }]);
+    assert.equal(s.state('T1', 2), 'upcoming');
+    assert.equal(s.state('T1', 3), 'upcoming');
+    assert.ok(s.store.instance('T1').progressM < 450);
   });
 
   it('a tracker reporting every 60 s: stops are still arrived at, not passed', async () => {
@@ -462,6 +473,30 @@ describe('replay: review findings', () => {
     assert.deepEqual(s.transitions('T1'), FULL_RUN);
     assert.equal(s.store.instance('T1').vehicleId, VEHICLE);
     assert.equal(s.store.vehicleState.get(VEHICLE_2)?.tripInstanceId, null);
+  });
+
+  it('a trip any vehicle may run: two buses start it at the same moment, only one runs it', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30', vehicleId: null }]));
+    const fixes = normalRun(s, 'T1').fixes;
+    const send = (f: Fix, device: string): Promise<unknown> => {
+      const ll = s.plane.toLonLat(f.xy);
+      return s.engine.handlePosition({
+        deviceId: device, positionId: null, fixTime: f.t, lon: ll.lon, lat: ll.lat,
+        speedKmh: f.speedKmh, course: f.course ?? null, accuracyM: 5, valid: true,
+      });
+    };
+    // Both buses drive the same track (convoy): both qualify on the same fix.
+    for (const f of fixes) {
+      s.clock.set(new Date(f.t.getTime() + 1000));
+      await Promise.all([send(f, DEVICE), send(f, DEVICE_2)]);
+      assert.equal(s.engine.trips.get('T1')?.progress.status, s.store.instance('T1').status, 'memory and database agree');
+    }
+    assert.ok(s.engine.metrics.concurrentTripUpdates >= 1, 'the race happened');
+    assert.deepEqual(s.transitions('T1'), FULL_RUN, 'each event once');
+    const runner = s.store.instance('T1').vehicleId;
+    const other = runner === VEHICLE ? VEHICLE_2 : VEHICLE;
+    assert.equal(s.engine.trips.get('T1')?.progress.vehicleId, runner);
+    assert.equal(s.store.vehicleState.get(other)?.tripInstanceId, null);
   });
 
   it('a trip cancelled in the database stops getting stop events after the next reload', async () => {
