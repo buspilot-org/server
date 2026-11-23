@@ -1,0 +1,1 @@
+-- Seed data for local development (demo operator). Filled by the schema migrations work.

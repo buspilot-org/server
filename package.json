@@ -1,0 +1,27 @@
+{
+  "name": "buspilot-server",
+  "version": "1.0.0",
+  "description": "Buspilot server: Supabase migrations and engine",
+  "scripts": {
+    "db:start": "supabase start",
+    "db:stop": "supabase stop",
+    "db:reset": "supabase db reset",
+    "db:test": "supabase test db"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/buspilot-org/server.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "AGPL-3.0-only",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/buspilot-org/server/issues"
+  },
+  "homepage": "https://github.com/buspilot-org/server#readme",
+  "devDependencies": {
+    "supabase": "3.3.0"
+  },
+  "private": true
+}
