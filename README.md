@@ -5,7 +5,7 @@ Server side of [Buspilot](https://buspilot.org), a bus tracking service for priv
 | Folder | Content |
 |---|---|
 | `supabase/` | Supabase project: `config.toml`, SQL migrations (schema, PostGIS, row-level security), seed data for a demo operator |
-| `engine/` | (planned) Service next to Traccar: assigns positions to trips, detects stops, sends alerts, receives vehicle events |
+| `engine/` | Service next to Traccar: assigns positions to trips, tracks progress along the route, stop events and ETAs (see [engine/README.md](engine/README.md)) |
 
 Positions come from a [Traccar](https://www.traccar.org) server. The engine turns them into trip state; Supabase stores schedules, trip state, access and content.
 
@@ -50,6 +50,21 @@ Migrations in `supabase/migrations/` create the schema (Postgres + PostGIS), row
 insert into public.staff_role (operator_id, user_id, role)
 values ('d0000000-0000-4000-8000-000000000001', '<auth user id>', 'owner');
 ```
+
+## Engine
+
+The engine (`engine/`, TypeScript on Node.js 26 LTS) receives positions from Traccar's JSON forwarding, matches them to the running trip and writes trip progress, stop events, ETAs and the vehicle state to Postgres. It also creates each day's trip instances from the calendars.
+
+```bash
+cd engine
+npm install
+cp .env.example .env   # set TRACCAR_FORWARD_SECRET
+npm run check          # lint, typecheck, unit and replay tests
+npm run test:db        # integration test against the local database (after npx supabase db reset)
+node --env-file=.env src/main.ts
+```
+
+Details, configuration and the Traccar setup: [engine/README.md](engine/README.md).
 
 ## Contributing
 

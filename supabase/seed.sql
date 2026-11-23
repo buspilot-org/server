@@ -118,6 +118,10 @@ insert into public.trip (id, operator_id, gtfs_id, pattern_id, service_calendar_
 insert into public.vehicle (id, operator_id, name, traccar_device_id, capacity)
 values ('d0000000-0000-4000-8000-000000000701', 'd0000000-0000-4000-8000-000000000001', 'Bus 1', '23273424', 29);
 
+-- Bus 1 runs both morning trips.
+update public.trip set vehicle_id = 'd0000000-0000-4000-8000-000000000701'
+ where operator_id = 'd0000000-0000-4000-8000-000000000001';
+
 -- Parents of the morning route: arrival times only (school default).
 insert into public.audience (id, operator_id, name)
 values (
