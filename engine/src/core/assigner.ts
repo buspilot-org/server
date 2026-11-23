@@ -8,7 +8,7 @@ import type { XY } from '../geo/plane.ts';
 import { distance } from '../geo/plane.ts';
 import { expectedProgressAt } from './eta.ts';
 import { addSeconds } from './time.ts';
-import type { TripInstance, TripProgress, TripRuntime, Vehicle } from './types.ts';
+import type { TripInstance, TripRuntime, Vehicle } from './types.ts';
 
 export function windowOpen(inst: TripInstance, at: Date, t: Thresholds): boolean {
   return at >= addSeconds(inst.startAt, -t.tripWindowBeforeS) && at <= addSeconds(inst.endAt, t.tripWindowAfterS);
@@ -25,8 +25,9 @@ export function activeTrip(trips: Iterable<TripRuntime>, vehicleId: string): Tri
 }
 
 /**
- * Planned trips this vehicle may start now: scheduled for this vehicle (or
- * for no vehicle in particular, within the same operator) with an open window.
+ * Planned trips this vehicle may start now: for this vehicle (the instance's
+ * vehicle if staff set one, else the trip's default vehicle, else any vehicle
+ * of the operator) with an open window.
  */
 export function startCandidates(trips: Iterable<TripRuntime>, vehicle: Vehicle, at: Date, t: Thresholds): TripRuntime[] {
   const out: TripRuntime[] = [];
@@ -39,37 +40,59 @@ export function startCandidates(trips: Iterable<TripRuntime>, vehicle: Vehicle, 
   return out;
 }
 
+/** A vehicle's streak of fixes towards starting one trip (kept per vehicle and trip, outside the trip's state). */
+export interface StartStreak {
+  /** Progress at the start of the streak. */
+  startM: number;
+  /** Highest progress in the streak. */
+  lastM: number;
+  count: number;
+  /** Since when the bus has been standing at the first stop, if it was. */
+  atFirstStopSince: Date | null;
+}
+
 export interface StartEvaluation {
-  /** New progress of the candidate (start streak updated). */
-  progress: TripProgress;
-  /** Where the bus is along the route if the trip may start now. */
+  streak: StartStreak | null;
+  /** Where the bus is along the route if the trip starts now. */
   startM: number | null;
 }
 
+/** GPS jitter tolerated before a streak counts as moving backwards (m). */
+const STREAK_JITTER_M = 10;
+
 /**
- * Automatic start: the bus is at the first stop, or on the first part of the
- * route and moving in route direction for autoStartConfirmFixes fixes.
+ * Automatic start: the bus is on the first part of the route and moves in
+ * route direction (autoStartConfirmFixes fixes, at least autoStartMinAdvanceM,
+ * currently moving). A bus parked at the first stop does not start a trip;
+ * once it pulls away, the trip starts and the first stop counts as arrived
+ * since the bus stood there.
  */
-export function evaluateStart(tr: TripRuntime, xy: XY, t: Thresholds): StartEvaluation {
+export function evaluateStart(
+  tr: TripRuntime,
+  prev: StartStreak | null,
+  xy: XY,
+  at: Date,
+  speedKmh: number,
+  t: Thresholds,
+): StartEvaluation {
   const pattern = tr.instance.pattern;
-  const progress: TripProgress = { ...tr.progress };
   const proj = pattern.shape.nearest(xy, 0, t.autoStartMaxProgressM);
-  if (proj === null || proj.distance > t.onRouteM) {
-    progress.startCandidate = null;
-    return { progress, startM: null };
-  }
+  if (proj === null || proj.distance > t.onRouteM) return { streak: null, startM: null };
   const first = pattern.stops[0];
-  if (first && distance(xy, first.point) <= t.autoStartFirstStopM) {
-    progress.startCandidate = null;
-    return { progress, startM: proj.m };
+  const atFirstStop = first !== undefined && distance(xy, first.point) <= t.autoStartFirstStopM && speedKmh < t.arrivedMaxSpeedKmh;
+  const streak: StartStreak = prev && proj.m >= prev.lastM - STREAK_JITTER_M
+    ? {
+        startM: prev.startM,
+        lastM: Math.max(prev.lastM, proj.m),
+        count: prev.count + 1,
+        atFirstStopSince: prev.atFirstStopSince ?? (atFirstStop ? at : null),
+      }
+    : { startM: proj.m, lastM: proj.m, count: 1, atFirstStopSince: atFirstStop ? at : null };
+  const moving = speedKmh >= t.arrivedMaxSpeedKmh;
+  if (moving && streak.count >= t.autoStartConfirmFixes && proj.m - streak.startM >= t.autoStartMinAdvanceM) {
+    return { streak, startM: proj.m };
   }
-  const prev = tr.progress.startCandidate;
-  progress.startCandidate = prev && proj.m > prev.m ? { m: proj.m, count: prev.count + 1 } : { m: proj.m, count: 1 };
-  if (progress.startCandidate.count >= t.autoStartConfirmFixes) {
-    progress.startCandidate = null;
-    return { progress, startM: proj.m };
-  }
-  return { progress, startM: null };
+  return { streak, startM: null };
 }
 
 /** Several trips could start (e.g. two trips of the same pattern): the one whose schedule fits the position best. */

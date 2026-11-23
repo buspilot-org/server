@@ -28,10 +28,18 @@ export interface Thresholds {
   /** Consecutive on-route fixes needed to leave the off-route state. */
   backOnRouteFixes: number;
 
-  /** A forward move larger than this is a jump (m). */
+  /** A forward move larger than this is a jump (m)… */
   jumpM: number;
+  /** …unless the time since the last accepted fix at this speed covers it (km/h), e.g. a tracker reporting every minute. */
+  jumpSpeedKmh: number;
   /** Consistent fixes needed before a jump is accepted. */
   jumpConfirmFixes: number;
+  /** Each confirming fix must be at least this far ahead of the previous one (m): a standing bus confirms nothing. */
+  jumpConfirmMinAdvanceM: number;
+  /** Above this speed the GPS course must match the direction of the route (km/h)… */
+  headingCheckMinSpeedKmh: number;
+  /** …within this angle (degrees). Tells apart the two directions of a street served twice. */
+  headingToleranceDeg: number;
   /** Two candidates whose distance ahead differs by less than this are a tie, broken by the schedule (m). */
   tieMarginM: number;
 
@@ -39,8 +47,10 @@ export interface Thresholds {
   autoStartMaxProgressM: number;
   /** Automatic trip start: within this distance of the first stop counts as "at the first stop" (m). */
   autoStartFirstStopM: number;
-  /** Automatic trip start: consistent fixes needed when not at the first stop. */
+  /** Automatic trip start: consecutive fixes moving in route direction… */
   autoStartConfirmFixes: number;
+  /** …covering at least this distance along the route (m). A parked bus never starts a trip. */
+  autoStartMinAdvanceM: number;
 
   /** Arrived: within this distance of the stop, measured along the route (m). */
   arrivedRadiusM: number;
@@ -50,8 +60,10 @@ export interface Thresholds {
   departedMarginM: number;
   /** Passed without stopping: progress beyond the stop by more than this (m). */
   passedMarginM: number;
-  /** Final stop at the end of the shape: the bus has left it when it is this far from the stop (m). */
+  /** Final stop at the end of the shape: the bus has left it when it is this far from the stop (m)… */
   finalLeaveM: number;
+  /** …for this many consecutive fixes (GPS multipath while parked). */
+  finalLeaveFixes: number;
 
   /** No position for longer than this during a trip → stale (s). */
   staleAfterS: number;
@@ -76,16 +88,22 @@ export const defaultThresholds: Thresholds = {
   offRouteAfterS: 60,
   backOnRouteFixes: 3,
   jumpM: 500,
+  jumpSpeedKmh: 50,
   jumpConfirmFixes: 3,
+  jumpConfirmMinAdvanceM: 5,
+  headingCheckMinSpeedKmh: 10,
+  headingToleranceDeg: 90,
   tieMarginM: 100,
   autoStartMaxProgressM: 1000,
   autoStartFirstStopM: 50,
   autoStartConfirmFixes: 2,
+  autoStartMinAdvanceM: 30,
   arrivedRadiusM: 30,
   arrivedMaxSpeedKmh: 5,
   departedMarginM: 20,
   passedMarginM: 50,
   finalLeaveM: 50,
+  finalLeaveFixes: 2,
   staleAfterS: 120,
   etaMaxSpeedKmh: 60,
   etaWriteThresholdS: 30,

@@ -4,8 +4,10 @@
  * delay = now − scheduled time at the current progress (interpolated between
  * stops); ETA(stop) = scheduled arrival + delay, but never earlier than now
  * plus the remaining distance at etaMaxSpeedKmh (the shortest plausible
- * travel time). Before the bus has left the first stop it is expected to wait
- * for the scheduled departure, so an early bus does not make ETAs early.
+ * travel time). While the bus stands at a stop (before it has left the first
+ * stop, or arrived at a later one) it is expected to wait for the scheduled
+ * departure: waiting on time is no delay, and an early bus does not make
+ * ETAs early.
  */
 import type { Thresholds } from '../config.ts';
 import { addSeconds, secondsBetween } from './time.ts';
@@ -60,9 +62,13 @@ export function computeEtas(
 ): Map<number, Date> {
   const pstops = inst.pattern.stops;
   let delayS = secondsBetween(addSeconds(inst.startAt, scheduledOffsetAt(pstops, progressM)), now);
+  const dwelling = [...stops].reverse().find((s) => s.state === 'arrived');
+  const dwellStop = dwelling ? pstops.find((p) => p.sequence === dwelling.sequence) : undefined;
   const firstSeq = pstops[0]?.sequence;
   const firstStop = stops.find((s) => s.sequence === firstSeq);
-  if (firstStop && (firstStop.state === 'upcoming' || firstStop.state === 'approaching' || firstStop.state === 'arrived')) {
+  if (dwellStop) {
+    delayS = Math.max(0, secondsBetween(addSeconds(inst.startAt, dwellStop.departureOffsetS), now));
+  } else if (firstStop && (firstStop.state === 'upcoming' || firstStop.state === 'approaching')) {
     delayS = Math.max(0, delayS);
   }
   const maxSpeedMps = t.etaMaxSpeedKmh / 3.6;

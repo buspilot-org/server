@@ -100,10 +100,10 @@ export interface TripProgress {
    * consistent fixes.
    */
   pendingJump: PendingJump | null;
-  /** Automatic start: consecutive fixes on the first part of the route. */
-  startCandidate: { m: number; count: number } | null;
   /** The bus came within arrivedRadiusM of the final stop. */
   reachedFinalStop: boolean;
+  /** Consecutive fixes away from the final stop after reaching it. */
+  finalLeaveCount: number;
   stops: StopProgress[];
 }
 
@@ -123,7 +123,7 @@ export interface PositionInput {
   lon: number;
   lat: number;
   speedKmh: number;
-  /** Degrees, 0 ≤ course < 360, or null. */
+  /** Degrees clockwise from north, 0 ≤ course < 360, or null. */
   course: number | null;
   accuracyM: number | null;
   valid: boolean;

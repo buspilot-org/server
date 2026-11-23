@@ -86,12 +86,21 @@ export function createApp(deps: AppDeps): Hono {
       }
     }
     const ok = engine.loaded && database === 'ok';
+    // Public: counters about Buspilot vehicles only. Nothing about other
+    // devices on the shared Traccar server (no unknown-device count).
+    const m = engine.metrics;
     return c.json({
       status: ok ? 'ok' : 'degraded',
       cacheLoaded: engine.loaded,
       database,
       staleTrips: engine.staleTrips().length,
-      metrics: engine.metrics,
+      metrics: {
+        positionsProcessed: m.positionsProcessed,
+        positionsDuplicate: m.positionsDuplicate,
+        positionsInvalid: m.positionsInvalid,
+        positionsFailed: m.positionsFailed,
+        lastReloadAt: m.lastReloadAt,
+      },
     }, ok ? 200 : 503);
   });
 

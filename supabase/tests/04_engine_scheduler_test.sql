@@ -65,8 +65,8 @@ select results_eq(
 );
 select results_eq(
   $$ select distinct status::text, kind::text, vehicle_id, route_id from public.trip_instance $$,
-  $$ values ('planned', 'scheduled', 'd0000000-0000-4000-8000-000000000701'::uuid, 'd0000000-0000-4000-8000-000000000101'::uuid) $$,
-  'instances are planned, scheduled, with the trip''s vehicle and route'
+  $$ values ('planned', 'scheduled', null::uuid, 'd0000000-0000-4000-8000-000000000101'::uuid) $$,
+  'instances are planned and scheduled, with the trip''s route; no vehicle until one runs it'
 );
 
 -- Exceptions.

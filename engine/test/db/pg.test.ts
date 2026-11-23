@@ -98,7 +98,7 @@ describe('PgStore and engine against the seeded database', () => {
     assert.equal(await store.createTripInstances(new Date('2027-02-28T16:00:00Z')), 0, 'idempotent');
     const events = await stopEvents();
     assert.deepEqual(events.map((e) => e.state), Array(6).fill('upcoming'));
-    assert.equal((await instance()).vehicle_id, VEHICLE, 'vehicle from the trip');
+    assert.equal((await instance()).vehicle_id, null, 'no vehicle until one runs it (the trip default applies)');
   });
 
   it('projects like PostGIS', async () => {
@@ -165,6 +165,7 @@ describe('PgStore and engine against the seeded database', () => {
     assert.deepEqual(arrivals, [...arrivals].sort((a, b) => a - b), 'arrivals in route order');
     const inst = await instance();
     assert.equal(inst.status, 'completed');
+    assert.equal(inst.vehicle_id, VEHICLE, 'the trip default vehicle ran it');
     assert.ok(inst.progress_m > (stopM[4] ?? 0));
 
     const [vs] = await sql<{ trip_instance_id: string | null; recorded_at: Date }[]>`

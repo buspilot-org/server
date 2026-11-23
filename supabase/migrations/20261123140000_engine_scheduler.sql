@@ -8,9 +8,10 @@
 -- -----------------------------------------------------------------------------
 
 -- "Vehicle A runs the morning route on weekdays" (arrival-alerts.md): the
--- vehicle that normally runs a trip. Copied to each trip instance; the trip
--- assigner only starts an instance with its own vehicle. Null means any
--- vehicle of the operator may run it.
+-- vehicle that normally runs a trip. The trip assigner starts an instance
+-- only with trip_instance.vehicle_id if set (staff override for one day),
+-- else with this vehicle; null means any vehicle of the operator. It is not
+-- copied into instances, so changing it applies to instances already created.
 alter table public.trip add column vehicle_id uuid;
 alter table public.trip
   add foreign key (operator_id, vehicle_id) references public.vehicle (operator_id, id)
@@ -18,7 +19,7 @@ alter table public.trip
 create index trip_vehicle_id_idx on public.trip (operator_id, vehicle_id) where vehicle_id is not null;
 
 comment on column public.trip.vehicle_id is
-  'Vehicle that normally runs this trip (copied to trip instances). Null = any vehicle of the operator.';
+  'Vehicle that normally runs this trip (trip_instance.vehicle_id overrides it for one day). Null = any vehicle of the operator.';
 
 -- -----------------------------------------------------------------------------
 -- Trip instances from calendars
@@ -34,8 +35,9 @@ comment on column public.trip.vehicle_id is
 -- exception covers it, or when an `added` exception covers it.
 --
 -- Not yet: skip_national_holidays (needs a holiday table for Japan; until
--- then instances are created on holidays too, and simply never start
--- because no bus runs).
+-- then instances are created on holidays too. The engine only starts a trip
+-- when the bus moves along the route in its window, so a parked bus does not
+-- start one).
 create function private.create_trip_instances(p_from date, p_to date, p_operator_id uuid default null)
 returns integer
 language plpgsql
@@ -50,7 +52,7 @@ begin
       from generate_series(p_from::timestamp, p_to::timestamp, interval '1 day') as d
   ),
   runs as (
-    select t.operator_id, t.id as trip_id, t.vehicle_id, d.service_date
+    select t.operator_id, t.id as trip_id, d.service_date
       from public.trip t
       join public.service_calendar c on c.id = t.service_calendar_id
       join public.trip_pattern p on p.id = t.pattern_id
@@ -76,8 +78,8 @@ begin
        )
   ),
   inserted as (
-    insert into public.trip_instance (operator_id, service_date, kind, trip_id, vehicle_id)
-    select operator_id, service_date, 'scheduled', trip_id, vehicle_id from runs
+    insert into public.trip_instance (operator_id, service_date, kind, trip_id)
+    select operator_id, service_date, 'scheduled', trip_id from runs
     on conflict (service_date, trip_id) do nothing
     returning id, operator_id, trip_id
   ),

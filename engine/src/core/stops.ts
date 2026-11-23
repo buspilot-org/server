@@ -41,6 +41,17 @@ export function updateStops(
 ): { stops: StopProgress[]; changes: StopChange[] } {
   const changes: StopChange[] = [];
   const last = patternStops[patternStops.length - 1];
+  // Only the stop nearest the bus can be arrived at (stops closer together
+  // than twice arrivedRadiusM would otherwise both arrive).
+  let arriving: PatternStop | null = null;
+  if (input.m !== null && input.speedKmh < t.arrivedMaxSpeedKmh) {
+    const m = input.m;
+    for (const ps of patternStops) {
+      const sp = current.find((s) => s.sequence === ps.sequence);
+      if (!sp || isFinalStopState(sp.state) || Math.abs(m - ps.distM) > t.arrivedRadiusM) continue;
+      if (arriving === null || Math.abs(m - ps.distM) < Math.abs(m - arriving.distM)) arriving = ps;
+    }
+  }
   const stops = current.map((sp) => {
     const ps = patternStops.find((p) => p.sequence === sp.sequence);
     if (ps === undefined || isFinalStopState(sp.state)) return sp;
@@ -50,21 +61,32 @@ export function updateStops(
     if (sp.state !== 'arrived') {
       if (beyond(t.passedMarginM)) {
         next = { ...sp, state: 'passed', passedAt: input.at };
-      } else if (
-        input.m !== null &&
-        Math.abs(input.m - ps.distM) <= t.arrivedRadiusM &&
-        input.speedKmh < t.arrivedMaxSpeedKmh
-      ) {
+      } else if (ps === arriving) {
         next = { ...sp, state: 'arrived', arrivedAt: input.at };
       }
     } else if (beyond(t.departedMarginM)) {
       next = { ...sp, state: 'departed', departedAt: input.at };
     }
-    if (next !== sp) {
-      if (stopStateRank[next.state] <= stopStateRank[sp.state]) throw new Error('stop state can only move forward');
-      changes.push({ sequence: sp.sequence, from: sp.state, to: next.state });
-    }
     return next;
+  });
+
+  // Arriving at a stop closes every earlier stop, so events stay in route
+  // order even for stops closer together than passedMarginM.
+  let lastArrived = -1;
+  stops.forEach((s, i) => {
+    if (s.state === 'arrived' && s !== current[i]) lastArrived = i;
+  });
+  for (let i = 0; i < lastArrived; i++) {
+    const s = stops[i];
+    if (s === undefined || isFinalStopState(s.state)) continue;
+    stops[i] = s.state === 'arrived' ? { ...s, state: 'departed', departedAt: input.at } : { ...s, state: 'passed', passedAt: input.at };
+  }
+
+  stops.forEach((s, i) => {
+    const before = current[i];
+    if (before === undefined || s === before) return;
+    if (stopStateRank[s.state] <= stopStateRank[before.state]) throw new Error('stop state can only move forward');
+    changes.push({ sequence: s.sequence, from: before.state, to: s.state });
   });
   return { stops, changes };
 }

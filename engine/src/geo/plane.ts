@@ -61,10 +61,21 @@ export function distance(a: XY, b: XY): number {
   return Math.hypot(a.x - b.x, a.y - b.y);
 }
 
-/** A point on the line: `m` is the distance along the line, `distance` the distance from the query point. */
+/**
+ * A point on the line: `m` is the distance along the line, `distance` the
+ * distance from the query point, `bearing` the direction of travel of the
+ * line there (degrees clockwise from north, like a GPS course).
+ */
 export interface Projection {
   m: number;
   distance: number;
+  bearing: number;
+}
+
+/** Smallest angle between two bearings (0–180°). */
+export function bearingDifference(a: number, b: number): number {
+  const d = Math.abs(((a - b) % 360 + 360) % 360);
+  return d > 180 ? 360 - d : d;
 }
 
 export class Polyline {
@@ -198,7 +209,8 @@ export class Polyline {
       t = Math.min(Math.max(t, tMin), tMax);
       const q = { x: a.x + dx * t, y: a.y + dy * t };
       const d = distance(p, q);
-      visit({ m: m0 + segM * t, distance: d });
+      const bearing = ((Math.atan2(dx, dy) * 180) / Math.PI + 360) % 360;
+      visit({ m: m0 + segM * t, distance: d, bearing });
     }
   }
 }

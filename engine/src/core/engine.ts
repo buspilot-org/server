@@ -6,13 +6,17 @@
  * Every change is computed on a copy of the runtime state, written in one
  * transaction, and only kept in memory once the write succeeded. If the write
  * fails, Traccar retries the position and it is processed again from the same
- * state. Positions of one vehicle are processed one at a time, in order.
+ * state. Positions of one vehicle are processed one at a time, in order. A
+ * trip that any vehicle of the operator may run can be touched from two
+ * vehicles' queues; a change is only kept if the trip's state is still the
+ * one it was computed from.
  */
 import type { Thresholds } from '../config.ts';
 import { distance } from '../geo/plane.ts';
 import type { Logger } from '../log.ts';
 import { errorMessage } from '../log.ts';
 import type { Store } from '../store/store.ts';
+import type { StartStreak } from './assigner.ts';
 import { activeTrip, chooseStart, evaluateStart, startCandidates, windowOpen } from './assigner.ts';
 import type { Cache } from './cache.ts';
 import { buildCache, progressFromRow } from './cache.ts';
@@ -45,6 +49,8 @@ export interface EngineMetrics {
   positionsDuplicate: number;
   positionsInvalid: number;
   positionsFailed: number;
+  /** Changes not kept because another vehicle changed the same trip meanwhile. */
+  concurrentTripUpdates: number;
   lastPositionAt: string | null;
   lastReloadAt: string | null;
 }
@@ -52,6 +58,12 @@ export interface EngineMetrics {
 interface LastFix {
   at: Date;
   positionId: number | null;
+}
+
+/** A trip state change waiting for the write: kept only if the trip still has `base`. */
+interface PendingUpdate {
+  base: TripProgress;
+  next: TripProgress;
 }
 
 export class Engine {
@@ -62,6 +74,8 @@ export class Engine {
   #cache: Cache | null = null;
   readonly #trips = new Map<string, TripRuntime>();
   readonly #lastFix = new Map<string, LastFix>();
+  /** Start streaks per vehicle, by trip instance. */
+  readonly #streaks = new Map<string, Map<string, StartStreak>>();
   readonly #queues = new Map<string, Promise<unknown>>();
   readonly metrics: EngineMetrics = {
     positionsProcessed: 0,
@@ -69,6 +83,7 @@ export class Engine {
     positionsDuplicate: 0,
     positionsInvalid: 0,
     positionsFailed: 0,
+    concurrentTripUpdates: 0,
     lastPositionAt: null,
     lastReloadAt: null,
   };
@@ -90,11 +105,14 @@ export class Engine {
   }
 
   /**
-   * (Re)loads the cache from the database. Runtime state of trips already in
-   * memory is kept (memory is at least as new as the database, since every
-   * change is written before it is kept); only a cancellation made in the
-   * database is taken over. New instances (and all of them after a restart)
-   * start from their database rows.
+   * (Re)loads the cache from the database and merges it with the runtime
+   * state:
+   * - a trip not yet started in memory takes its database row as it is
+   *   (a driver start, a vehicle assigned by staff);
+   * - a trip cancelled or completed in the database is taken over;
+   * - a trip running in memory keeps its memory state, which is at least as
+   *   new as the database (every change is written before it is kept).
+   * After a restart every trip starts from its database row.
    */
   async reload(): Promise<void> {
     const rows = await this.#store.loadSnapshot(this.#clock.now());
@@ -106,19 +124,29 @@ export class Engine {
     const seen = new Set<string>();
     for (const { instance, row } of cache.instances.values()) {
       seen.add(instance.id);
+      const scheduledVehicleId = row.vehicleId ?? row.defaultVehicleId;
       const existing = this.#trips.get(instance.id);
-      if (existing) {
-        existing.instance = instance;
-        existing.scheduledVehicleId = row.vehicleId;
-        if (row.status === 'cancelled') existing.progress = { ...existing.progress, status: 'cancelled' };
-      } else {
-        this.#trips.set(instance.id, { instance, scheduledVehicleId: row.vehicleId, progress: progressFromRow(row, instance.pattern) });
+      if (!existing) {
+        this.#trips.set(instance.id, { instance, scheduledVehicleId, progress: progressFromRow(row, instance.pattern) });
+        continue;
+      }
+      existing.instance = instance;
+      existing.scheduledVehicleId = scheduledVehicleId;
+      const mem = existing.progress.status;
+      if (mem === 'planned') {
+        existing.progress = progressFromRow(row, instance.pattern);
+      } else if (mem === 'active' && (row.status === 'cancelled' || row.status === 'completed')) {
+        existing.progress = { ...existing.progress, status: row.status, endedAt: row.endedAt ?? existing.progress.endedAt };
+        this.#log.info('trip ended in the database', { tripInstanceId: instance.id, status: row.status });
       }
     }
-    // Drop instances that left the snapshot (past service dates, completed
-    // or cancelled elsewhere), except trips still running in memory.
+    // Drop instances that left the snapshot (past service dates, inactive
+    // routes), except trips still running in memory.
     for (const [id, tr] of this.#trips) {
       if (!seen.has(id) && tr.progress.status !== 'active') this.#trips.delete(id);
+    }
+    for (const streaks of this.#streaks.values()) {
+      for (const id of streaks.keys()) if (this.#trips.get(id)?.progress.status !== 'planned') streaks.delete(id);
     }
     this.#cache = cache;
     this.metrics.lastReloadAt = this.#clock.now().toISOString();
@@ -168,10 +196,11 @@ export class Engine {
       const vehicleId = tr.progress.vehicleId;
       if (tr.progress.status !== 'active' || vehicleId === null || windowOpen(tr.instance, now, this.#t)) continue;
       jobs.push(this.#enqueue(vehicleId, async () => {
-        if (tr.progress.status !== 'active' || windowOpen(tr.instance, now, this.#t)) return;
-        const next = this.#complete(tr.progress, now);
+        const base = tr.progress;
+        if (base.status !== 'active' || windowOpen(tr.instance, now, this.#t)) return;
+        const next = complete(base, now);
         await this.#store.persist({ vehicleState: null, trip: tripWrite(tr, next), stopEvents: [], etas: [] });
-        tr.progress = next;
+        this.#commit(tr, { base, next });
         this.#log.info('trip completed', { tripInstanceId: tr.instance.id, reason: 'window_closed' });
       }));
     }
@@ -204,6 +233,15 @@ export class Engine {
     return run;
   }
 
+  #commit(tr: TripRuntime, u: PendingUpdate): void {
+    if (tr.progress !== u.base) {
+      this.metrics.concurrentTripUpdates++;
+      this.#log.warn('trip changed concurrently; update not kept in memory', { tripInstanceId: tr.instance.id });
+      return;
+    }
+    tr.progress = u.next;
+  }
+
   async #process(vehicle: Vehicle, p: PositionInput): Promise<PositionOutcome> {
     const t = this.#t;
     const last = this.#lastFix.get(vehicle.id);
@@ -221,7 +259,8 @@ export class Engine {
 
     const at = p.fixTime;
     const xy = operator.plane.toXY(p);
-    const updates = new Map<TripRuntime, TripProgress>();
+    const updates = new Map<TripRuntime, PendingUpdate>();
+    let streaks: Map<string, StartStreak> | null = null;
     const writes: Writes = { vehicleState: null, trip: null, stopEvents: [], etas: [] };
     const logs: [string, Record<string, string | number>][] = [];
 
@@ -230,37 +269,50 @@ export class Engine {
     let progress: TripProgress | null = null;
     let justStarted = false;
     if (trip && !windowOpen(trip.instance, at, t)) {
-      const done = this.#complete(trip.progress, at);
+      const done = complete(trip.progress, at);
       writes.trip = tripWrite(trip, done);
-      updates.set(trip, done);
+      updates.set(trip, { base: trip.progress, next: done });
       logs.push(['trip completed', { tripInstanceId: trip.instance.id, reason: 'window_closed' }]);
       trip = undefined;
     }
     if (trip) {
       progress = { ...trip.progress };
     } else if (writes.trip === null) {
-      const options: { trip: TripRuntime; startM: number; progress: TripProgress }[] = [];
+      const prevStreaks = this.#streaks.get(vehicle.id);
+      streaks = new Map();
+      const options: { trip: TripRuntime; startM: number; streak: StartStreak | null }[] = [];
       for (const cand of startCandidates(this.#trips.values(), vehicle, at, t)) {
-        const ev = evaluateStart(cand, xy, t);
-        updates.set(cand, ev.progress);
-        if (ev.startM !== null) options.push({ trip: cand, startM: ev.startM, progress: ev.progress });
+        const ev = evaluateStart(cand, prevStreaks?.get(cand.instance.id) ?? null, xy, at, p.speedKmh, t);
+        if (ev.streak) streaks.set(cand.instance.id, ev.streak);
+        if (ev.startM !== null) options.push({ trip: cand, startM: ev.startM, streak: ev.streak });
       }
       const chosen = chooseStart(options, at);
       if (chosen) {
         trip = chosen.trip;
+        streaks.clear();
         progress = {
-          ...chosen.progress,
+          ...trip.progress,
           status: 'active',
           vehicleId: vehicle.id,
           startedBy: 'schedule',
           startedAt: at,
-          progressM: Math.max(chosen.progress.progressM, chosen.startM),
+          progressM: Math.max(trip.progress.progressM, chosen.startM),
           progressAt: at,
           awaySince: null,
           offRouteSince: null,
           pendingJump: null,
-          startCandidate: null,
         };
+        // The bus stood at the first stop before pulling away: it was arrived there.
+        const firstSeq = trip.instance.pattern.stops[0]?.sequence;
+        const since = chosen.streak?.atFirstStopSince ?? null;
+        if (since !== null) {
+          progress.stops = progress.stops.map((s) => (s.sequence === firstSeq && s.state === 'upcoming' ? { ...s, state: 'arrived', arrivedAt: since } : s));
+          const first = progress.stops.find((s) => s.sequence === firstSeq);
+          if (first?.state === 'arrived') {
+            writes.stopEvents.push(stopEventWrite(trip.instance.id, first));
+            logs.push(['stop event', { tripInstanceId: trip.instance.id, stopSequence: first.sequence, state: 'arrived' }]);
+          }
+        }
         justStarted = true;
         logs.push(['trip started', { tripInstanceId: trip.instance.id, vehicleId: vehicle.id }]);
       }
@@ -274,7 +326,7 @@ export class Engine {
       if (justStarted) {
         m = progress.progressM;
       } else {
-        const res = matchPosition(pattern.shape, progress, xy, at, expectedProgressAt(trip.instance, at), t);
+        const res = matchPosition(pattern.shape, progress, { xy, at, speedKmh: p.speedKmh, course: p.course }, expectedProgressAt(trip.instance, at), t);
         m = res.m;
         progress = { ...progress, ...res };
         if (before.offRouteSince === null && progress.offRouteSince !== null) {
@@ -286,7 +338,10 @@ export class Engine {
 
       const finalStop = pattern.stops[pattern.stops.length - 1];
       if (finalStop && m !== null && m >= finalStop.distM - t.arrivedRadiusM) progress.reachedFinalStop = true;
-      const leftFinalStop = progress.reachedFinalStop && finalStop !== undefined && distance(xy, finalStop.point) > t.finalLeaveM;
+      if (progress.reachedFinalStop && finalStop !== undefined) {
+        progress.finalLeaveCount = distance(xy, finalStop.point) > t.finalLeaveM ? progress.finalLeaveCount + 1 : 0;
+      }
+      const leftFinalStop = progress.finalLeaveCount >= t.finalLeaveFixes;
 
       const { stops, changes } = updateStops(pattern.stops, progress.stops, {
         m, progressM: progress.progressM, speedKmh: p.speedKmh, at, leftFinalStop,
@@ -301,7 +356,7 @@ export class Engine {
       }
 
       if (allStopsFinal(stops)) {
-        progress = this.#complete(progress, at);
+        progress = complete(progress, at);
         logs.push(['trip completed', { tripInstanceId: trip.instance.id, reason: 'last_stop' }]);
       } else if (progress.offRouteSince === null) {
         const etas = computeEtas(trip.instance, stops, progress.progressM, at, t);
@@ -314,8 +369,8 @@ export class Engine {
         });
       }
 
-      updates.set(trip, progress);
-      if (tripChanged(before, progress)) writes.trip = tripWrite(trip, progress);
+      updates.set(trip, { base: before, next: progress });
+      if (justStarted || tripChanged(before, progress)) writes.trip = tripWrite(trip, progress);
     }
 
     const activeId = trip && progress?.status === 'active' ? trip.instance.id : null;
@@ -339,17 +394,19 @@ export class Engine {
         throw err;
       }
     }
-    for (const [tr, next] of updates) tr.progress = next;
+    for (const [tr, u] of updates) this.#commit(tr, u);
+    if (streaks !== null) this.#streaks.set(vehicle.id, streaks);
+    else this.#streaks.delete(vehicle.id);
     this.#lastFix.set(vehicle.id, { at, positionId: p.positionId });
     this.metrics.positionsProcessed++;
     this.metrics.lastPositionAt = at.toISOString();
     for (const [msg, fields] of logs) this.#log.info(msg, fields);
     return 'processed';
   }
+}
 
-  #complete(progress: TripProgress, at: Date): TripProgress {
-    return { ...progress, status: 'completed', endedAt: at, pendingJump: null, startCandidate: null };
-  }
+function complete(progress: TripProgress, at: Date): TripProgress {
+  return { ...progress, status: 'completed', endedAt: at, pendingJump: null };
 }
 
 function tripChanged(a: TripProgress, b: TripProgress): boolean {

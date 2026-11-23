@@ -16,6 +16,8 @@ export const TZ = 'Asia/Tokyo';
 export const OPERATOR = 'op-1';
 export const VEHICLE = 'veh-1';
 export const DEVICE = '23273424';
+export const VEHICLE_2 = 'veh-2';
+export const DEVICE_2 = 'device-2';
 export const ROUTE = 'route-1';
 export const PATTERN = 'pattern-1';
 /** Origin of the test plane: Kobe. */
@@ -56,7 +58,6 @@ export class MemoryStore implements Store {
 
   loadSnapshot(): Promise<SnapshotRows> {
     const copy = structuredClone(this.rows);
-    copy.instances = copy.instances.filter((i) => i.status === 'planned' || i.status === 'active');
     for (const v of copy.vehicles) v.lastFixAt = this.vehicleState.get(v.id)?.recordedAt ?? null;
     return Promise.resolve(copy);
   }
@@ -67,33 +68,39 @@ export class MemoryStore implements Store {
       this.failNext--;
       return Promise.reject(new Error('simulated database failure'));
     }
+    const cancelled = (id: string): boolean => this.instance(id).status === 'cancelled';
     if (w.vehicleState) {
-      const prev = this.vehicleState.get(w.vehicleState.vehicleId);
-      if (!prev || prev.recordedAt < w.vehicleState.recordedAt) this.vehicleState.set(w.vehicleState.vehicleId, w.vehicleState);
+      const vs = w.vehicleState;
+      const prev = this.vehicleState.get(vs.vehicleId);
+      const tripInstanceId = vs.tripInstanceId !== null && cancelled(vs.tripInstanceId) ? null : vs.tripInstanceId;
+      if (!prev || prev.recordedAt < vs.recordedAt) this.vehicleState.set(vs.vehicleId, { ...vs, tripInstanceId });
     }
     if (w.trip) {
       const tr = w.trip;
       const row = this.instance(tr.id);
       if (row.status !== 'cancelled') {
+        const oldStatus = row.status;
         const rank: Record<TripStatus, number> = { planned: 0, active: 1, completed: 2, cancelled: 3 };
         if (rank[tr.status] > rank[row.status] && tr.status !== 'cancelled') row.status = tr.status;
+        if (oldStatus === 'planned') row.startedBy = tr.startedBy;
         row.vehicleId ??= tr.vehicleId;
         row.progressM = Math.max(row.progressM, tr.progressM);
         if (tr.progressAt && (!row.progressAt || tr.progressAt > row.progressAt)) row.progressAt = tr.progressAt;
         if (tr.lastConfirmedStopSequence !== null) {
           row.lastConfirmedStopSequence = Math.max(row.lastConfirmedStopSequence ?? -1, tr.lastConfirmedStopSequence);
         }
-        if (row.status !== 'completed') row.offRouteSince = tr.offRouteSince;
+        if (oldStatus !== 'completed') row.offRouteSince = tr.offRouteSince;
         row.startedAt ??= tr.startedAt;
         row.endedAt ??= tr.endedAt;
       }
     }
     for (const e of w.stopEvents) {
       const row = this.instance(e.tripInstanceId);
+      if (row.status === 'cancelled') continue;
       const ev = row.stopEvents.find((x) => x.sequence === e.sequence);
       if (!ev) throw new Error(`missing stop event ${e.sequence}`);
       if (stopStateRank[ev.state] >= stopStateRank[e.state] || ev.state === 'departed' || ev.state === 'passed') continue;
-      if (e.state === 'passed' && ev.arrivedAt !== null) throw new Error('arrived stop cannot be passed');
+      if (e.state === 'passed' && ev.arrivedAt !== null) continue;
       ev.state = e.state;
       ev.arrivedAt ??= e.arrivedAt;
       ev.departedAt ??= e.departedAt;
@@ -102,8 +109,9 @@ export class MemoryStore implements Store {
       this.transitions.push({ tripInstanceId: e.tripInstanceId, sequence: e.sequence, state: e.state, at: at ?? new Date(0) });
     }
     for (const e of w.etas) {
-      const ev = this.instance(e.tripInstanceId).stopEvents.find((x) => x.sequence === e.sequence);
-      if (ev && (ev.state === 'upcoming' || ev.state === 'approaching')) {
+      const row = this.instance(e.tripInstanceId);
+      const ev = row.stopEvents.find((x) => x.sequence === e.sequence);
+      if (ev && row.status !== 'cancelled' && (ev.state === 'upcoming' || ev.state === 'approaching')) {
         ev.eta = e.eta;
         this.etaWrites++;
       }
@@ -165,6 +173,8 @@ export function hhmm(s: string): number {
 
 export class Scenario {
   readonly plane = new LocalPlane(ORIGIN);
+  /** Course of the generated fixes: the direction of travel (set to null to send none). */
+  sendCourse = true;
   readonly shape: Polyline;
   readonly store: MemoryStore;
   readonly clock: FakeClock;
@@ -183,7 +193,10 @@ export class Scenario {
     };
     this.store = new MemoryStore({
       operators: [{ id: OPERATOR, timezone: TZ }],
-      vehicles: [{ id: VEHICLE, operatorId: OPERATOR, deviceId: DEVICE, lastFixAt: null }],
+      vehicles: [
+        { id: VEHICLE, operatorId: OPERATOR, deviceId: DEVICE, lastFixAt: null },
+        { id: VEHICLE_2, operatorId: OPERATOR, deviceId: DEVICE_2, lastFixAt: null },
+      ],
       shapes: [{ id: 'shape-1', operatorId: OPERATOR, coordinates: def.shape.map(ll), lengthM: this.shape.length }],
       patterns: [{ id: PATTERN, operatorId: OPERATOR, routeId: ROUTE, shapeId: 'shape-1' }],
       patternStops: def.stops.map((s) => {
@@ -195,7 +208,7 @@ export class Scenario {
       }),
       instances: def.trips.map((t) => ({
         id: t.id, operatorId: OPERATOR, serviceDate: t.serviceDate, tripId: `trip-${t.id}`, patternId: PATTERN,
-        startTimeS: hhmm(t.start), vehicleId: t.vehicleId === undefined ? VEHICLE : t.vehicleId,
+        startTimeS: hhmm(t.start), vehicleId: null, defaultVehicleId: t.vehicleId === undefined ? VEHICLE : t.vehicleId,
         status: 'planned', startedBy: 'schedule', progressM: 0, progressAt: null, lastConfirmedStopSequence: null,
         offRouteSince: null, startedAt: null, endedAt: null,
         stopEvents: def.stops.map((s) => ({ sequence: s.sequence, state: 'upcoming', arrivedAt: null, departedAt: null, passedAt: null, eta: null })),
@@ -242,7 +255,7 @@ export class Scenario {
         lon: ll.lon,
         lat: ll.lat,
         speedKmh: f.speedKmh,
-        course: null,
+        course: this.sendCourse ? (f.course ?? null) : null,
         accuracyM: 5,
         valid: true,
       }));
@@ -277,6 +290,8 @@ export interface Fix {
   t: Date;
   xy: XY;
   speedKmh: number;
+  /** Direction of travel (degrees from north), as a GPS course. */
+  course?: number | null;
   positionId?: number;
   deviceId?: string;
 }
@@ -307,8 +322,11 @@ export class Track {
 
   #emit(xy: XY, speedKmh: number): void {
     this.#t = new Date(this.#t.getTime() + this.#intervalS * 1000);
+    const dx = xy.x - this.#xy.x;
+    const dy = xy.y - this.#xy.y;
+    const course = speedKmh > 0 && (dx !== 0 || dy !== 0) ? ((Math.atan2(dx, dy) * 180) / Math.PI + 360) % 360 : null;
     this.#xy = xy;
-    this.fixes.push({ t: this.#t, xy, speedKmh });
+    this.fixes.push({ t: this.#t, xy, speedKmh, course });
   }
 
   /** Drive along the shape to `toM` at a constant speed. Optional `noise(i)` offsets each fix. */

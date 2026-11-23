@@ -70,6 +70,17 @@ describe('ETA v1', () => {
     assert.equal(bound.get(2)?.toISOString(), at(500).toISOString());
   });
 
+  it('waiting at a stop until its scheduled departure is no delay', () => {
+    const s = progress('departed');
+    const second = s[1];
+    assert.ok(second);
+    s[1] = { ...second, state: 'arrived' };
+    // On time at stop 2 (arrival 300 s, departure 330 s), still standing at 320 s.
+    assert.equal(computeEtas(inst, s, 1000, at(320), t).get(3)?.toISOString(), at(600).toISOString());
+    // Still there at 400 s: 70 s late.
+    assert.equal(computeEtas(inst, s, 1000, at(400), t).get(3)?.toISOString(), at(670).toISOString());
+  });
+
   it('a bus waiting early at the first stop does not make ETAs early', () => {
     const etas = computeEtas(inst, progress('arrived'), 0, at(-300), t);
     assert.equal(etas.get(2)?.toISOString(), at(300).toISOString());

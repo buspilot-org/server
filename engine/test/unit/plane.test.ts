@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { LocalPlane, Polyline, distance } from '../../src/geo/plane.ts';
+import { LocalPlane, Polyline, bearingDifference, distance } from '../../src/geo/plane.ts';
 
 const near = (a: number, b: number, tol: number, msg?: string): void => {
   assert.ok(Math.abs(a - b) <= tol, msg ?? `${a} ≉ ${b} (±${tol})`);
@@ -30,6 +30,14 @@ describe('LocalPlane', () => {
   });
 });
 
+describe('bearings', () => {
+  it('smallest angle between two bearings', () => {
+    assert.equal(bearingDifference(10, 350), 20);
+    assert.equal(bearingDifference(90, 270), 180);
+    assert.equal(bearingDifference(0, 0), 0);
+  });
+});
+
 describe('Polyline', () => {
   const line = new Polyline([{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }]);
 
@@ -50,7 +58,8 @@ describe('Polyline', () => {
 
   it('projects onto the nearest point within a range', () => {
     const p = { x: 60, y: 10 };
-    assert.deepEqual(line.nearest(p), { m: 60, distance: 10 });
+    assert.deepEqual(line.nearest(p), { m: 60, distance: 10, bearing: 90 });
+    assert.equal(line.nearest({ x: 110, y: 150 })?.bearing, 0, 'second segment runs north');
     const limited = line.nearest(p, 120, 200);
     assert.ok(limited);
     assert.equal(limited.m, 120);

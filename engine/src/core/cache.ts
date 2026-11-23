@@ -4,11 +4,23 @@
  * metres, pattern stops with their distance along the shape, trip instances
  * with their scheduled times.
  */
-import type { LonLat } from '../geo/plane.ts';
+import type { LonLat, XY } from '../geo/plane.ts';
 import { LocalPlane, Polyline } from '../geo/plane.ts';
 import type { InstanceRow, SnapshotRows } from '../store/store.ts';
 import { serviceTime } from './time.ts';
 import type { Operator, Pattern, PatternStop, TripInstance, TripProgress, Vehicle } from './types.ts';
+
+/** A stop without dist_along_shape is matched to a pass of the shape within this distance (m)… */
+const STOP_MATCH_M = 100;
+/** …preferring the earliest pass at most this much farther than the closest (m). */
+const STOP_TIE_M = 15;
+
+function projectStop(shape: Polyline, point: XY, fromM: number): number | null {
+  const passes = shape.candidates(point, fromM, shape.length, STOP_MATCH_M);
+  if (passes.length === 0) return shape.nearest(point, fromM, shape.length)?.m ?? null;
+  const best = Math.min(...passes.map((c) => c.distance));
+  return passes.find((c) => c.distance <= best + STOP_TIE_M)?.m ?? null;
+}
 
 export interface Cache {
   operators: Map<string, Operator>;
@@ -59,13 +71,14 @@ export function buildCache(rows: SnapshotRows): Cache {
       shapeRow.coordinates.map(([lon, lat]) => op.plane.toXY({ lon, lat })),
       shapeRow.lengthM,
     );
-    // Stops without dist_along_shape are projected onto the shape, searching
-    // forward from the previous stop, so a loop's second visit lands on the
-    // second pass.
+    // Stops without dist_along_shape are projected onto the shape after the
+    // previous stop (so a loop's second visit lands on the second pass). Where
+    // two passes are about equally close (both directions of a street), the
+    // earlier one wins; a stop clearly on one side keeps its own pass.
     let prevDist = 0;
     const stops: PatternStop[] = stopRows.map((r) => {
       const point = op.plane.toXY({ lon: r.lon, lat: r.lat });
-      let distM = r.distAlongShape ?? shape.nearest(point, prevDist, shape.length)?.m ?? prevDist;
+      let distM = r.distAlongShape ?? projectStop(shape, point, prevDist) ?? prevDist;
       distM = Math.min(Math.max(distM, prevDist), shape.length);
       prevDist = distM;
       return { sequence: r.sequence, distM, arrivalOffsetS: r.arrivalOffsetS, departureOffsetS: r.departureOffsetS, point };
@@ -114,8 +127,8 @@ export function progressFromRow(row: InstanceRow, pattern: Pattern): TripProgres
     awaySince: row.offRouteSince,
     offRouteSince: row.offRouteSince,
     pendingJump: null,
-    startCandidate: null,
     reachedFinalStop: lastEvent?.state === 'arrived',
+    finalLeaveCount: 0,
     // Stop events are created with the trip instance; fall back to
     // `upcoming` for any that are missing.
     stops: pattern.stops.map((ps) => {

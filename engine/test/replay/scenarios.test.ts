@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { XY } from '../../src/geo/plane.ts';
-import { Scenario, Track, VEHICLE, type RouteDef, type TripDef } from './harness.ts';
+import { DEVICE, DEVICE_2, Scenario, Track, VEHICLE, VEHICLE_2, type Fix, type RouteDef, type TripDef } from './harness.ts';
 
 const DATE = '2026-11-24';
 
@@ -188,11 +188,11 @@ describe('replay: GPS jump', () => {
     assert.equal(s.state('T1', 4), 'upcoming');
   });
 
-  it('after a data gap, a jump is accepted once three consistent positions confirm it', async () => {
+  it('after a short gap, a jump is accepted once three positions moving forward confirm it', async () => {
     const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
     const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 60_000));
     t.dwell(120).drive(STOP_M[2] - 5, 30).dwell(30).drive(1000, 30);
-    t.gap(120);
+    t.gap(30); // ~930 m in 35 s would be 95 km/h: a jump
     await s.feed(t.fixes);
 
     const t2 = new Track(s.shape, t.time, { startM: 1900 });
@@ -261,7 +261,8 @@ describe('replay: detour and off route', () => {
     const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
     const t = await runToStop3(s);
     const before = structuredClone(s.store.instance('T1'));
-    await s.feed([{ t: new Date(t.time.getTime() + 5000), xy: { x: 300, y: 340 }, speedKmh: 30 }]);
+    // More than 100 m from every part of the route inside the window.
+    await s.feed([{ t: new Date(t.time.getTime() + 5000), xy: { x: 500, y: 250 }, speedKmh: 30 }]);
     const after = s.store.instance('T1');
     assert.equal(after.offRouteSince, null);
     assert.equal(after.progressM, before.progressM);
@@ -406,5 +407,126 @@ describe('replay: trip end and ETAs', () => {
     assert.deepEqual(out, ['unknown_device']);
     assert.equal(s.store.persistCalls, 0);
     assert.equal(s.engine.metrics.positionsUnknownDevice, 1);
+  });
+});
+
+describe('replay: review findings', () => {
+  it('German School: a bus waiting on the outbound street with GPS pulled onto the return street', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 60_000));
+    t.dwell(120).drive(400, 30);
+    await s.feed(t.fixes);
+    // 60 s standing at x = 400; GPS 55 m from the outbound street, 15 m from the return street (stop 3).
+    const waiting: Fix[] = Array.from({ length: 12 }, (_, i) => ({
+      t: new Date(t.time.getTime() + (i + 1) * 5000), xy: { x: 400, y: 55 }, speedKmh: 0,
+    }));
+    await s.feed(waiting);
+    assert.equal(s.state('T1', 3), 'upcoming');
+    assert.equal(s.state('T1', 2), 'upcoming');
+    assert.ok(s.store.instance('T1').progressM < 450);
+
+    const rest = new Track(s.shape, waiting[waiting.length - 1]?.t ?? t.time, { startM: 400 });
+    rest.drive(STOP_M[2] - 5, 30).dwell(30).drive(STOP_M[3] - 2, 30).dwell(30).drive(STOP_M[4] - 2, 30).dwell(30)
+      .drive(STOP_M[5] - 2, 30).dwell(60).goTo({ x: 800, y: 480 }, 15);
+    await s.feed(rest.fixes);
+    assert.deepEqual(s.transitions('T1'), FULL_RUN);
+  });
+
+  it('a tracker reporting every 60 s: stops are still arrived at, not passed', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 120_000), { intervalS: 60 });
+    t.dwell(180);
+    for (const m of [STOP_M[2], STOP_M[3], STOP_M[4], STOP_M[5]]) t.drive(m - 5, 40).dwell(120);
+    t.goTo({ x: 800, y: 480 }, 10).dwell(120);
+    await s.feed(t.fixes);
+    assert.deepEqual(s.transitions('T1'), FULL_RUN);
+  });
+
+  it('a trip any vehicle may run: a second vehicle reporting at the same time does not undo the start', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30', vehicleId: null }]));
+    const bus1 = normalRun(s, 'T1').fixes;
+    // Bus 2 stands at the depot the whole time.
+    const send = async (f: Fix, device: string): Promise<unknown> => {
+      const ll = s.plane.toLonLat(f.xy);
+      return s.engine.handlePosition({
+        deviceId: device, positionId: null, fixTime: f.t, lon: ll.lon, lat: ll.lat,
+        speedKmh: f.speedKmh, course: f.course ?? null, accuracyM: 5, valid: true,
+      });
+    };
+    for (const f of bus1) {
+      s.clock.set(new Date(f.t.getTime() + 1000));
+      await Promise.all([send(f, DEVICE), send({ t: f.t, xy: { x: 0, y: 0 }, speedKmh: 0 }, DEVICE_2)]);
+      const mem = s.engine.trips.get('T1')?.progress.status;
+      assert.equal(mem, s.store.instance('T1').status, 'memory and database agree');
+    }
+    assert.deepEqual(s.transitions('T1'), FULL_RUN);
+    assert.equal(s.store.instance('T1').vehicleId, VEHICLE);
+    assert.equal(s.store.vehicleState.get(VEHICLE_2)?.tripInstanceId, null);
+  });
+
+  it('a trip cancelled in the database stops getting stop events after the next reload', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    const fixes = normalRun(s, 'T1').fixes;
+    const mid = fixes.findIndex((f) => f.xy.x > 600 && f.xy.y > 30); // on the way back
+    await s.feed(fixes.slice(0, mid));
+    assert.equal(s.store.instance('T1').status, 'active');
+    const before = s.transitions('T1');
+
+    s.store.instance('T1').status = 'cancelled';
+    await s.engine.reload();
+    await s.feed(fixes.slice(mid));
+    assert.deepEqual(s.transitions('T1'), before);
+    assert.equal(s.engine.trips.get('T1')?.progress.status, 'cancelled');
+    assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, null);
+  });
+
+  it('a vehicle assigned by staff for the day takes over after a reload', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s.store.instance('T1').vehicleId = VEHICLE_2; // Bus 1 is broken today
+    await s.engine.reload();
+    const fixes = normalRun(s, 'T1').fixes;
+    await s.feed(fixes.slice(0, 40)); // Bus 1 drives the route anyway
+    assert.equal(s.store.instance('T1').status, 'planned');
+    await s.feed(fixes.slice(40).map((f) => ({ ...f, deviceId: DEVICE_2 })));
+    assert.equal(s.store.instance('T1').vehicleId, VEHICLE_2);
+    assert.notEqual(s.store.instance('T1').status, 'planned');
+  });
+
+  it('a bus parked at the first stop does not start the trip (e.g. on a holiday)', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 20 * 60_000));
+    t.dwell(60 * 60);
+    await s.feed(t.fixes);
+    assert.equal(s.store.instance('T1').status, 'planned');
+    assert.deepEqual(s.transitions('T1'), []);
+    assert.equal(s.store.etaWrites, 0);
+  });
+
+  it('pulling away from the first stop starts the trip; the stop counts as arrived since the window opened', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    const start = s.tripStart('T1');
+    const t = new Track(s.shape, new Date(start.getTime() - 20 * 60_000));
+    t.dwell(21 * 60).drive(300, 30);
+    await s.feed(t.fixes);
+    assert.equal(s.store.instance('T1').status, 'active');
+    const first = s.store.instance('T1').stopEvents.find((e) => e.sequence === 1);
+    assert.equal(first?.state, 'departed');
+    assert.ok(first.arrivedAt && first.arrivedAt >= new Date(start.getTime() - 15 * 60_000));
+  });
+
+  it('a loop without dist_along_shape: stops are projected onto the right pass', async () => {
+    const def = loopRoute([{ id: 'L1', serviceDate: DATE, start: '07:30' }]);
+    const dist = def.stops.map((x) => x.distM ?? 0);
+    const noDist: RouteDef = { ...def, stops: def.stops.map((x) => ({ sequence: x.sequence, at: x.at, arrivalOffsetS: x.arrivalOffsetS, departureOffsetS: x.departureOffsetS })) };
+    const s = await Scenario.create(noDist);
+    const t = new Track(s.shape, new Date(s.tripStart('L1').getTime() - 60_000));
+    t.dwell(120);
+    for (const i of [1, 2, 3, 4, 5]) t.drive((dist[i] ?? 0) - 3, 30).dwell(30);
+    t.goTo({ x: -700, y: -300 }, 20).dwell(30);
+    await s.feed(t.fixes);
+    assert.deepEqual(s.transitions('L1'), [
+      '1:arrived', '1:departed', '2:arrived', '2:departed', '3:arrived', '3:departed',
+      '4:arrived', '4:departed', '5:arrived', '5:departed', '6:arrived', '6:departed',
+    ]);
   });
 });

@@ -75,6 +75,19 @@ describe('stop state machine', () => {
     assert.ok(allStopsFinal(s));
   });
 
+  it('arriving at a stop closes earlier stops, so events stay in route order', () => {
+    // Two stops 30 m apart: the bus stops at the second one without stopping at the first.
+    const close: PatternStop[] = [
+      { sequence: 1, distM: 0, arrivalOffsetS: 0, departureOffsetS: 0, point: { x: 0, y: 0 } },
+      { sequence: 2, distM: 500, arrivalOffsetS: 60, departureOffsetS: 60, point: { x: 500, y: 0 } },
+      { sequence: 3, distM: 530, arrivalOffsetS: 70, departureOffsetS: 70, point: { x: 530, y: 0 } },
+    ];
+    const init: StopProgress[] = close.map((s) => ({ sequence: s.sequence, state: s.sequence === 1 ? 'arrived' : 'upcoming', arrivedAt: s.sequence === 1 ? at : null, departedAt: null, passedAt: null, eta: null }));
+    const r = updateStops(close, init, input(528, 2), t);
+    assert.deepEqual(r.stops.map((s) => s.state), ['departed', 'passed', 'arrived']);
+    assert.deepEqual(r.changes.map((c) => `${c.sequence}:${c.to}`), ['1:departed', '2:passed', '3:arrived']);
+  });
+
   it('reports changes and the last confirmed stop', () => {
     const r = updateStops(stops, fresh(), input(1660, 35), t);
     assert.deepEqual(r.changes.map((c) => `${c.sequence}:${c.to}`), ['1:passed', '2:passed', '3:passed']);

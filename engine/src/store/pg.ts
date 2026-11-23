@@ -5,7 +5,8 @@
  * All writes are idempotent, so a retried position or a replay after a
  * restart cannot move anything backwards:
  * - progress_m only grows (`greatest`), trip status only moves
- *   planned → active → completed, a cancelled trip is never touched;
+ *   planned → active → completed; a cancelled trip is never touched (no
+ *   progress, stop events or ETAs, and vehicle_state does not link to it);
  * - stop events only move forward (`state < new state`), final states stay;
  * - vehicle_state only takes newer fixes.
  */
@@ -62,19 +63,18 @@ export class PgStore implements Store {
           join public.stop s on s.id = ps.stop_id`,
       sql<{
         id: string; operator_id: string; service_date: string; trip_id: string; pattern_id: string;
-        start_time: number; vehicle_id: string | null; status: TripStatus; started_by: 'schedule' | 'driver';
+        start_time: number; vehicle_id: string | null; default_vehicle_id: string | null; status: TripStatus; started_by: 'schedule' | 'driver';
         progress_m: number; progress_at: Date | null; last_confirmed_stop_sequence: number | null;
         off_route_since: Date | null; started_at: Date | null; ended_at: Date | null;
       }[]>`
         select ti.id, ti.operator_id, ti.service_date::text as service_date, ti.trip_id, t.pattern_id,
-               t.start_time, coalesce(ti.vehicle_id, t.vehicle_id) as vehicle_id, ti.status, ti.started_by,
+               t.start_time, ti.vehicle_id, t.vehicle_id as default_vehicle_id, ti.status, ti.started_by,
                ti.progress_m, ti.progress_at, ti.last_confirmed_stop_sequence, ti.off_route_since,
                ti.started_at, ti.ended_at
           from public.trip_instance ti
           join public.trip t on t.id = ti.trip_id
           join public.route r on r.id = ti.route_id
          where ti.kind = 'scheduled'
-           and ti.status in ('planned', 'active')
            and r.active
            and ti.service_date between (${now}::timestamptz - interval '2 days')::date
                                    and (${now}::timestamptz + interval '2 days')::date`,
@@ -106,7 +106,7 @@ export class PgStore implements Store {
       })),
       instances: instances.map((i) => ({
         id: i.id, operatorId: i.operator_id, serviceDate: i.service_date, tripId: i.trip_id, patternId: i.pattern_id,
-        startTimeS: i.start_time, vehicleId: i.vehicle_id, status: i.status, startedBy: i.started_by,
+        startTimeS: i.start_time, vehicleId: i.vehicle_id, defaultVehicleId: i.default_vehicle_id, status: i.status, startedBy: i.started_by,
         progressM: i.progress_m, progressAt: i.progress_at, lastConfirmedStopSequence: i.last_confirmed_stop_sequence,
         offRouteSince: i.off_route_since, startedAt: i.started_at, endedAt: i.ended_at,
         stopEvents: eventsByInstance.get(i.id) ?? [],
@@ -123,7 +123,8 @@ export class PgStore implements Store {
           insert into public.vehicle_state
             (vehicle_id, operator_id, trip_instance_id, location, speed_kmh, heading, accuracy_m, recorded_at)
           values (
-            ${vs.vehicleId}, ${vs.operatorId}, ${vs.tripInstanceId},
+            ${vs.vehicleId}, ${vs.operatorId},
+            (select id from public.trip_instance where id = ${vs.tripInstanceId}::uuid and status <> 'cancelled'),
             extensions.st_setsrid(extensions.st_makepoint(${vs.lon}, ${vs.lat}), 4326)::extensions.geography,
             ${vs.speedKmh}, ${vs.heading}, ${vs.accuracyM}, ${vs.recordedAt}
           )
@@ -161,7 +162,7 @@ export class PgStore implements Store {
             (operator_id, trip_instance_id, stop_sequence, state, arrived_at, departed_at, passed_at)
           select ti.operator_id, ti.id, ${e.sequence}, ${e.state}::public.stop_event_state,
                  ${e.arrivedAt}::timestamptz, ${e.departedAt}::timestamptz, ${e.passedAt}::timestamptz
-            from public.trip_instance ti where ti.id = ${e.tripInstanceId}
+            from public.trip_instance ti where ti.id = ${e.tripInstanceId} and ti.status <> 'cancelled'
           on conflict (trip_instance_id, stop_sequence) do update set
             state = excluded.state,
             arrived_at = coalesce(public.stop_event.arrived_at, excluded.arrived_at),
@@ -186,7 +187,8 @@ export class PgStore implements Store {
               from unnest(${seqs}::integer[], ${etas}::timestamptz[]) as v(stop_sequence, eta)
              where se.trip_instance_id = ${tripInstanceId}
                and se.stop_sequence = v.stop_sequence
-               and se.state in ('upcoming', 'approaching')`);
+               and se.state in ('upcoming', 'approaching')
+               and exists (select 1 from public.trip_instance ti where ti.id = se.trip_instance_id and ti.status <> 'cancelled')`);
         }
       }
       await Promise.all(queries);

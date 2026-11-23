@@ -60,8 +60,10 @@ export interface InstanceRow {
   patternId: string;
   /** `trip.start_time`, seconds since the service day start. */
   startTimeS: number;
-  /** Vehicle of the instance, or of the trip (schedule default), or null. */
+  /** Vehicle that runs (or ran) this instance: set when it starts, or by staff for one day. */
   vehicleId: string | null;
+  /** The trip's default vehicle (`trip.vehicle_id`), used while the instance has none. */
+  defaultVehicleId: string | null;
   status: TripStatus;
   startedBy: StartedBy;
   progressM: number;
@@ -85,8 +87,8 @@ export interface SnapshotRows {
 export interface Store {
   /**
    * Everything the engine caches: active vehicles, shapes, patterns and the
-   * scheduled trip instances that are planned or active on service dates
-   * around `now` (yesterday to tomorrow).
+   * scheduled trip instances (any status, so cancellations and completions
+   * made elsewhere are seen) on service dates around `now`.
    */
   loadSnapshot(now: Date): Promise<SnapshotRows>;
   /** Writes one position's (or tick's) changes in one transaction. Idempotent. */
