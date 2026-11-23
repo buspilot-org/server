@@ -783,3 +783,53 @@ describe('replay: fifth review findings', () => {
     });
   }
 });
+
+describe('replay: sixth review findings', () => {
+  const hairpin = (): RouteDef => ({
+    // Out along y = 0, a 20 m wide U-turn, back along y = 20, then north.
+    shape: [{ x: 0, y: 0 }, { x: 1000, y: 0 }, { x: 1000, y: 20 }, { x: 0, y: 20 }, { x: 0, y: 400 }],
+    stops: [
+      { sequence: 1, at: { x: 0, y: 0 }, arrivalOffsetS: 0, departureOffsetS: 60 },
+      { sequence: 2, at: { x: 500, y: 0 }, arrivalOffsetS: 180, departureOffsetS: 200 },
+      { sequence: 3, at: { x: 920, y: 20 }, arrivalOffsetS: 360, departureOffsetS: 390 }, // 80 m after the turn
+      { sequence: 4, at: { x: 0, y: 390 }, arrivalOffsetS: 720, departureOffsetS: 720 },
+    ],
+    trips: [{ id: 'T1', serviceDate: DATE, start: '07:30' }],
+  });
+
+  for (const intervalS of [5, 15, 60]) {
+    for (const bias of [10, 15]) {
+      it(`a stop 80 m after a 20 m hairpin, GPS ${bias} m towards the way out (${intervalS}-s tracker): arrived`, async () => {
+        const s = await Scenario.create(hairpin());
+        const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 120_000), { intervalS });
+        const pulled = (): XY => ({ x: 0, y: -bias });
+        t.dwell(180).drive(495, 30).dwell(60).drive(1020, 25);
+        t.drive(1095, 20, pulled).dwell(60).drive(1600, 25, pulled).drive(2010, 25);
+        await s.feed(t.fixes);
+        assert.equal(s.state('T1', 3), 'departed', s.transitions('T1').join(' '));
+        assert.ok(s.store.instance('T1').stopEvents.find((e) => e.sequence === 3)?.arrivedAt);
+      });
+    }
+  }
+
+  it('one outlier at the end of the route, then a side street: the final stop is not reached', async () => {
+    const def: RouteDef = {
+      shape: [{ x: 0, y: 0 }, { x: 900, y: 0 }, { x: 900, y: 40 }, { x: 860, y: 40 }],
+      stops: [
+        { sequence: 1, at: { x: 0, y: 0 }, arrivalOffsetS: 0, departureOffsetS: 60 },
+        { sequence: 2, at: { x: 500, y: 0 }, arrivalOffsetS: 180, departureOffsetS: 200 },
+        { sequence: 3, at: { x: 860, y: 40 }, arrivalOffsetS: 400, departureOffsetS: 400 },
+      ],
+      trips: [{ id: 'T1', serviceDate: DATE, start: '07:30' }],
+    };
+    const s = await Scenario.create(def);
+    const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 120_000), { intervalS: 15 });
+    t.dwell(180).drive(495, 30).dwell(60).drive(850, 25);
+    await s.feed(t.fixes);
+    const side = new Track(s.shape, t.time, { startXY: { x: 862, y: 62 }, intervalS: 15 });
+    side.goTo({ x: 862, y: 61 }, 2).goTo({ x: 850, y: -150 }, 20).dwell(60);
+    await s.feed(side.fixes);
+    assert.equal(s.state('T1', 3), 'upcoming');
+    assert.equal(s.store.instance('T1').status, 'active');
+  });
+});

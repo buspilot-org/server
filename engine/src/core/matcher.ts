@@ -102,16 +102,22 @@ export function matchPosition(
 
   // A match behind the window: the bus is at (or GPS puts it a little
   // behind) its progress on the current pass, e.g. after one fix too far
-  // ahead, or reversing. On route, but it never advances progress; it beats
-  // a later pass that is not closer. No heading check (reversing).
+  // ahead, or reversing (slowly, so the course is not checked). On route,
+  // but it never advances progress; it beats a later pass that is not
+  // closer, except one that continues a pending hold (a dwell just after a
+  // turn). It keeps the hold, and only reports a position (for arrivals)
+  // close behind the progress.
+  const held = prev.pendingJump;
+  const continuesHold = held !== null && onRoute.some((c) =>
+    c.m >= held.m - t.windowBehindM && c.m <= held.m + since(held.at) * t.windowMaxSpeedMps + t.onRouteM);
   const behindMatch = all
-    .filter((c) => c.m < from - 0.5 && c.distance <= t.onRouteM)
+    .filter((c) => c.m < from - 0.5 && c.distance <= t.onRouteM && headingOk(c))
     .sort((a, b) => a.distance - b.distance)[0];
   const nearestAhead = [...onRoute].sort((a, b) => a.distance - b.distance)[0];
-  if (behindMatch !== undefined && (nearestAhead === undefined || behindMatch.distance <= nearestAhead.distance)) {
+  if (!continuesHold && behindMatch !== undefined && (nearestAhead === undefined || behindMatch.distance <= nearestAhead.distance)) {
     next.awaySince = null;
-    next.m = behindMatch.m;
-    next.pendingJump = null;
+    next.progressAt = at;
+    next.m = prev.progressM - behindMatch.m <= t.windowBehindM + t.arrivedRadiusM ? behindMatch.m : null;
     return next;
   }
 
@@ -122,9 +128,15 @@ export function matchPosition(
         next.offRouteSince = next.awaySince;
       }
       const pending = prev.pendingJump;
-      if (pending !== null && shape.length - pending.m <= t.arrivedRadiusM) {
+      const end = shape.pointAt(shape.length);
+      const earlierPass = pending === null ? null : shape.nearest(xy, searchFrom, pending.firstM - t.onRouteM);
+      if (
+        pending !== null && pending.count >= 2 && shape.length - pending.m <= t.arrivedRadiusM
+        && (earlierPass === null || distance(xy, end) < earlierPass.distance)
+      ) {
         // Held at the end of the route (a final stop right after a turn) and
-        // now leaving it: there is no later pass to confuse it with.
+        // now leaving it from there, not from an earlier pass: there is no
+        // later pass to confuse it with.
         next.progressM = Math.max(prev.progressM, pending.m);
         next.progressAt = pending.at;
         next.confirmedHeld = pending.held;
