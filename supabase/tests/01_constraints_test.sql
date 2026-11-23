@@ -2,7 +2,7 @@
 -- Uses the demo operator from seed.sql.
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(24);
+select plan(25);
 
 -- Every table in public has RLS; anon has no write privileges.
 select is_empty(
@@ -186,6 +186,13 @@ select is(
   private.hash_invite_code('demo kobe-2026'),
   private.hash_invite_code('DEMO-KOBE-2026'),
   'invite code hash ignores case, spaces and dashes'
+);
+
+-- Deleting a whole operator cascades through everything.
+delete from public.operator where id = 'd0000000-0000-4000-8000-000000000001';
+select is_empty(
+  $$ select 1 from public.stop where operator_id = 'd0000000-0000-4000-8000-000000000001' $$,
+  'an operator with schedule data can be deleted'
 );
 
 select * from finish();

@@ -15,7 +15,7 @@
 --   Active trip instance with a vehicle state on A1, A2, A3 and C1.
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(70);
+select plan(72);
 
 -- Users ----------------------------------------------------------------------
 insert into auth.users (id, email, is_anonymous) values
@@ -534,6 +534,16 @@ select is(
 select is_empty(
   $$ select 1 from public.subscription where device_id = 'f0000000-0000-4000-8000-000000000002' $$,
   'revoking rider2''s membership removed its subscription to A2'
+);
+select is(
+  (select count(*) from public.subscription where device_id = 'f0000000-0000-4000-8000-000000000001'),
+  1::bigint,
+  'rider1 keeps its subscription to A1 (still a member)'
+);
+delete from public.audience where id = 'a5000000-0000-4000-8000-000000000001';
+select is_empty(
+  $$ select 1 from public.subscription where device_id = 'f0000000-0000-4000-8000-000000000001' $$,
+  'deleting the audience removes subscriptions that depended on it'
 );
 
 select * from finish();

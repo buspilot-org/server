@@ -158,9 +158,9 @@ begin
     select 1 from public.membership m
      where m.device_id = v_uid
        and m.audience_id = v_invite.audience_id
-       and m.revoked_at is not null
+       and m.revoked_at is null
   ) then
-    return query select 'revoked'::text, null::uuid, null::uuid;
+    return query select 'already_member'::text, v_invite.operator_id, v_invite.audience_id;
     return;
   end if;
 
@@ -168,9 +168,9 @@ begin
     select 1 from public.membership m
      where m.device_id = v_uid
        and m.audience_id = v_invite.audience_id
-       and m.revoked_at is null
+       and m.revoked_at is not null
   ) then
-    return query select 'already_member'::text, v_invite.operator_id, v_invite.audience_id;
+    return query select 'revoked'::text, null::uuid, null::uuid;
     return;
   end if;
 
@@ -187,50 +187,70 @@ revoke execute on function public.redeem_invite_code(text) from public, anon;
 grant execute on function public.redeem_invite_code(text) to authenticated;
 
 -- -----------------------------------------------------------------------------
--- Revoking or leaving a membership removes the device's subscriptions to
--- routes it can no longer see, so the engine stops sending alerts.
+-- Subscriptions follow access: whenever a device may lose access to a route
+-- (membership revoked or deleted, audience or audience_route deleted, route
+-- deactivated or made non-public, operator default changed), its
+-- subscriptions to that route's patterns are deleted, so the engine stops
+-- sending alerts. The engine should still check access before sending.
 -- -----------------------------------------------------------------------------
 
-create function private.membership_drop_subscriptions()
+-- Arrival-time access of a device (not the current user) to a route.
+create function private.device_can_see_route(p_device_id uuid, p_route_id uuid)
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select exists (
+    select 1
+    from public.route r
+    join public.operator o on o.id = r.operator_id
+    where r.id = p_route_id
+      and r.active
+      and (
+        coalesce(r.visibility, o.default_visibility) = 'public'
+        or exists (
+          select 1
+          from public.membership m
+          join public.audience_route ar on ar.audience_id = m.audience_id
+          where m.device_id = p_device_id
+            and m.revoked_at is null
+            and ar.route_id = r.id
+        )
+      )
+  )
+$$;
+
+create function private.drop_inaccessible_subscriptions()
 returns trigger
 language plpgsql
 security definer
 set search_path = ''
 as $$
 begin
-  if tg_op = 'UPDATE' and not (old.revoked_at is null and new.revoked_at is not null) then
-    return new;
-  end if;
-
   delete from public.subscription s
    using public.trip_pattern p
-   join public.route r on r.id = p.route_id
-   join public.operator o on o.id = r.operator_id
-   where s.device_id = old.device_id
-     and p.id = s.pattern_id
-     -- a route of the audience that was left
-     and exists (
-       select 1 from public.audience_route ar
-        where ar.audience_id = old.audience_id and ar.route_id = r.id
-     )
-     -- and not visible any more: not public, no other active membership
-     and not (r.active and coalesce(r.visibility, o.default_visibility) = 'public')
-     and not exists (
-       select 1
-         from public.membership m
-         join public.audience_route ar on ar.audience_id = m.audience_id
-        where m.device_id = old.device_id
-          and m.id <> old.id
-          and m.revoked_at is null
-          and ar.route_id = r.id
-     );
-
-  return coalesce(new, old);
+   where p.id = s.pattern_id
+     and not private.device_can_see_route(s.device_id, p.route_id);
+  return null;
 end;
 $$;
 
-create trigger membership_drop_subscriptions
+create trigger drop_inaccessible_subscriptions
   after update of revoked_at or delete on public.membership
-  for each row execute function private.membership_drop_subscriptions();
+  for each statement execute function private.drop_inaccessible_subscriptions();
+
+create trigger drop_inaccessible_subscriptions
+  after update or delete on public.audience_route
+  for each statement execute function private.drop_inaccessible_subscriptions();
+
+create trigger drop_inaccessible_subscriptions
+  after update of active, visibility on public.route
+  for each statement execute function private.drop_inaccessible_subscriptions();
+
+create trigger drop_inaccessible_subscriptions
+  after update of default_visibility on public.operator
+  for each statement execute function private.drop_inaccessible_subscriptions();
 
 revoke execute on all functions in schema private from public;

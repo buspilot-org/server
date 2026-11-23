@@ -150,6 +150,10 @@ security definer
 set search_path = ''
 as $$
 begin
+  -- Serialise owner changes per operator, so two owners cannot demote each
+  -- other at the same time.
+  perform 1 from public.operator o where o.id = old.operator_id for update;
+
   if old.role = 'owner'
      and (tg_op = 'DELETE' or new.role <> 'owner' or new.operator_id <> old.operator_id)
      and exists (select 1 from public.operator o where o.id = old.operator_id)
@@ -165,6 +169,8 @@ begin
 end;
 $$;
 
+-- Deleting the auth user of an operator's only owner fails too: transfer
+-- ownership or delete the operator first.
 create trigger staff_role_keep_owner
   after update or delete on public.staff_role
   for each row execute function private.staff_role_keep_owner();
@@ -234,7 +240,9 @@ create table public.trip_pattern (
   updated_at timestamptz not null default now(),
   unique (operator_id, id),
   foreign key (operator_id, route_id) references public.route (operator_id, id) on delete cascade,
-  foreign key (operator_id, shape_id) references public.shape (operator_id, id)
+  -- Deferred, so deleting a whole operator (cascade) works; deleting a shape
+  -- that is still in use fails at commit.
+  foreign key (operator_id, shape_id) references public.shape (operator_id, id) deferrable initially deferred
 );
 
 create index trip_pattern_route_id_idx on public.trip_pattern (operator_id, route_id);
@@ -256,7 +264,7 @@ create table public.pattern_stop (
   unique (operator_id, pattern_id, stop_sequence),
   check (departure_offset >= arrival_offset),
   foreign key (operator_id, pattern_id) references public.trip_pattern (operator_id, id) on delete cascade,
-  foreign key (operator_id, stop_id) references public.stop (operator_id, id)
+  foreign key (operator_id, stop_id) references public.stop (operator_id, id) deferrable initially deferred
 );
 
 create index pattern_stop_stop_id_idx on public.pattern_stop (operator_id, stop_id);
@@ -309,7 +317,7 @@ create table public.trip (
   unique (operator_id, id),
   unique (operator_id, gtfs_id),
   foreign key (operator_id, pattern_id) references public.trip_pattern (operator_id, id) on delete cascade,
-  foreign key (operator_id, service_calendar_id) references public.service_calendar (operator_id, id)
+  foreign key (operator_id, service_calendar_id) references public.service_calendar (operator_id, id) deferrable initially deferred
 );
 
 create index trip_pattern_id_idx on public.trip (operator_id, pattern_id);
@@ -567,12 +575,27 @@ create table public.device (
   -- BCP 47 language tag for notifications.
   language text check (language ~ '^[a-z]{2,3}(-[A-Za-z0-9]{1,8})*$'),
   created_at timestamptz not null default now(),
-  -- Clients may touch it, but not push it into the future to escape the
-  -- 90-day retention.
-  last_seen_at timestamptz not null default now() check (last_seen_at <= now() + interval '1 day')
+  last_seen_at timestamptz not null default now()
 );
 
 create index device_last_seen_at_idx on public.device (last_seen_at);
+
+-- Clients may touch last_seen_at but not push it into the future to escape
+-- the 90-day retention.
+create function private.device_clamp_last_seen()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  new.last_seen_at := least(new.last_seen_at, now());
+  return new;
+end;
+$$;
+
+create trigger device_clamp_last_seen
+  before insert or update on public.device
+  for each row execute function private.device_clamp_last_seen();
 
 comment on table public.device is
   'Anonymous rider device (id = auth.users.id of an anonymous user). No operator_id: a device can join several operators.';

@@ -552,15 +552,16 @@ create policy "own device" on public.device
   using (id = (select auth.uid()))
   with check (id = (select auth.uid()));
 
--- Memberships are created by public.redeem_invite_code. Riders may read and
--- leave (delete) their own; editors may read and revoke.
+-- Memberships are created by public.redeem_invite_code. Riders may read their
+-- own and leave (delete) active ones; a revoked row stays, so the device
+-- cannot rejoin by code. Editors may read, revoke and delete.
 create policy "own memberships" on public.membership
   for select to authenticated
   using (device_id = (select auth.uid()));
 
 create policy "leave own memberships" on public.membership
   for delete to authenticated
-  using (device_id = (select auth.uid()));
+  using (device_id = (select auth.uid()) and revoked_at is null);
 
 create policy "editors read memberships" on public.membership
   for select to authenticated

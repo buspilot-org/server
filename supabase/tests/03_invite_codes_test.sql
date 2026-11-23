@@ -2,7 +2,7 @@
 -- seed.sql and a few test codes.
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(19);
+select plan(20);
 
 insert into auth.users (id, is_anonymous) values
   ('f0000000-0000-4000-8000-0000000000d1', true),
@@ -68,6 +68,9 @@ select is_empty(
   $$ select 1 from public.route where operator_id = 'd0000000-0000-4000-8000-000000000001' $$,
   'after revocation, the rider sees no route of the demo school'
 );
+delete from public.membership;
+select is((select status from public.redeem_invite_code('DEMO-KOBE-2026')), 'revoked',
+  'a rider cannot delete its revoked membership to rejoin');
 reset role;
 
 -- Retention: inactive devices and anonymous users without a device go.
@@ -84,9 +87,10 @@ select set_eq(
   array['f0000000-0000-4000-8000-0000000000e2']::uuid[],
   'purge deletes inactive devices and old anonymous users without a device'
 );
-select throws_ok(
-  $$ update public.device set last_seen_at = '9999-01-01' where id = 'f0000000-0000-4000-8000-0000000000e2' $$,
-  '23514', null, 'last_seen_at cannot be pushed into the future'
+update public.device set last_seen_at = '9999-01-01' where id = 'f0000000-0000-4000-8000-0000000000e2';
+select ok(
+  (select last_seen_at <= now() from public.device where id = 'f0000000-0000-4000-8000-0000000000e2'),
+  'last_seen_at cannot be pushed into the future'
 );
 
 -- Throttling: 10 failures within an hour block further attempts, even with a
