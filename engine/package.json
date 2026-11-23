@@ -1,0 +1,31 @@
+{
+  "name": "buspilot-engine",
+  "version": "0.1.0",
+  "description": "Buspilot engine: turns Traccar positions into trip progress, stop events and ETAs",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "start": "node src/main.ts",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --test-reporter=spec \"test/unit/**/*.test.ts\" \"test/replay/**/*.test.ts\"",
+    "test:db": "node --test --test-concurrency=1 --test-reporter=spec \"test/db/**/*.test.ts\"",
+    "check": "npm run lint && npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.11",
+    "hono": "^4.13.21",
+    "postgres": "^4.1.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.6.6",
+    "eslint": "^10.15.0",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.73.0"
+  }
+}
