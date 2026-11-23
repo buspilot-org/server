@@ -35,6 +35,22 @@ npx supabase test db                # run database tests (pgTAP) in supabase/tes
 npx supabase stop
 ```
 
+## Database
+
+Migrations in `supabase/migrations/` create the schema (Postgres + PostGIS), row-level security and a daily retention job (pg_cron). Tests in `supabase/tests/` are pgTAP.
+
+- **Identities** are Supabase Auth users: staff sign in with email and get a role per operator in `staff_role` (`owner`, `editor`, `driver`); rider devices sign in anonymously and get a `device` row with the same ID.
+- **Riders** join an audience with an invite code: `select * from redeem_invite_code('XXXXX-XXXXX')` (RPC). Editors create codes with `create_invite_code(audience_id)`; only the hash is stored.
+- **Route visibility** (`public`, `invited_map`, `invited_eta`) decides what a rider sees: arrival times only, or also the map (shape, stop locations, vehicle position). Stop locations are read through the `stop_location` view, not `stop.location`.
+- **The engine** writes live state (trip progress, stop events, vehicle state, alerts, vehicle events) with the service role.
+
+`seed.sql` adds a fictional demo school in Kobe with one route (a loop that serves one stop twice), two trips, a vehicle for Traccar device `23273424`, and the invite code `DEMO-KOBE-2026`. To try the admin side locally, sign up a user in Studio and give it a role:
+
+```sql
+insert into public.staff_role (operator_id, user_id, role)
+values ('d0000000-0000-4000-8000-000000000001', '<auth user id>', 'owner');
+```
+
 ## Contributing
 
 Every pull request gets at least one thorough self-review before merge; see the [Buspilot agent policy](https://github.com/buspilot-org/.github/blob/main/docs/agent-policy.md).
