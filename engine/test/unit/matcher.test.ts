@@ -10,7 +10,7 @@ const shape = new Polyline([{ x: 0, y: 0 }, { x: 3000, y: 0 }, { x: 3000, y: 40 
 const start = new Date('2026-11-24T22:30:00Z');
 const sec = (s: number): Date => new Date(start.getTime() + s * 1000);
 const state = (progressM: number, extra: Partial<MatchState> = {}): MatchState => ({
-  progressM, progressAt: start, lastFixAt: start, awaySince: null, offRouteSince: null, pendingJump: null, ...extra,
+  progressM, progressAt: start, lastFixAt: start, lastFixXY: null, awaySince: null, offRouteSince: null, pendingJump: null, ...extra,
 });
 const fix = (xy: XY, s: number, speedKmh = 30, course: number | null = null) => ({ xy, at: sec(s), speedKmh, course });
 

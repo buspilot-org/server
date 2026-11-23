@@ -133,56 +133,29 @@ export class Polyline {
   }
 
   /**
-   * Candidate matches of `p` within `[fromM, toM]`, one per section of the
-   * line that comes within `maxDistance`: where the line passes the point
-   * twice (a loop, the same road in both directions), each pass is a separate
-   * candidate. Sorted by `m`.
+   * Candidate matches of `p` within `[fromM, toM]`, one per pass of the line
+   * within `maxDistance`: where the line passes the point twice (a loop, the
+   * same road in both directions, the two sides of a turn), each pass is a
+   * separate candidate, represented by its closest point. Sorted by `m`.
    *
-   * Sections are separated where the line moves farther than `maxDistance`
-   * away from the point; candidates closer than `mergeM` along the line
-   * (a curve made of short segments) count as one section.
+   * Two points of the line belong to the same pass if the line between them
+   * is not longer than going through `p` (their distances to `p` added) plus
+   * `sameSectionSlackM`: a line that leaves the point and comes back is a
+   * new pass. Projections clamped to the ends of the range count too, so a
+   * caller can tell them apart by `m === fromM`.
    */
-  candidates(p: XY, fromM: number, toM: number, maxDistance: number, mergeM = maxDistance): Projection[] {
-    // Runs of consecutive segments that come within maxDistance.
-    const runs: Projection[][] = [];
-    let run: Projection[] = [];
+  candidates(p: XY, fromM: number, toM: number, maxDistance: number, sameSectionSlackM = 10): Projection[] {
+    const projections: Projection[] = [];
     this.#eachSegment(p, fromM, toM, (proj) => {
-      if (proj.distance <= maxDistance) {
-        run.push(proj);
-      } else if (run.length > 0) {
-        runs.push(run);
-        run = [];
-      }
+      if (proj.distance <= maxDistance) projections.push(proj);
     });
-    if (run.length > 0) runs.push(run);
-
-    // Local minima of the distance along each run. A vertex shared by two
-    // segments shows up in both; on equal distances the earlier one wins
-    // (the conservative choice, since progress only moves forward).
-    const minima: Projection[] = [];
-    for (const r of runs) {
-      for (let i = 0; i < r.length; i++) {
-        const cur = r[i];
-        if (cur === undefined) continue;
-        const prev = r[i - 1];
-        const next = r[i + 1];
-        if ((prev === undefined || cur.distance < prev.distance) && (next === undefined || cur.distance <= next.distance)) {
-          minima.push(cur);
-        }
-      }
+    projections.sort((a, b) => a.distance - b.distance || a.m - b.m);
+    const passes: Projection[] = [];
+    for (const c of projections) {
+      const samePass = passes.some((q) => Math.abs(c.m - q.m) <= c.distance + q.distance + sameSectionSlackM);
+      if (!samePass) passes.push(c);
     }
-
-    // A curve made of short segments can have several minima close together.
-    const out: Projection[] = [];
-    for (const c of minima) {
-      const last = out[out.length - 1];
-      if (last !== undefined && c.m - last.m <= mergeM) {
-        if (c.distance < last.distance) out[out.length - 1] = c;
-      } else {
-        out.push(c);
-      }
-    }
-    return out;
+    return passes.sort((a, b) => a.m - b.m);
   }
 
   #eachSegment(

@@ -143,6 +143,7 @@ export function progressFromRow(row: InstanceRow, pattern: Pattern): TripProgres
     progressM: row.progressM,
     progressAt: row.progressAt,
     lastFixAt: row.progressAt,
+    lastFixXY: null,
     lastConfirmedStopSequence: row.lastConfirmedStopSequence,
     awaySince: row.offRouteSince,
     offRouteSince: row.offRouteSince,

@@ -22,6 +22,7 @@ import type { Cache } from './cache.ts';
 import { buildCache, progressFromRow } from './cache.ts';
 import { computeEtas, expectedProgressAt } from './eta.ts';
 import { matchPosition } from './matcher.ts';
+import type { StopChange } from './stops.ts';
 import { allStopsFinal, lastConfirmedStop, updateStops } from './stops.ts';
 import { secondsBetween } from './time.ts';
 import type {
@@ -77,6 +78,8 @@ export class Engine {
   /** Start streaks per vehicle, by trip instance. */
   readonly #streaks = new Map<string, Map<string, StartStreak>>();
   readonly #queues = new Map<string, Promise<unknown>>();
+  /** Trip starts the database refused (another vehicle runs the trip), per vehicle and trip, until the next reload. */
+  readonly #refused = new Set<string>();
   readonly metrics: EngineMetrics = {
     positionsProcessed: 0,
     positionsUnknownDevice: 0,
@@ -144,7 +147,12 @@ export class Engine {
       } else if (mem.status === 'active' && (row.status === 'cancelled' || row.status === 'completed')) {
         existing.progress = { ...existing.progress, status: row.status, endedAt: row.endedAt ?? existing.progress.endedAt };
         this.#log.info('trip ended in the database', { tripInstanceId: instance.id, status: row.status });
-      } else if (mem.status === 'active' && (row.status !== 'active' || row.vehicleId !== mem.vehicleId)) {
+      } else if (
+        mem.status === 'active' && row.vehicleId !== null && row.vehicleId !== mem.vehicleId
+        && (row.status === 'active' || row.status === 'planned')
+      ) {
+        // (A planned row without a vehicle is only an older snapshot of a
+        // start being written right now: memory is newer.)
         // The database disagrees about who runs the trip (a staff assignment
         // or driver start elsewhere, or a lost race): the database wins.
         existing.progress = progressFromRow(row, instance.pattern);
@@ -159,6 +167,7 @@ export class Engine {
     for (const streaks of this.#streaks.values()) {
       for (const id of streaks.keys()) if (this.#trips.get(id)?.progress.status !== 'planned') streaks.delete(id);
     }
+    this.#refused.clear();
     this.#cache = cache;
     this.metrics.lastReloadAt = this.#clock.now().toISOString();
     if (cache.stopsWithoutDist > 0) {
@@ -214,7 +223,12 @@ export class Engine {
         if (base.status !== 'active' || windowOpen(tr.instance, now, this.#t)) return;
         const next = complete(base, now);
         const res = await this.#store.persist({ vehicleId, vehicleState: null, trip: tripWrite(tr, next), stopEvents: [], etas: [] });
-        if (res.tripApplied) this.#commit(tr, { base, next });
+        if (!res.tripApplied) {
+          // Not this vehicle's trip any more: take the database's state.
+          tr.progress = { ...base, status: 'completed', endedAt: now };
+          return;
+        }
+        this.#commit(tr, { base, next });
         this.#log.info('trip completed', { tripInstanceId: tr.instance.id, reason: 'window_closed' });
       }));
     }
@@ -296,6 +310,7 @@ export class Engine {
       streaks = new Map();
       const options: { trip: TripRuntime; startM: number; streak: StartStreak | null }[] = [];
       for (const cand of startCandidates(this.#trips.values(), vehicle, at, t)) {
+        if (this.#refused.has(`${vehicle.id}:${cand.instance.id}`)) continue;
         const ev = evaluateStart(cand, prevStreaks?.get(cand.instance.id) ?? null, xy, at, p.speedKmh, t);
         if (ev.streak) streaks.set(cand.instance.id, ev.streak);
         if (ev.startM !== null) options.push({ trip: cand, startM: ev.startM, streak: ev.streak });
@@ -313,6 +328,7 @@ export class Engine {
           progressM: Math.max(trip.progress.progressM, chosen.startM),
           progressAt: at,
           lastFixAt: at,
+          lastFixXY: xy,
           awaySince: null,
           offRouteSince: null,
           pendingJump: null,
@@ -338,12 +354,24 @@ export class Engine {
       const before = trip.progress;
       const pattern = trip.instance.pattern;
       let m: number | null;
+      const changes: StopChange[] = [];
       if (justStarted) {
         m = progress.progressM;
       } else {
-        const res = matchPosition(pattern.shape, progress, { xy, at, speedKmh: p.speedKmh, course: p.course }, expectedProgressAt(trip.instance, at), t);
-        m = res.m;
-        progress = { ...progress, ...res };
+        const { m: matched, confirmedHeld, ...state } = matchPosition(
+          pattern.shape, progress, { xy, at, speedKmh: p.speedKmh, course: p.course }, expectedProgressAt(trip.instance, at), t,
+        );
+        m = matched;
+        const progressBefore = progress.progressM;
+        progress = { ...progress, ...state, stops: progress.stops };
+        // Fixes held for confirmation (e.g. a stop dwell) count now, in order.
+        let heldProgress = progressBefore;
+        for (const h of confirmedHeld) {
+          heldProgress = Math.max(heldProgress, h.m);
+          const r = updateStops(pattern.stops, progress.stops, { m: h.m, progressM: heldProgress, speedKmh: h.speedKmh, at: h.at, leftFinalStop: false }, t);
+          progress.stops = r.stops;
+          changes.push(...r.changes);
+        }
         if (before.offRouteSince === null && progress.offRouteSince !== null) {
           logs.push(['off route', { tripInstanceId: trip.instance.id }]);
         } else if (before.offRouteSince !== null && progress.offRouteSince === null) {
@@ -358,15 +386,24 @@ export class Engine {
       }
       const leftFinalStop = progress.finalLeaveCount >= t.finalLeaveFixes;
 
-      const { stops, changes } = updateStops(pattern.stops, progress.stops, {
+      const current = updateStops(pattern.stops, progress.stops, {
         m, progressM: progress.progressM, speedKmh: p.speedKmh, at, leftFinalStop,
       }, t);
+      const stops = current.stops;
+      changes.push(...current.changes);
       progress.stops = stops;
       progress.lastConfirmedStopSequence = lastConfirmedStop(stops);
+      // One write per change, in order (a replayed dwell can arrive and
+      // depart a stop within one fix).
       for (const c of changes) {
         const s = stops.find((x) => x.sequence === c.sequence);
         if (!s) continue;
-        writes.stopEvents.push(stopEventWrite(trip.instance.id, s));
+        writes.stopEvents.push(stopEventWrite(trip.instance.id, {
+          ...s,
+          state: c.to,
+          departedAt: c.to === 'departed' ? s.departedAt : null,
+          passedAt: c.to === 'passed' ? s.passedAt : null,
+        }));
         logs.push(['stop event', { tripInstanceId: trip.instance.id, stopSequence: c.sequence, state: c.to }]);
       }
 
@@ -417,6 +454,7 @@ export class Engine {
         // reload brings the database's state.
         this.metrics.concurrentTripUpdates++;
         this.#log.warn('trip write not applied; change not kept', { tripInstanceId: tr.instance.id, vehicleId: vehicle.id });
+        if (tr.progress.status === 'planned') this.#refused.add(`${vehicle.id}:${tr.instance.id}`);
         continue;
       }
       this.#commit(tr, u);

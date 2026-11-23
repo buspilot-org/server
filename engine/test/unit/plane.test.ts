@@ -79,6 +79,16 @@ describe('Polyline', () => {
     assert.equal(outAndBack.candidates({ x: 400, y: 25 }, 0, 1000, 50).length, 1);
   });
 
+  it('tells apart the two sides of a tight turn', () => {
+    // Out along y = 0, a 40 m connector, back along y = 40. A fix 25 m north
+    // of the out street, 20 m before the turn, is near both sides.
+    const turn = new Polyline([{ x: 0, y: 0 }, { x: 900, y: 0 }, { x: 900, y: 40 }, { x: 0, y: 40 }]);
+    const c = turn.candidates({ x: 880, y: 25 }, 0, turn.length, 100);
+    assert.equal(c.length, 2, JSON.stringify(c));
+    near(c[0]?.m ?? -1, 880, 1e-9);
+    assert.ok((c[1]?.m ?? 0) > 920);
+  });
+
   it('does not report vertices of a straight, finely split road as extra candidates', () => {
     const pts = Array.from({ length: 51 }, (_, i) => ({ x: i * 20, y: 0 }));
     const road = new Polyline(pts);

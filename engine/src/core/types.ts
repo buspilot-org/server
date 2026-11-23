@@ -78,8 +78,16 @@ export interface PendingJump {
   firstM: number;
   m: number;
   count: number;
-  /** Fixes of the confirmation with the bus moving (speed ≥ arrivedMaxSpeedKmh). */
+  /** Fixes of the confirmation with the bus moving along the new section. */
   moving: number;
+  at: Date;
+  /** The held fixes, replayed into the stop state machine once confirmed (a stop dwell during the hold). */
+  held: HeldFix[];
+}
+
+export interface HeldFix {
+  m: number;
+  speedKmh: number;
   at: Date;
 }
 
@@ -95,6 +103,8 @@ export interface TripProgress {
   progressAt: Date | null;
   /** Fix time of the last position received during the trip (accepted or not). */
   lastFixAt: Date | null;
+  /** Where that position was (operator plane), for the direction of movement. */
+  lastFixXY: XY | null;
   lastConfirmedStopSequence: number | null;
   /** Since when the bus has been more than offRouteM from the route (not yet off route). */
   awaySince: Date | null;

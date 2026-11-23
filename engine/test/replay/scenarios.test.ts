@@ -643,3 +643,89 @@ describe('replay: database wins over memory', () => {
     assert.equal(s.transitions('T1').length, before);
   });
 });
+
+describe('replay: fourth review findings', () => {
+  function withStops(moves: Record<number, XY>): RouteDef {
+    const def = germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]);
+    def.stops = def.stops.map((x) => (moves[x.sequence] ? { ...x, at: moves[x.sequence] ?? x.at } : x));
+    return def;
+  }
+  async function outbound(def: RouteDef, toM: number): Promise<{ s: Scenario; t: Track }> {
+    const s = await Scenario.create(def);
+    const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 60_000));
+    t.dwell(120).drive(toM, 30).dwell(5);
+    await s.feed(t.fixes);
+    return { s, t };
+  }
+  const at = (t: Track, i: number): Date => new Date(t.time.getTime() + i * 5000);
+
+  it('standing just before the turn with GPS pulled north does not move onto the return street', async () => {
+    const { s, t } = await outbound(withStops({ 3: { x: 870, y: 40 } }), 880);
+    await s.feed(Array.from({ length: 24 }, (_, i) => ({ t: at(t, i + 1), xy: { x: 880, y: 25 }, speedKmh: 0 })));
+    assert.ok(s.store.instance('T1').progressM < 935, String(s.store.instance('T1').progressM));
+    assert.notEqual(s.state('T1', 2), 'passed');
+    assert.equal(s.state('T1', 3), 'upcoming');
+  });
+
+  it('one outlier on the return street, then slow traffic eastwards: no move onto it', async () => {
+    const { s, t } = await outbound(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]), 400);
+    await s.feed([
+      { t: at(t, 1), xy: { x: 445, y: 55 }, speedKmh: 7, course: 90 },
+      { t: at(t, 2), xy: { x: 410, y: 10 }, speedKmh: 7, course: 90 },
+      { t: at(t, 3), xy: { x: 420, y: 10 }, speedKmh: 7, course: 90 },
+      { t: at(t, 4), xy: { x: 430, y: 10 }, speedKmh: 7, course: 90 },
+    ]);
+    assert.ok(s.store.instance('T1').progressM < 500);
+    assert.equal(s.state('T1', 2), 'upcoming');
+  });
+
+  it('one outlier, then a standing bus with speed jitter and no course: no move onto the return street', async () => {
+    const { s, t } = await outbound(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30' }]), 400);
+    await s.feed([
+      { t: at(t, 1), xy: { x: 440, y: 55 }, speedKmh: 6 },
+      { t: at(t, 2), xy: { x: 405, y: 15 }, speedKmh: 6 },
+      { t: at(t, 3), xy: { x: 402, y: 10 }, speedKmh: 0 },
+      { t: at(t, 4), xy: { x: 404, y: 12 }, speedKmh: 6 },
+    ]);
+    assert.ok(s.store.instance('T1').progressM < 500);
+    assert.equal(s.state('T1', 3), 'upcoming');
+  });
+
+  it('a stop right after the turn: a dwell while the position is held still counts as arrived (5-s tracker)', async () => {
+    // Stop 2 at x = 700 on the way out (m = 700), stop 3 just after the turn (m = 990).
+    const { s, t } = await outbound(withStops({ 2: { x: 700, y: 0 }, 3: { x: 850, y: 40 } }), 900);
+    const tr = new Track(s.shape, t.time, { startM: 900 });
+    tr.drive(988, 15).dwell(40).drive(1300, 25);
+    await s.feed(tr.fixes);
+    assert.equal(s.state('T1', 3), 'departed');
+    const ev = s.store.instance('T1').stopEvents.find((e) => e.sequence === 3);
+    assert.ok(ev?.arrivedAt);
+  });
+
+  it('a stop right after the turn with a 60-s tracker', async () => {
+    const def = withStops({ 3: { x: 830, y: 40 } }); // m = 1010
+    const s = await Scenario.create(def);
+    const t = new Track(s.shape, new Date(s.tripStart('T1').getTime() - 120_000), { intervalS: 60 });
+    t.dwell(180);
+    for (const m of [STOP_M[2], 1010, STOP_M[4], STOP_M[5]]) t.drive(m - 5, 30).dwell(120);
+    t.goTo({ x: 800, y: 480 }, 10).dwell(120);
+    await s.feed(t.fixes);
+    assert.deepEqual(s.transitions('T1'), FULL_RUN);
+  });
+
+  it('a reload with a snapshot taken just before a start does not undo the start', async () => {
+    const s = await Scenario.create(germanSchool([{ id: 'T1', serviceDate: DATE, start: '07:30', vehicleId: null }]));
+    const fixes = normalRun(s, 'T1').fixes;
+    const driven = fixes.findIndex((f) => f.xy.x >= 300 && f.xy.y < 30);
+    const startIdx = fixes.findIndex((f) => f.speedKmh > 0);
+    await s.feed(fixes.slice(0, startIdx));
+    const stale = await s.store.loadSnapshot();
+    await s.feed(fixes.slice(startIdx, driven));
+    assert.equal(s.store.instance('T1').status, 'active');
+    const real = s.store.loadSnapshot.bind(s.store);
+    s.store.loadSnapshot = () => Promise.resolve(stale);
+    await s.engine.reload();
+    s.store.loadSnapshot = real;
+    assert.equal(s.engine.trips.get('T1')?.progress.status, 'active');
+  });
+});
