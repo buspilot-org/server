@@ -5,7 +5,7 @@
 //   node supabase/scripts/national-holidays.mjs [year ...] [--file syukujitsu.csv]
 //
 // Without years: the current and the next year (Asia/Tokyo). Without --file
-// the CSV is downloaded from CSV_URL. The output is an idempotent upsert; put
+// the CSV is downloaded from CSV_URL. The output replaces the given years (delete + insert, safe to rerun); put
 // it into a new migration (npx supabase migration new national_holidays_<year>)
 // so the hosted project gets it too.
 //
@@ -16,6 +16,7 @@
 // script, so a new holiday gets its translations before it is stored.
 
 import { readFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 
 export const CSV_URL = 'https://www8.cao.go.jp/chosei/shukujitsu/syukujitsu.csv';
 
@@ -102,7 +103,7 @@ async function download() {
   return new Uint8Array(await res.arrayBuffer());
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main(process.argv.slice(2)).catch((err) => {
     console.error(err.message);
     process.exit(1);

@@ -86,7 +86,8 @@ $$;
 -- 10:30–12:00"). Live trips on a pattern use the pattern's stops instead.
 -- Each planned stop gets an `upcoming` stop event (same stop_sequence), which
 -- the engine moves forward as for scheduled trips; removing a planned stop
--- removes its stop event. Reorder by deleting and inserting.
+-- removes its stop event (only while the bus has not reached it). Reorder by
+-- deleting and inserting.
 create table public.trip_instance_stop (
   operator_id uuid not null,
   trip_instance_id uuid not null,
@@ -179,6 +180,19 @@ begin
     on conflict do nothing;
     return new;
   end if;
+  -- The whole trip is being deleted (cascade): its stop events go anyway.
+  if not exists (select 1 from public.trip_instance ti where ti.id = old.trip_instance_id) then
+    return old;
+  end if;
+  if exists (
+    select 1 from public.stop_event se
+     where se.trip_instance_id = old.trip_instance_id
+       and se.stop_sequence = old.stop_sequence
+       and se.state not in ('upcoming', 'approaching')
+  ) then
+    raise exception 'the bus has already reached or passed this stop; it cannot be removed from the plan'
+      using errcode = 'check_violation';
+  end if;
   delete from public.stop_event se
    where se.trip_instance_id = old.trip_instance_id
      and se.stop_sequence = old.stop_sequence;
@@ -211,14 +225,43 @@ create trigger trip_instance_audience_check
   before insert or update on public.trip_instance_audience
   for each row execute function private.trip_instance_audience_check();
 
+-- A live trip with planned stops or per-trip audiences stays a live trip
+-- without a pattern.
+create function private.trip_instance_keep_live()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if (new.kind <> 'live' or new.pattern_id is not null)
+     and exists (select 1 from public.trip_instance_stop tis where tis.trip_instance_id = new.id) then
+    raise exception 'this live trip has planned stops; it cannot get a pattern or become scheduled'
+      using errcode = 'check_violation';
+  end if;
+  if new.kind <> 'live'
+     and exists (select 1 from public.trip_instance_audience tia where tia.trip_instance_id = new.id) then
+    raise exception 'this live trip has its own audiences; it cannot become scheduled'
+      using errcode = 'check_violation';
+  end if;
+  return new;
+end;
+$$;
+
+-- Runs after trip_instance_before_write (alphabetical order), so it sees the
+-- pattern copied from the trip.
+create trigger trip_instance_keep_live
+  before update of kind, pattern_id, trip_id on public.trip_instance
+  for each row execute function private.trip_instance_keep_live();
+
 -- -----------------------------------------------------------------------------
 -- Access level to a trip instance
 -- -----------------------------------------------------------------------------
 
 -- 0 none, 1 arrival times only, 2 map, 3 staff (with private.staff_trip_access).
 -- Riders: the route's level (if the trip has a route), for live trips at
--- least the level of the trip's audiences they are members of; nothing after
--- visible_until.
+-- least the level of the trip's audiences they are members of (arrival times
+-- only if the route is invited_eta); nothing after visible_until.
 create function private.trip_instance_access(p_trip_instance_id uuid)
 returns smallint
 language plpgsql
@@ -231,6 +274,7 @@ declare
   v_ti record;
   v_level smallint := 0;
   v_can_see_map boolean;
+  v_eta_only boolean;
 begin
   select ti.operator_id, ti.kind, ti.trip_id, ti.route_id, ti.vehicle_id, ti.visible_until
     into v_ti
@@ -253,6 +297,13 @@ begin
   end if;
 
   if v_ti.kind = 'live' and v_uid is not null then
+    -- A route with visibility invited_eta never shows the map to riders,
+    -- whatever the trip's audiences say (as for audience_route).
+    select coalesce(r.visibility, o.default_visibility) = 'invited_eta'
+      into v_eta_only
+      from public.route r
+      join public.operator o on o.id = r.operator_id
+     where r.id = v_ti.route_id;
     select bool_or(tia.can_see_map)
       into v_can_see_map
       from public.trip_instance_audience tia
@@ -261,7 +312,7 @@ begin
        and m.device_id = v_uid
        and m.revoked_at is null;
     if v_can_see_map is not null then
-      v_level := greatest(v_level, case when v_can_see_map then 2 else 1 end);
+      v_level := greatest(v_level, case when v_can_see_map and not coalesce(v_eta_only, false) then 2 else 1 end);
     end if;
   end if;
 
@@ -272,7 +323,7 @@ $$;
 comment on function private.trip_instance_access(uuid) is
   'Access level of the current user to a trip instance: 0 none, 1 arrival times only, 2 map, 3 staff.';
 
--- Stops: also the planned stops of live trips one can see.
+-- Stops: also the planned stops of current live trips one can see.
 create or replace function private.stop_access(p_stop_id uuid)
 returns smallint
 language sql
@@ -289,10 +340,15 @@ as $$
         join public.trip_pattern p on p.id = ps.pattern_id
         where ps.stop_id = s.id
       ), 0),
+      -- Only live trips riders can still see that are planned, running or
+      -- ended within a day, so old tours do not slow down every stop read.
       coalesce((
         select max(private.trip_instance_access(tis.trip_instance_id))
         from public.trip_instance_stop tis
+        join public.trip_instance ti on ti.id = tis.trip_instance_id
         where tis.operator_id = s.operator_id and tis.stop_id = s.id
+          and (ti.visible_until is null or ti.visible_until > now())
+          and (ti.status in ('planned', 'active') or ti.ended_at > now() - interval '1 day')
       ), 0)
     )
   end::smallint
@@ -455,9 +511,48 @@ create trigger drop_inaccessible_subscriptions
   after update or delete on public.trip_instance_audience
   for each statement execute function private.drop_inaccessible_subscriptions();
 
+-- route_id also changes through trip_instance_before_write when pattern_id
+-- or trip_id is set; column triggers only see the SET list. The engine sets
+-- none of these, so this does not run on every position.
 create trigger drop_inaccessible_subscriptions
-  after update of route_id on public.trip_instance
+  after update of route_id, pattern_id, trip_id on public.trip_instance
   for each statement execute function private.drop_inaccessible_subscriptions();
+
+-- Realtime "route:<id>": route_access is 3 for every staff member, so
+-- drivers would receive every bus of the operator. Editors and owners still
+-- do; drivers only for routes on which a trip they may see is active.
+create or replace function private.route_topic_access(p_topic text)
+returns smallint
+language plpgsql
+stable
+security definer
+set search_path = ''
+as $$
+declare
+  v_route_id uuid;
+  v_operator_id uuid;
+  v_level smallint;
+begin
+  if p_topic !~ '^route:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    return 0;
+  end if;
+  v_route_id := substr(p_topic, 7)::uuid;
+  v_level := private.route_access(v_route_id);
+  if v_level = 3 then
+    select r.operator_id into v_operator_id from public.route r where r.id = v_route_id;
+    if not private.can_edit(v_operator_id)
+       and not exists (
+         select 1 from public.trip_instance ti
+          where ti.route_id = v_route_id
+            and ti.status = 'active'
+            and private.staff_trip_access(ti.operator_id, ti.vehicle_id, ti.trip_id)
+       ) then
+      return 0;
+    end if;
+  end if;
+  return v_level;
+end;
+$$;
 
 revoke execute on all functions in schema private from public;
 grant execute on function

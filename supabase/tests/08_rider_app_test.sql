@@ -9,7 +9,7 @@
 --   riderA: member of the demo audience. riderB: no membership.
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(25);
+select plan(27);
 
 insert into auth.users (id, email, is_anonymous) values
   ('f8000000-0000-4000-8000-00000000000a', null, true),
@@ -61,6 +61,25 @@ select results_eq(
   $$ values ('d0000000-0000-4000-8000-000000000203'::uuid) $$,
   'riderA gets the location of the followed stop (Sannomiya) only'
 );
+-- At most two distinct followed stops per operator (30 days) show a location.
+insert into public.subscription (operator_id, device_id, pattern_id, stop_sequence) values
+  ('d0000000-0000-4000-8000-000000000001', 'f8000000-0000-4000-8000-00000000000a', 'd0000000-0000-4000-8000-000000000301', 1),
+  ('d0000000-0000-4000-8000-000000000001', 'f8000000-0000-4000-8000-00000000000a', 'd0000000-0000-4000-8000-000000000301', 4);
+select set_eq(
+  $$ select id from public.stop_location where operator_id = 'd0000000-0000-4000-8000-000000000001' $$,
+  array['d0000000-0000-4000-8000-000000000203', 'd0000000-0000-4000-8000-000000000201']::uuid[],
+  'only the first two followed stops show a location; the third (Motomachi) does not'
+);
+delete from public.subscription
+ where device_id = 'f8000000-0000-4000-8000-00000000000a' and stop_sequence in (1, 3);
+select is_empty(
+  $$ select 1 from public.stop_location where operator_id = 'd0000000-0000-4000-8000-000000000001' $$,
+  'unfollowing the first two does not unlock the location of other stops'
+);
+insert into public.subscription (operator_id, device_id, pattern_id, stop_sequence)
+values ('d0000000-0000-4000-8000-000000000001', 'f8000000-0000-4000-8000-00000000000a', 'd0000000-0000-4000-8000-000000000301', 3);
+delete from public.subscription
+ where device_id = 'f8000000-0000-4000-8000-00000000000a' and stop_sequence = 4;
 select throws_ok(
   $$ select location from public.stop $$,
   '42501', null, 'riders still cannot read stop.location directly'

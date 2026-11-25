@@ -15,7 +15,7 @@
 --   staff: editor E, driver D (drives V1), driver D2 (no vehicle)
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(43);
+select plan(50);
 
 insert into auth.users (id, email, is_anonymous) values
   ('e7000000-0000-4000-8000-0000000000e1', 'editor-t@example.test', false),
@@ -355,6 +355,62 @@ select is_empty(
   $$ select 1 from public.trip_instance where id = '77000000-0000-4000-8000-0000000000b1'
      union all select 1 from public.vehicle_state where vehicle_id = '75000000-0000-4000-8000-000000000003' $$,
   'after visible_until riders no longer see the live trip or its bus'
+);
+
+-- =============================================================================
+-- Review fixes: invited_eta caps per-trip map access, Realtime for drivers,
+-- planned stops already reached, live trips stay live
+-- =============================================================================
+reset role;
+-- L3: live trip on route R1's pattern (route invited_eta), audience aud_M
+-- with can_see_map, bus V2.
+insert into public.trip_instance (id, operator_id, service_date, kind, pattern_id, vehicle_id, status, started_by, title)
+values ('77000000-0000-4000-8000-0000000000b3', '70000000-0000-4000-8000-000000000001', current_date, 'live',
+        '73000000-0000-4000-8000-000000000001', '75000000-0000-4000-8000-000000000002', 'active', 'driver', '{"en": "Extra run"}');
+insert into public.trip_instance_audience (operator_id, trip_instance_id, audience_id, can_see_map)
+values ('70000000-0000-4000-8000-000000000001', '77000000-0000-4000-8000-0000000000b3', '78000000-0000-4000-8000-00000000000a', true);
+update public.vehicle_state set trip_instance_id = '77000000-0000-4000-8000-0000000000b3'
+ where vehicle_id = '75000000-0000-4000-8000-000000000002';
+
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub": "f7000000-0000-4000-8000-00000000000c", "role": "authenticated", "is_anonymous": true}', true);
+select ok(
+  exists (select 1 from public.trip_instance where id = '77000000-0000-4000-8000-0000000000b3')
+  and not exists (select 1 from public.vehicle_state where vehicle_id = '75000000-0000-4000-8000-000000000002'),
+  'a per-trip audience with map sees a live trip on an invited_eta route, but not the bus'
+);
+
+reset role;
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub": "e7000000-0000-4000-8000-0000000000d2", "role": "authenticated"}', true);
+select is(private.route_topic_access('route:71000000-0000-4000-8000-000000000001'), 0::smallint,
+  'a driver without an active trip on the route gets no Realtime positions of it');
+reset role;
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub": "e7000000-0000-4000-8000-0000000000d1", "role": "authenticated"}', true);
+select is(private.route_topic_access('route:71000000-0000-4000-8000-000000000001'), 3::smallint,
+  'the driver of an active trip on the route receives its Realtime positions');
+reset role;
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub": "e7000000-0000-4000-8000-0000000000e1", "role": "authenticated"}', true);
+select is(private.route_topic_access('route:71000000-0000-4000-8000-000000000001'), 3::smallint,
+  'editors receive Realtime positions of all routes');
+
+reset role;
+update public.stop_event set state = 'arrived', arrived_at = now()
+ where trip_instance_id = '77000000-0000-4000-8000-0000000000b1' and stop_sequence = 1;
+select throws_ok(
+  $$ delete from public.trip_instance_stop where trip_instance_id = '77000000-0000-4000-8000-0000000000b1' and stop_sequence = 1 $$,
+  '23514', null, 'a planned stop the bus already reached cannot be removed'
+);
+select throws_ok(
+  $$ update public.trip_instance set pattern_id = '73000000-0000-4000-8000-000000000001'
+      where id = '77000000-0000-4000-8000-0000000000b1' $$,
+  '23514', null, 'a live trip with planned stops cannot get a pattern'
+);
+select lives_ok(
+  $$ delete from public.trip_instance where id = '77000000-0000-4000-8000-0000000000b1' $$,
+  'the whole live trip can still be deleted (planned stops and stop events go with it)'
 );
 
 select * from finish();

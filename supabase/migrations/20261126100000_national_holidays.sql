@@ -137,7 +137,8 @@ comment on function private.create_trip_instances(date, date, uuid) is
 -- The dates in [p_from, p_to] on which each calendar the caller can see runs,
 -- national holidays applied. At most 400 days per call. RLS decides which
 -- calendars (and exceptions) are visible, so riders get the calendars of
--- the routes they see, staff those of their operator.
+-- the routes they see, staff those of their operator. national_holiday is
+-- the holiday's name when a returned date is one.
 --
 --   select * from service_days('2026-12-01', '2026-12-31');
 --   select * from service_days('2026-12-01', '2026-12-31', '<operator id>');
@@ -165,7 +166,7 @@ end;
 $$;
 
 comment on function public.service_days(date, date, uuid) is
-  'Dates on which each visible service calendar runs in [p_from, p_to] (max. 400 days), national holidays applied; national_holiday is set when the date is one (an added exception).';
+  'Dates on which each visible service calendar runs in [p_from, p_to] (max. 400 days), national holidays applied; national_holiday is the holiday''s name when the date is one (calendar without skip_national_holidays, or an added exception).';
 
 revoke execute on function public.service_days(date, date, uuid) from public;
 grant execute on function public.service_days(date, date, uuid) to anon, authenticated, service_role;
