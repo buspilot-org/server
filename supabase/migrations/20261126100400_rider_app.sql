@@ -62,10 +62,14 @@ create table private.followed_stop_log (
   device_id uuid not null references public.device (id) on delete cascade,
   operator_id uuid not null,
   stop_id uuid not null,
-  created_at timestamptz not null default now()
+  created_at timestamptz not null default now(),
+  -- When the device stopped following the stop; the row (and so the place)
+  -- is purged 30 days later. Following it again clears this.
+  released_at timestamptz,
+  unique (device_id, operator_id, stop_id)
 );
 
-create index followed_stop_log_device_idx on private.followed_stop_log (device_id, operator_id, created_at);
+create index followed_stop_log_released_at_idx on private.followed_stop_log (released_at) where released_at is not null;
 
 alter table private.followed_stop_log enable row level security;
 revoke all on private.followed_stop_log from public, anon, authenticated;
@@ -112,8 +116,10 @@ begin
      where tis.trip_instance_id = new.trip_instance_id and tis.stop_sequence = new.stop_sequence;
   end if;
   if v_stop_id is not null and private.stop_access(v_stop_id) < 2 then
+    -- One row per stop: following a stop again keeps its original place.
     insert into private.followed_stop_log (device_id, operator_id, stop_id)
-    values (new.device_id, new.operator_id, v_stop_id);
+    values (new.device_id, new.operator_id, v_stop_id)
+    on conflict (device_id, operator_id, stop_id) do update set released_at = null;
   end if;
   return null;
 end;
@@ -123,12 +129,53 @@ create trigger log_followed_stop
   after insert or update of pattern_id, trip_instance_id, stop_sequence on public.subscription
   for each row execute function private.log_followed_stop();
 
--- Existing subscriptions count as followed, in the order they were made.
+-- Marks the stops the device no longer follows at the operator as released
+-- (also when subscriptions go by cascade).
+create function private.release_followed_stops()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  update private.followed_stop_log l
+     set released_at = now()
+   where l.device_id = old.device_id
+     and l.operator_id = old.operator_id
+     and l.released_at is null
+     and l.stop_id not in (
+       select f.stop_id from private.device_followed_stops(old.device_id) f
+        where f.operator_id = old.operator_id
+     );
+  return null;
+end;
+$$;
+
+create trigger release_followed_stops
+  after delete or update of pattern_id, trip_instance_id, stop_sequence on public.subscription
+  for each row execute function private.release_followed_stops();
+
+-- Existing subscriptions count as followed, in the order they were made,
+-- except stops of routes the device sees on the map anyway (public, or
+-- invited_map with a map-level membership).
 insert into private.followed_stop_log (device_id, operator_id, stop_id, created_at)
-select s.device_id, s.operator_id, ps.stop_id, s.created_at
+select distinct on (s.device_id, s.operator_id, ps.stop_id) s.device_id, s.operator_id, ps.stop_id, s.created_at
   from public.subscription s
   join public.pattern_stop ps on ps.pattern_id = s.pattern_id and ps.stop_sequence = s.stop_sequence
- order by s.created_at, s.id;
+  join public.trip_pattern p on p.id = s.pattern_id
+  join public.route r on r.id = p.route_id
+  join public.operator o on o.id = r.operator_id
+ where coalesce(r.visibility, o.default_visibility) <> 'public'
+   and not (
+     coalesce(r.visibility, o.default_visibility) = 'invited_map'
+     and exists (
+       select 1 from public.audience_route ar
+         join public.membership m on m.audience_id = ar.audience_id
+        where ar.route_id = r.id and ar.can_see_map
+          and m.device_id = s.device_id and m.revoked_at is null
+     )
+   )
+ order by s.device_id, s.operator_id, ps.stop_id, s.created_at, s.id;
 
 -- True if the current user follows the stop (has a subscription to it, on a
 -- pattern or a live trip) and still sees that route or trip, and the stop is
@@ -307,12 +354,7 @@ begin
   delete from public.boarding_event where occurred_at < now() - interval '30 days';
   delete from private.invite_redemption_failure where attempted_at < now() - interval '1 day';
   -- Followed-stop log: freed 30 days after the device stopped following.
-  delete from private.followed_stop_log l
-   where l.created_at < now() - interval '30 days'
-     and not exists (
-       select 1 from private.device_followed_stops(l.device_id) f
-        where f.operator_id = l.operator_id and f.stop_id = l.stop_id
-     );
+  delete from private.followed_stop_log where released_at < now() - interval '30 days';
 
   -- Inactive rider devices: delete the anonymous auth user; device,
   -- memberships, subscriptions and alert log follow by cascade.
