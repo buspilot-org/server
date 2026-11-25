@@ -1,11 +1,13 @@
 /**
- * Entry point: configuration, database, cache, HTTP server and the periodic
- * jobs (cache reload, trip instance creation, closing trips whose window
- * passed).
+ * Entry point: configuration, database, cache, alert dispatcher, HTTP server
+ * and the periodic jobs (cache and subscription reload, trip instance
+ * creation, closing trips whose window passed).
  */
 import { serve } from '@hono/node-server';
+import { AlertDispatcher } from './alerts/dispatcher.ts';
+import { FcmSender } from './alerts/fcm.ts';
 import { loadConfig } from './config.ts';
-import { Engine } from './core/engine.ts';
+import { Engine, systemClock } from './core/engine.ts';
 import { createApp } from './http/app.ts';
 import { createLogger, errorMessage } from './log.ts';
 import { PgStore } from './store/pg.ts';
@@ -13,7 +15,15 @@ import { PgStore } from './store/pg.ts';
 const config = loadConfig();
 const log = createLogger(config.logLevel);
 const store = new PgStore(config.databaseUrl);
-const engine = new Engine({ store, thresholds: config.thresholds, log });
+const alerts = config.push === null ? null : new AlertDispatcher({
+  store,
+  sender: new FcmSender({ serviceAccount: config.push.serviceAccount, projectId: config.push.projectId, targetField: config.push.targetField }),
+  clock: systemClock,
+  log,
+  config: config.alerts,
+});
+if (alerts === null) log.warn('no FCM service account configured (FCM_SERVICE_ACCOUNT_FILE): arrival alerts are off');
+const engine = new Engine({ store, thresholds: config.thresholds, log, ...(alerts ? { observer: alerts } : {}) });
 
 async function createInstances(): Promise<number> {
   const created = await store.createTripInstances(new Date());
@@ -38,6 +48,8 @@ async function start(): Promise<void> {
   for (;;) {
     try {
       await createInstances();
+      // Subscriptions first, so the first reload can already send cancellations.
+      await alerts?.reloadSubscriptions();
       await engine.reload();
       break;
     } catch (err) {
@@ -47,7 +59,9 @@ async function start(): Promise<void> {
   }
 }
 
-const app = createApp({ engine, traccarSecret: config.traccarSecret, log, checkDatabase: () => store.ping() });
+const app = createApp({
+  engine, traccarSecret: config.traccarSecret, log, checkDatabase: () => store.ping(), ...(alerts ? { alertMetrics: () => alerts.metrics } : {}),
+});
 const server = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, (info) => {
   log.info('listening', { port: info.port });
 });
@@ -61,13 +75,17 @@ void start().then(() => {
     }),
     every('tick', config.tickS, () => engine.tick()),
   );
+  if (alerts) timers.push(every('subscription reload', config.subscriptionReloadS, () => alerts.reloadSubscriptions()));
 });
 
 function shutdown(signal: string): void {
   log.info('shutting down', { signal });
   for (const t of timers) clearInterval(t);
   server.close(() => {
-    void store.close().finally(() => process.exit(0));
+    // Let sends in progress finish (they are claimed already), then close.
+    void (alerts?.idle() ?? Promise.resolve())
+      .then(() => store.close())
+      .finally(() => process.exit(0));
   });
   setTimeout(() => process.exit(1), 10_000).unref();
 }

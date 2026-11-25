@@ -14,6 +14,7 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { Hono } from 'hono';
 import { bodyLimit } from 'hono/body-limit';
+import type { AlertMetrics } from '../alerts/dispatcher.ts';
 import type { Engine } from '../core/engine.ts';
 import type { Logger } from '../log.ts';
 import { errorMessage } from '../log.ts';
@@ -32,6 +33,13 @@ export interface AppDeps {
   log: Logger;
   /** Extra health checks, e.g. a database ping. */
   checkDatabase?: () => Promise<void>;
+  /** Alert counters for /healthz (absent when push is not configured). */
+  alertMetrics?: () => AlertMetrics;
+}
+
+/** Health counters only (no subscription count: not public). */
+function alertCounters(m: AlertMetrics): Record<string, number> {
+  return { sent: m.alertsSent, failed: m.alertsFailed, expired: m.alertsExpired, pushTokensCleared: m.pushTokensCleared };
 }
 
 export function createApp(deps: AppDeps): Hono {
@@ -101,6 +109,8 @@ export function createApp(deps: AppDeps): Hono {
         positionsFailed: m.positionsFailed,
         lastReloadAt: m.lastReloadAt,
       },
+      // null: no FCM service account configured, alerts are off.
+      alerts: deps.alertMetrics ? alertCounters(deps.alertMetrics()) : null,
     }, ok ? 200 : 503);
   });
 

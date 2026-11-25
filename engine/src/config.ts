@@ -1,3 +1,8 @@
+import type { AlertConfig } from './alerts/dispatcher.ts';
+import { defaultAlertConfig } from './alerts/dispatcher.ts';
+import type { ServiceAccount } from './alerts/fcm.ts';
+import { loadServiceAccount } from './alerts/fcm.ts';
+
 /**
  * Engine configuration. Thresholds come from internal/concept/engine.md and
  * arrival-alerts.md; every value marked "assumption" there still needs
@@ -124,6 +129,10 @@ export interface AppConfig {
   tickS: number;
   logLevel: 'debug' | 'info' | 'warn' | 'error';
   thresholds: Thresholds;
+  /** Push (FCM HTTP v1); null when no service account is configured: alerts are off. */
+  push: { serviceAccount: ServiceAccount; projectId: string; targetField: 'fid' | 'token' } | null;
+  alerts: AlertConfig;
+  subscriptionReloadS: number;
 }
 
 const MIN_SECRET_LENGTH = 32;
@@ -151,6 +160,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (logLevel !== 'debug' && logLevel !== 'info' && logLevel !== 'warn' && logLevel !== 'error') {
     throw new Error('LOG_LEVEL must be debug, info, warn or error');
   }
+  const thresholds = { ...defaultThresholds };
+  const serviceAccount = loadServiceAccount(env);
+  const target = env.FCM_TARGET ?? 'fid';
+  if (target !== 'fid' && target !== 'token') throw new Error('FCM_TARGET must be fid or token');
+  const delayRaw = env.ALERT_DELAY_MINUTES;
+  const delayMinutes = delayRaw === undefined || delayRaw === '' ? defaultAlertConfig.delayThresholdS / 60 : Number(delayRaw);
+  if ((delayRaw !== undefined && delayRaw !== '' && !/^\d+$/.test(delayRaw)) || !Number.isInteger(delayMinutes) || delayMinutes < 0) throw new Error('ALERT_DELAY_MINUTES must be a whole number ≥ 0 (0 = no delay alerts)');
   return {
     databaseUrl,
     traccarSecret,
@@ -160,6 +176,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     schedulerIntervalS: int(env, 'SCHEDULER_INTERVAL_SECONDS', 3600),
     tickS: int(env, 'TICK_SECONDS', 30),
     logLevel,
-    thresholds: { ...defaultThresholds },
+    thresholds,
+    push: serviceAccount === null ? null : {
+      serviceAccount,
+      projectId: env.FCM_PROJECT_ID || serviceAccount.projectId,
+      targetField: target,
+    },
+    alerts: { ...defaultAlertConfig, staleAfterS: thresholds.staleAfterS, delayThresholdS: delayMinutes * 60 },
+    subscriptionReloadS: int(env, 'SUBSCRIPTION_RELOAD_SECONDS', 60),
   };
 }

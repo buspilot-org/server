@@ -11,6 +11,7 @@
  * vehicles' queues; a change is only kept if the trip's state is still the
  * one it was computed from.
  */
+import type { TripObserver } from '../alerts/types.ts';
 import type { Thresholds } from '../config.ts';
 import { distance } from '../geo/plane.ts';
 import type { Logger } from '../log.ts';
@@ -72,6 +73,7 @@ export class Engine {
   readonly #t: Thresholds;
   readonly #clock: Clock;
   readonly #log: Logger;
+  readonly #observer: TripObserver | null;
   #cache: Cache | null = null;
   readonly #trips = new Map<string, TripRuntime>();
   readonly #lastFix = new Map<string, LastFix>();
@@ -91,8 +93,9 @@ export class Engine {
     lastReloadAt: null,
   };
 
-  constructor(opts: { store: Store; thresholds: Thresholds; clock?: Clock; log: Logger }) {
+  constructor(opts: { store: Store; thresholds: Thresholds; clock?: Clock; log: Logger; observer?: TripObserver }) {
     this.#store = opts.store;
+    this.#observer = opts.observer ?? null;
     this.#t = opts.thresholds;
     this.#clock = opts.clock ?? systemClock;
     this.#log = opts.log;
@@ -170,6 +173,7 @@ export class Engine {
     this.#refused.clear();
     this.#cache = cache;
     this.metrics.lastReloadAt = this.#clock.now().toISOString();
+    this.#notify(() => this.#observer?.tripsReloaded(this.#trips.values()));
     if (cache.stopsWithoutDist > 0) {
       this.#log.warn('pattern stops without dist_along_shape are projected by the engine', { count: cache.stopsWithoutDist });
     }
@@ -250,6 +254,15 @@ export class Engine {
     return out;
   }
 
+  /** Alerts must never fail position processing or a reload. */
+  #notify(call: () => void): void {
+    try {
+      call();
+    } catch (err) {
+      this.#log.error('trip observer failed', { error: errorMessage(err) });
+    }
+  }
+
   #enqueue<T>(vehicleId: string, job: () => Promise<T>): Promise<T> {
     const prev = this.#queues.get(vehicleId) ?? Promise.resolve();
     const run = prev.then(job, job);
@@ -291,6 +304,7 @@ export class Engine {
     let streaks: Map<string, StartStreak> | null = null;
     const writes: Writes = { vehicleId: vehicle.id, vehicleState: null, trip: null, stopEvents: [], etas: [] };
     const logs: [string, Record<string, string | number>][] = [];
+    let etas: ReadonlyMap<number, Date> = new Map();
 
     // 1. Trip assignment.
     let trip = activeTrip(this.#trips.values(), vehicle.id);
@@ -413,7 +427,7 @@ export class Engine {
         progress = complete(progress, at);
         logs.push(['trip completed', { tripInstanceId: trip.instance.id, reason: 'last_stop' }]);
       } else if (progress.offRouteSince === null) {
-        const etas = computeEtas(trip.instance, stops, progress.progressM, at, t);
+        etas = computeEtas(trip.instance, stops, progress.progressM, at, t);
         progress.stops = stops.map((s) => {
           const eta = etas.get(s.sequence);
           if (eta === undefined) return s;
@@ -460,6 +474,11 @@ export class Engine {
         continue;
       }
       this.#commit(tr, u);
+      // Alerts only from a state that was written and kept.
+      if (tr === trip && tr.progress === u.next) {
+        const progress = tr.progress;
+        this.#notify(() => this.#observer?.tripUpdated({ instance: tr.instance, progress, etas, fixAt: at }));
+      }
     }
     if (streaks !== null) this.#streaks.set(vehicle.id, streaks);
     else this.#streaks.delete(vehicle.id);
