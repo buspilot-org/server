@@ -348,6 +348,18 @@ describe('alerts: delayed and cancelled', () => {
     assert.equal(s.sender.sent.length, before + 2, 'nothing more for a cancelled trip');
   });
 
+  it('cancelled mid-run, running late: stops not yet served get it even if their scheduled time has passed', async () => {
+    const s = await Scenario.create(exampleRoute(T1), {}, { subscriptions: [subscription('A', 5, { triggerValue: 1 })], alerts: { delayThresholdS: 0 } });
+    const start = s.tripStart('T1');
+    const fixes = exampleRun(s, 'T1', { lateS: 15 * 60 }).fixes;
+    await s.feed(fixes.slice(0, at(fixes, minutes(start, 18))));
+    assert.ok(s.clock.now() > minutes(start, 12), 'stop 5 was scheduled at 07:42');
+    assert.equal(s.state('T1', 5), 'upcoming');
+    s.store.instance('T1').status = 'cancelled';
+    await s.reload();
+    assert.deepEqual(s.sender.kinds(), ['cancelled@5']);
+  });
+
   it('cancelled: only for trips starting within 24 hours', async () => {
     const s = await Scenario.create(exampleRoute([{ id: 'T3', serviceDate: '2026-11-26', start: '07:30' }]), {}, {
       subscriptions: [subscription('A', 2)],
@@ -393,5 +405,19 @@ describe('alerts: sending', () => {
     assert.equal(s.sender.attempts.length, 1);
     assert.deepEqual(s.store.clearedTokens, ['dev-x']);
     assert.deepEqual(s.store.deliveries.map((d) => d.result), ['invalid_token', 'invalid_token']);
+  });
+});
+
+describe('alerts: never in the way of position processing', () => {
+  it('an observer that throws does not fail positions or reloads', async () => {
+    const s = await Scenario.create(exampleRoute(T1));
+    const { Engine } = await import('../../src/core/engine.ts');
+    const { silentLogger } = await import('../../src/log.ts');
+    const boom = () => { throw new Error('boom'); };
+    s.engine = new Engine({ store: s.store, thresholds: s.thresholds, clock: s.clock, log: silentLogger, observer: { tripUpdated: boom, tripsReloaded: boom } });
+    await s.engine.reload();
+    const outcomes = await s.feed(exampleRun(s, 'T1').fixes);
+    assert.ok(outcomes.every((o) => o === 'processed'));
+    assert.equal(s.store.instance('T1').status, 'completed');
   });
 });

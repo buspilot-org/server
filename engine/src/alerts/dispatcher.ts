@@ -29,7 +29,7 @@ import { errorMessage } from '../log.ts';
 import type { DueConfig } from './due.ts';
 import { dueAlert, isMuted } from './due.ts';
 import { buildPayload } from './messages.ts';
-import type { AlertStore, AlertVariant, PushSender, Subscription, TripObserver, TripUpdate } from './types.ts';
+import type { AlertStore, AlertVariant, PushSender, SendResult, Subscription, TripObserver, TripUpdate } from './types.ts';
 import { kindOf } from './types.ts';
 
 export interface AlertConfig extends DueConfig {
@@ -70,8 +70,8 @@ interface Pending {
   expiresAt: Date;
 }
 
-/** Runs at most `n` tasks at a time. */
-class Limiter {
+/** Runs at most `n` tasks at a time, in FIFO order. */
+export class Limiter {
   #active = 0;
   readonly #queue: (() => void)[] = [];
   readonly #n: number;
@@ -79,13 +79,16 @@ class Limiter {
     this.#n = Math.max(1, n);
   }
   async run<T>(task: () => Promise<T>): Promise<T> {
+    // A finishing task hands its slot to the next waiter directly, so no
+    // task starting in between can take it.
     if (this.#active >= this.#n) await new Promise<void>((resolve) => this.#queue.push(resolve));
-    this.#active++;
+    else this.#active++;
     try {
       return await task();
     } finally {
-      this.#active--;
-      this.#queue.shift()?.();
+      const next = this.#queue.shift();
+      if (next) next();
+      else this.#active--;
     }
   }
 }
@@ -101,8 +104,8 @@ export class AlertDispatcher implements TripObserver {
   #byPattern = new Map<string, Subscription[]>();
   /** Keys claimed (or being claimed) by this process, per trip instance: `subscription:stop:kind`. */
   readonly #claimed = new Map<string, Set<string>>();
-  /** Latest stop states per trip instance, to drop retries of alerts that are no longer useful. */
-  readonly #latest = new Map<string, readonly StopProgress[]>();
+  /** Latest state per trip instance, to drop retries of alerts that are no longer useful. */
+  readonly #latest = new Map<string, { status: TripProgress['status']; stops: readonly StopProgress[] }>();
   /** Push targets FCM rejected, by device, until the next subscription reload. */
   readonly #invalidTargets = new Map<string, string>();
   readonly #inflight = new Set<Promise<void>>();
@@ -154,7 +157,7 @@ export class AlertDispatcher implements TripObserver {
 
   tripUpdated(u: TripUpdate): void {
     try {
-      this.#latest.set(u.instance.id, u.progress.stops);
+      this.#latest.set(u.instance.id, { status: u.progress.status, stops: u.progress.stops });
       const subs = this.#byPattern.get(u.instance.pattern.id);
       if (!subs) return;
       const now = this.#clock.now();
@@ -174,9 +177,10 @@ export class AlertDispatcher implements TripObserver {
           approachingClaimed: this.#isClaimed(u.instance.id, sub, 'approaching'),
         }, this.#cfg);
         if (due === null) continue;
+        const passedAt = u.progress.stops.find((s) => s.sequence === sub.stopSequence)?.passedAt ?? now;
         const expiresAt = due.variant === 'passed'
-          ? addSeconds(now, this.#cfg.passedMaxAgeS)
-          // Approaching, arrived, delayed: useful until the bus leaves the stop (checked on retry), at most 30 min.
+          ? addSeconds(passedAt, this.#cfg.passedMaxAgeS)
+          // Approaching, arrived, delayed: useful until the bus leaves the stop (checked before each attempt), at most 30 min.
           : addSeconds(now, 30 * 60);
         this.#dispatch({ variant: due.variant, sub, instance: u.instance, eta: due.eta, delayS: due.delayS, expiresAt });
       }
@@ -203,15 +207,18 @@ export class AlertDispatcher implements TripObserver {
 
   #cancelled(instance: TripInstance, progress: TripProgress, now: Date): void {
     if ((instance.startAt.getTime() - now.getTime()) / 1000 > this.#cfg.cancelLookaheadS) return;
-    this.#latest.set(instance.id, progress.stops);
+    this.#latest.set(instance.id, { status: progress.status, stops: progress.stops });
     for (const sub of this.#byPattern.get(instance.pattern.id) ?? []) {
       const ps = instance.pattern.stops.find((p) => p.sequence === sub.stopSequence);
       const state = progress.stops.find((s) => s.sequence === sub.stopSequence)?.state;
       if (ps === undefined || state === undefined || isFinalStopState(state) || isMuted(sub, now)) continue;
-      // Not once the bus would have been there already.
+      // A trip that ran: every stop not yet served (it may run late). A trip
+      // that never started: not once the bus would have been there already.
       const scheduled = addSeconds(instance.startAt, ps.arrivalOffsetS);
-      if (scheduled <= now) continue;
-      this.#dispatch({ variant: 'cancelled', sub, instance, eta: null, delayS: null, expiresAt: scheduled });
+      const started = progress.startedAt !== null;
+      if (!started && scheduled <= now) continue;
+      const expiresAt = started && scheduled < addSeconds(now, 30 * 60) ? addSeconds(now, 30 * 60) : scheduled;
+      this.#dispatch({ variant: 'cancelled', sub, instance, eta: null, delayS: null, expiresAt });
     }
   }
 
@@ -261,18 +268,26 @@ export class AlertDispatcher implements TripObserver {
   }
 
   /**
-   * Whether a retry is still useful: not expired, and the bus has not left
-   * the stop (approaching, arrived, delayed). An approaching alert whose bus
-   * has arrived meanwhile becomes "the bus is at your stop" (same key).
+   * Checked right before each attempt (also after waiting for a send slot or
+   * a retry): the alert is still useful. Not expired; the subscription still
+   * exists, may still be alerted and is not muted (it is taken fresh from the
+   * last reload, with its current push target); for approaching, arrived and
+   * delayed, the trip is still active and the bus has not left the stop. An
+   * approaching alert whose bus has arrived meanwhile becomes "the bus is at
+   * your stop" (same key).
    */
   #check(p: Pending, now: Date): Pending | null {
     if (now > p.expiresAt) return null;
-    if (p.variant === 'passed' || p.variant === 'cancelled') return p;
-    const state = this.#latest.get(p.instance.id)?.find((s) => s.sequence === p.sub.stopSequence)?.state;
-    if (state === undefined || state === 'upcoming' || state === 'approaching') return p;
+    const sub = this.#byPattern.get(p.sub.patternId)?.find((s) => s.id === p.sub.id && s.stopSequence === p.sub.stopSequence);
+    if (sub === undefined || isMuted(sub, now)) return null;
+    if (p.variant === 'passed' || p.variant === 'cancelled') return { ...p, sub };
+    const trip = this.#latest.get(p.instance.id);
+    if (trip?.status !== 'active') return null;
+    const state = trip.stops.find((s) => s.sequence === sub.stopSequence)?.state;
+    if (state === 'upcoming' || state === 'approaching') return p.variant === 'arrived' ? null : { ...p, sub };
     if (state !== 'arrived') return null;
-    if (p.variant === 'approaching') return { ...p, variant: 'arrived', eta: null };
-    return p.variant === 'arrived' ? p : null;
+    if (p.variant === 'approaching') return { ...p, sub, variant: 'arrived', eta: null };
+    return p.variant === 'arrived' ? { ...p, sub } : null;
   }
 
   async #deliver(id: string, first: Pending): Promise<void> {
@@ -280,26 +295,29 @@ export class AlertDispatcher implements TripObserver {
     let p = first;
     const fields = { alertId: id, tripInstanceId: p.instance.id, kind: p.variant };
     for (let attempt = 0; ; attempt++) {
-      const now = this.#clock.now();
-      const current = attempt === 0 ? p : this.#check(p, now);
-      if (current !== null) p = current;
-      if (current === null) {
+      const res = await this.#limiter.run(async (): Promise<SendResult | 'expired' | 'invalid_token'> => {
+        const now = this.#clock.now();
+        const current = this.#check(p, now);
+        if (current === null) return 'expired';
+        p = current;
+        if (this.#invalidTargets.get(p.sub.deviceId) === p.sub.pushToken) return 'invalid_token';
+        const payload = buildPayload({
+          variant: p.variant, sub: p.sub, tripInstanceId: p.instance.id, serviceDate: p.instance.serviceDate,
+          tripStart: p.instance.startAt, eta: p.eta, delayS: p.delayS, deliveryId: id, now,
+          ttlS: (p.expiresAt.getTime() - now.getTime()) / 1000,
+        });
+        return this.#sender.send({ target: p.sub.pushToken, payload });
+      });
+      if (res === 'expired') {
         this.metrics.alertsExpired++;
         await this.#finish(id, null, 'expired');
-        this.#log.info('alert expired before it could be sent', fields);
+        this.#log.info('alert no longer useful, not sent', { ...fields, attempts: attempt });
         return;
       }
-      const target = p.sub.pushToken;
-      if (this.#invalidTargets.get(p.sub.deviceId) === target) {
+      if (res === 'invalid_token') {
         await this.#finish(id, null, 'invalid_token');
         return;
       }
-      const payload = buildPayload({
-        variant: p.variant, sub: p.sub, tripInstanceId: p.instance.id, serviceDate: p.instance.serviceDate,
-        tripStart: p.instance.startAt, eta: p.eta, delayS: p.delayS, deliveryId: id, now,
-        ttlS: (p.expiresAt.getTime() - now.getTime()) / 1000,
-      });
-      const res = await this.#limiter.run(() => this.#sender.send({ target, payload }));
       if (res.ok) {
         this.metrics.alertsSent++;
         await this.#finish(id, this.#clock.now(), 'sent');
@@ -307,6 +325,7 @@ export class AlertDispatcher implements TripObserver {
         return;
       }
       if (res.invalidTarget) {
+        const target = p.sub.pushToken;
         this.metrics.alertsFailed++;
         this.#invalidTargets.set(p.sub.deviceId, target);
         await this.#finish(id, null, 'invalid_token');
@@ -323,7 +342,9 @@ export class AlertDispatcher implements TripObserver {
       if (!res.retryable || wait === undefined) {
         this.metrics.alertsFailed++;
         await this.#finish(id, null, `failed: ${res.code}`);
-        this.#log.warn('alert send failed', { ...fields, code: res.code, attempts: attempt + 1 });
+        // Not retryable: usually configuration (wrong project, key without permission) or a malformed message.
+        const level = res.retryable ? 'warn' : 'error';
+        this.#log[level]('alert send failed', { ...fields, code: res.code, attempts: attempt + 1 });
         return;
       }
       await this.#sleep(Math.max(wait, res.retryAfterS ?? 0) * 1000);

@@ -129,7 +129,7 @@ interface FcmErrorBody {
   error?: {
     status?: string;
     message?: string;
-    details?: { '@type'?: string; errorCode?: string }[];
+    details?: { '@type'?: string; errorCode?: string; fieldViolations?: { field?: string }[] }[];
   };
 }
 
@@ -145,13 +145,21 @@ export function classifyFcmResponse(res: HttpResponse): SendResult {
   const fcmCode = body.error?.details?.find((d) => d['@type']?.endsWith('google.firebase.fcm.v1.FcmError'))?.errorCode;
   const code = fcmCode ?? body.error?.status ?? `HTTP_${res.status}`;
   const retryAfter = Number(res.header('retry-after'));
-  const retryAfterS = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : undefined;
+  // Capped: a long Retry-After would hold a send slot and delay shutdown.
+  const retryAfterS = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 60) : undefined;
   const fail = (retryable: boolean, invalidTarget = false): SendResult => ({ ok: false, code, retryable, invalidTarget, ...(retryAfterS === undefined ? {} : { retryAfterS }) });
 
-  if (code === 'UNREGISTERED' || code === 'SENDER_ID_MISMATCH') return fail(false, true);
+  // Only these clear device.push_token. Errors that every send would get
+  // (SENDER_ID_MISMATCH from a wrong project or key, an unknown field in our
+  // message) must not wipe the tokens of every device: they fail without
+  // clearing and are logged as errors.
+  if (code === 'UNREGISTERED') return fail(false, true);
   if (code === 'INVALID_ARGUMENT') {
-    // Also used for a malformed message; only clear the target if FCM says it is the target.
-    return fail(false, /registration token|installation|\bfid\b/i.test(body.error?.message ?? ''));
+    const fields = (body.error?.details ?? [])
+      .filter((d) => d['@type']?.endsWith('google.rpc.BadRequest'))
+      .flatMap((d) => d.fieldViolations ?? [])
+      .map((v) => v.field);
+    return fail(false, fields.some((f) => f === 'message.token' || f === 'message.fid'));
   }
   if (res.status === 401) return fail(true);
   if (res.status === 429 || res.status >= 500 || code === 'QUOTA_EXCEEDED' || code === 'UNAVAILABLE' || code === 'INTERNAL') return fail(true);

@@ -126,9 +126,17 @@ describe('FCM error classification', () => {
   it('maps FCM errors', () => {
     assert.equal(c(response(200)), 'ok');
     assert.equal(c(fcmError(404, 'NOT_FOUND', 'Requested entity was not found.', 'UNREGISTERED')), 'UNREGISTERED retry=false invalid=true');
-    assert.equal(c(fcmError(403, 'PERMISSION_DENIED', '', 'SENDER_ID_MISMATCH')), 'SENDER_ID_MISMATCH retry=false invalid=true');
-    assert.equal(c(fcmError(400, 'INVALID_ARGUMENT', 'The registration token is not a valid FCM registration token', 'INVALID_ARGUMENT')), 'INVALID_ARGUMENT retry=false invalid=true');
+    // Every send would get these (wrong project or key, a field FCM does not know): never clear tokens.
+    assert.equal(c(fcmError(403, 'PERMISSION_DENIED', '', 'SENDER_ID_MISMATCH')), 'SENDER_ID_MISMATCH retry=false invalid=false');
+    const badRequest = (field: string, message: string) => response(400, {
+      error: { code: 400, status: 'INVALID_ARGUMENT', message, details: [{ '@type': 'type.googleapis.com/google.rpc.BadRequest', fieldViolations: [{ field }] }] },
+    });
+    assert.equal(c(badRequest('message.fid', 'The registration token is not a valid FCM registration token')), 'INVALID_ARGUMENT retry=false invalid=true');
+    assert.equal(c(badRequest('message.token', 'The registration token is not a valid FCM registration token')), 'INVALID_ARGUMENT retry=false invalid=true');
+    assert.equal(c(badRequest('message', 'Invalid JSON payload received. Unknown name "fid" at \'message\': Cannot find field.')), 'INVALID_ARGUMENT retry=false invalid=false', 'an unknown fid field does not wipe tokens');
+    assert.equal(c(fcmError(400, 'INVALID_ARGUMENT', 'The registration token is not a valid FCM registration token', 'INVALID_ARGUMENT')), 'INVALID_ARGUMENT retry=false invalid=false', 'without a field violation on the target: kept');
     assert.equal(c(fcmError(400, 'INVALID_ARGUMENT', 'Invalid value at \'message.android.ttl\'', 'INVALID_ARGUMENT')), 'INVALID_ARGUMENT retry=false invalid=false', 'a bad message does not clear the target');
+    assert.equal(c({ ...fcmError(429, 'RESOURCE_EXHAUSTED', '', 'QUOTA_EXCEEDED'), header: (n) => (n === 'retry-after' ? '3600' : null) }), 'QUOTA_EXCEEDED retry=true invalid=false after=60', 'Retry-After capped');
     assert.equal(c(fcmError(429, 'RESOURCE_EXHAUSTED', '', 'QUOTA_EXCEEDED')), 'QUOTA_EXCEEDED retry=true invalid=false');
     assert.equal(c({ ...fcmError(503, 'UNAVAILABLE', '', 'UNAVAILABLE'), header: (n) => (n === 'retry-after' ? '30' : null) }), 'UNAVAILABLE retry=true invalid=false after=30');
     assert.equal(c(fcmError(500, 'INTERNAL', '', 'INTERNAL')), 'INTERNAL retry=true invalid=false');

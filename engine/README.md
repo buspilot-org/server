@@ -48,7 +48,7 @@ Matching thresholds (distances, windows, speeds) are in `src/config.ts` (`defaul
 | | |
 |---|---|
 | `POST /v1/traccar/positions/:secret` | Traccar JSON position forwarding (`PositionData`: `{position, device}`). `200` processed / duplicate / invalid, `202` device is not a Buspilot vehicle (dropped), `400` malformed, `401` wrong secret, `503` not ready or the database write failed (Traccar retries) |
-| `GET /healthz` | `200 {"status": "ok", …}` or `503 {"status": "degraded", …}` with database reachability, stale trips and counters about Buspilot vehicles (nothing about other devices on the Traccar server), and alert counters (`alerts`: subscriptions, sent, failed, expired, push tokens cleared; `null` when push is off) |
+| `GET /healthz` | `200 {"status": "ok", …}` or `503 {"status": "degraded", …}` with database reachability, stale trips and counters about Buspilot vehicles (nothing about other devices on the Traccar server), and alert counters (`alerts`: sent, failed, expired, push tokens cleared; `null` when push is off) |
 
 ## Traccar setup
 
@@ -101,7 +101,7 @@ Rules from arrival-alerts.md ("Decisions (2026-11-26)"); code in `src/alerts/`.
 | `arrived` (the approaching alert was missed: data gap, late subscription) | **arrived** "the bus is at your stop", stored with kind `approaching`, so it goes out only if no approaching alert did |
 | `passed`, `notify_passed` on, passed less than 10 min ago and after the subscription was made | **passed** |
 | `departed`, or `passed` without `notify_passed` | nothing, ever |
-| any, trip instance cancelled by staff (seen at the next cache reload, every `CACHE_RELOAD_SECONDS`), trip starting within 24 h, stop not yet served and scheduled in the future | **cancelled** |
+| any, trip instance cancelled by staff (seen at the next cache reload, every `CACHE_RELOAD_SECONDS`), trip starting within 24 h, stop not yet served (a trip that never started: scheduled in the future) | **cancelled** |
 
 - **Passed is checked before triggers**: the stop states are final before triggers are looked at, so stops passed in one update (after a GPS gap or a confirmed jump) never get an approaching alert.
 - **Held** while the position is stale (fix older than 2 min when processed) or the bus is off route: nothing is due. The next fresh position on the route evaluates again, so a held alert goes out if it is still due, or becomes *arrived* / *passed* / nothing by the rules above.
@@ -116,9 +116,13 @@ Rules from arrival-alerts.md ("Decisions (2026-11-26)"); code in `src/alerts/`.
 | FCM answer | Then | `alert_delivery.result` |
 |---|---|---|
 | 200 | `sent_at` set | `sent` |
-| 429, 5xx, timeout, network, OAuth failure (also 401, with a new access token) | retried after 2 s, 10 s and 30 s (or `Retry-After`), while still useful: an approaching alert whose bus has arrived meanwhile becomes *arrived*; one whose bus has left is dropped | `sent`, `expired` or `failed: <code>` |
-| `UNREGISTERED`, `SENDER_ID_MISMATCH`, `INVALID_ARGUMENT` about the target | `device.push_token` cleared (only if it still holds that target); the device's other alerts are not attempted | `invalid_token` |
-| other 4xx (e.g. a malformed message) | not retried, token kept | `failed: <code>` |
+| 429, 5xx, timeout, network, OAuth failure (also 401, with a new access token) | retried after 2 s, 10 s and 30 s (or `Retry-After`, at most 60 s) | `sent`, `expired` or `failed: <code>` |
+| `UNREGISTERED`, or `INVALID_ARGUMENT` with a field violation on `message.fid` / `message.token` | `device.push_token` cleared (only if it still holds that target); the device's alerts not yet attempted are skipped | `invalid_token` |
+| other 4xx: `SENDER_ID_MISMATCH` (wrong project or key), `PERMISSION_DENIED`, a malformed message | not retried, token kept, logged as an error: these hit every send, so they must not wipe every device's token | `failed: <code>` |
+
+Before each attempt (also after waiting for a send slot or a retry) the alert is checked again: the subscription still exists, may be alerted and is not muted (taken from the last reload, with its current push target), and, for approaching / arrived / delayed, the trip is still active and the bus has not left the stop. An approaching alert whose bus has arrived meanwhile goes out as *arrived*; otherwise it is dropped (`expired`).
+
+Known limits: an alert is at most once, not at least once (the engine stopping between claim and send, or after the 10 s shutdown grace, leaves it `pending`); after a restart, a `delayed` alert can follow an approaching alert sent before the restart (the engine only remembers its own claims); a subscription reload that started before an invalid token was cleared can bring that token back for one more attempt.
 
 Logs carry the alert ID, trip instance, kind and FCM error code; never push targets, access tokens or positions.
 

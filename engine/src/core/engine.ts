@@ -173,7 +173,7 @@ export class Engine {
     this.#refused.clear();
     this.#cache = cache;
     this.metrics.lastReloadAt = this.#clock.now().toISOString();
-    this.#observer?.tripsReloaded(this.#trips.values());
+    this.#notify(() => this.#observer?.tripsReloaded(this.#trips.values()));
     if (cache.stopsWithoutDist > 0) {
       this.#log.warn('pattern stops without dist_along_shape are projected by the engine', { count: cache.stopsWithoutDist });
     }
@@ -252,6 +252,15 @@ export class Engine {
       if (!last || secondsBetween(last.at, now) > this.#t.staleAfterS) out.push(tr.instance.id);
     }
     return out;
+  }
+
+  /** Alerts must never fail position processing or a reload. */
+  #notify(call: () => void): void {
+    try {
+      call();
+    } catch (err) {
+      this.#log.error('trip observer failed', { error: errorMessage(err) });
+    }
   }
 
   #enqueue<T>(vehicleId: string, job: () => Promise<T>): Promise<T> {
@@ -466,7 +475,10 @@ export class Engine {
       }
       this.#commit(tr, u);
       // Alerts only from a state that was written and kept.
-      if (tr === trip && tr.progress === u.next) this.#observer?.tripUpdated({ instance: tr.instance, progress: tr.progress, etas, fixAt: at });
+      if (tr === trip && tr.progress === u.next) {
+        const progress = tr.progress;
+        this.#notify(() => this.#observer?.tripUpdated({ instance: tr.instance, progress, etas, fixAt: at }));
+      }
     }
     if (streaks !== null) this.#streaks.set(vehicle.id, streaks);
     else this.#streaks.delete(vehicle.id);

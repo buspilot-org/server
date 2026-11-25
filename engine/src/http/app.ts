@@ -37,6 +37,11 @@ export interface AppDeps {
   alertMetrics?: () => AlertMetrics;
 }
 
+/** Health counters only (no subscription count: not public). */
+function alertCounters(m: AlertMetrics): Record<string, number> {
+  return { sent: m.alertsSent, failed: m.alertsFailed, expired: m.alertsExpired, pushTokensCleared: m.pushTokensCleared };
+}
+
 export function createApp(deps: AppDeps): Hono {
   const { engine, log } = deps;
   const app = new Hono();
@@ -105,7 +110,7 @@ export function createApp(deps: AppDeps): Hono {
         lastReloadAt: m.lastReloadAt,
       },
       // null: no FCM service account configured, alerts are off.
-      alerts: deps.alertMetrics ? deps.alertMetrics() : null,
+      alerts: deps.alertMetrics ? alertCounters(deps.alertMetrics()) : null,
     }, ok ? 200 : 503);
   });
 

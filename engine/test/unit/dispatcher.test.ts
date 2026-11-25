@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { AlertDispatcher, defaultAlertConfig } from '../../src/alerts/dispatcher.ts';
+import { AlertDispatcher, Limiter, defaultAlertConfig } from '../../src/alerts/dispatcher.ts';
 import type { TripUpdate } from '../../src/alerts/types.ts';
 import { buildCache, progressFromRow } from '../../src/core/cache.ts';
 import type { StopState } from '../../src/core/types.ts';
@@ -62,6 +62,31 @@ describe('alert dispatcher: retries', () => {
     assert.equal(d.metrics.alertsExpired, 1);
   });
 
+  it('a retry after the subscription was muted is dropped', async () => {
+    const { s, d, clock, sender, releases, update, settle } = await setup();
+    sender.script = [unavailable];
+    d.tripUpdated(update('upcoming', new Date(clock.now().getTime() + 240_000)));
+    await settle();
+    s.store.subscriptions = [subscription('A', 4, { mutedUntil: new Date(clock.now().getTime() + 3600_000) })];
+    await d.reloadSubscriptions();
+    releases.shift()?.();
+    await d.idle();
+    assert.deepEqual(sender.kinds(), []);
+    assert.deepEqual(s.store.deliveries.map((x) => x.result), ['expired']);
+  });
+
+  it('a retry with a new push target (re-registered meanwhile) uses it', async () => {
+    const { s, d, clock, sender, releases, update, settle } = await setup();
+    sender.script = [unavailable];
+    d.tripUpdated(update('upcoming', new Date(clock.now().getTime() + 240_000)));
+    await settle();
+    s.store.subscriptions = [subscription('A', 4, { pushToken: 'fid-new' })];
+    await d.reloadSubscriptions();
+    releases.shift()?.();
+    await d.idle();
+    assert.deepEqual(sender.sent.map((m) => m.target), ['fid-new']);
+  });
+
   it('evaluating again while a claim is in flight does not claim twice', async () => {
     const { s, d, clock, sender, update } = await setup();
     const u = update('upcoming', new Date(clock.now().getTime() + 240_000));
@@ -70,5 +95,28 @@ describe('alert dispatcher: retries', () => {
     await d.idle();
     assert.equal(sender.attempts.length, 1);
     assert.equal(s.store.deliveries.length, 1);
+  });
+});
+
+describe('send limiter', () => {
+  it('never runs more than n tasks at once, in order', async () => {
+    const limiter = new Limiter(2);
+    let running = 0;
+    let max = 0;
+    const order: number[] = [];
+    const task = (i: number) => limiter.run(async () => {
+      running++;
+      max = Math.max(max, running);
+      order.push(i);
+      await new Promise((r) => setImmediate(r));
+      running--;
+    });
+    const all = Array.from({ length: 10 }, (_, i) => task(i));
+    // A task started while the others finish must still wait its turn.
+    await new Promise((r) => setImmediate(r));
+    all.push(task(10));
+    await Promise.all(all);
+    assert.equal(max, 2);
+    assert.deepEqual(order, Array.from({ length: 11 }, (_, i) => i));
   });
 });
