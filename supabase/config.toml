@@ -252,6 +252,14 @@ otp_expiry = 3600
 # admin_email = "admin@email.com"
 # sender_name = "Admin"
 
+# Staff sign in with a 6-digit one-time code (admin console, signInWithOtp
+# with shouldCreateUser: false). The default magic-link email has only a link,
+# so the code ({{ .Token }}) is in our template. The hosted project needs the
+# same template set in the dashboard (README, "Staff sign-in email").
+[auth.email.template.magic_link]
+subject = "Buspilot ログインコード / sign-in code / Anmeldecode"
+content_path = "./supabase/templates/magic_link.html"
+
 # Uncomment to customize email template
 # [auth.email.template.invite]
 # subject = "You have been invited"

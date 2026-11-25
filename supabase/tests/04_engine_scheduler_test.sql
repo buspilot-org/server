@@ -31,26 +31,27 @@ select throws_ok(
 );
 
 -- Scheduler job: today and tomorrow in the operator's time zone.
--- 2026-11-22 16:00 UTC is Monday 2026-11-23 01:00 in Tokyo.
+-- 2026-11-29 16:00 UTC is Monday 2026-11-30 01:00 in Tokyo. (The week before
+-- has Labour Thanksgiving Day on Monday 2026-11-23: see 05_national_holidays_test.sql.)
 select is(
-  private.create_upcoming_trip_instances('2026-11-22T16:00:00Z'),
+  private.create_upcoming_trip_instances('2026-11-29T16:00:00Z'),
   4,
   'upcoming: two trips on Monday and Tuesday (Tokyo dates)'
 );
 select results_eq(
   $$ select distinct service_date from public.trip_instance order by 1 $$,
-  $$ values ('2026-11-23'::date), ('2026-11-24'::date) $$,
+  $$ values ('2026-11-30'::date), ('2026-12-01'::date) $$,
   'service dates follow the operator time zone, not UTC'
 );
 
 -- A whole week: Monday–Friday only.
 select is(
-  private.create_trip_instances('2026-11-23', '2026-11-29'),
+  private.create_trip_instances('2026-11-30', '2026-12-06'),
   6,
   'the rest of the week: Wednesday–Friday, two trips each; the weekend has none'
 );
 select is(
-  private.create_trip_instances('2026-11-23', '2026-11-29'),
+  private.create_trip_instances('2026-11-30', '2026-12-06'),
   0,
   'idempotent: running again creates nothing'
 );
@@ -59,7 +60,7 @@ select results_eq(
   $$ select count(*), count(*) filter (where state = 'upcoming')
        from public.stop_event se
        join public.trip_instance ti on ti.id = se.trip_instance_id
-      where ti.service_date = '2026-11-25' and ti.trip_id = 'd0000000-0000-4000-8000-000000000801' $$,
+      where ti.service_date = '2026-12-02' and ti.trip_id = 'd0000000-0000-4000-8000-000000000801' $$,
   $$ values (6::bigint, 6::bigint) $$,
   'one upcoming stop event per pattern stop, including both visits of the loop stop'
 );
@@ -77,9 +78,9 @@ select is(
 );
 insert into public.calendar_exception (operator_id, calendar_id, start_date, end_date, type, reason)
 values ('d0000000-0000-4000-8000-000000000001', 'd0000000-0000-4000-8000-000000000501',
-        '2026-11-28', '2026-11-28', 'added', 'Saturday school event');
+        '2026-12-05', '2026-12-05', 'added', 'Saturday school event');
 select is(
-  private.create_trip_instances('2026-11-23', '2026-11-29'),
+  private.create_trip_instances('2026-11-30', '2026-12-06'),
   2,
   'an added exception adds a Saturday'
 );
@@ -92,7 +93,7 @@ select is(
 -- Inactive routes are skipped.
 update public.route set active = false where id = 'd0000000-0000-4000-8000-000000000101';
 select is(
-  private.create_trip_instances('2026-11-30', '2026-11-30'),
+  private.create_trip_instances('2026-12-07', '2026-12-07'),
   0,
   'inactive routes get no trip instances'
 );
