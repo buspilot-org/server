@@ -5,81 +5,10 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { XY } from '../../src/geo/plane.ts';
-import { DEVICE, DEVICE_2, Scenario, Track, VEHICLE, VEHICLE_2, type Fix, type RouteDef, type TripDef } from './harness.ts';
+import { DEVICE, DEVICE_2, Scenario, Track, VEHICLE, VEHICLE_2, type Fix, type RouteDef } from './harness.ts';
+import { FULL_RUN, STOP_M, germanSchool, loopRoute, normalRun } from './routes.ts';
 
 const DATE = '2026-11-24';
-
-/**
- * The German School problem, condensed: the route goes out along a street,
- * turns, and comes back on the parallel street 40 m away. Stop 3 is on the
- * way back, but the bus passes 40 m from it on the way out, before stop 2.
- * A 500 m circle fires for stop 3 first; progress along the route must not.
- *
- *   (0,400) ─────────── 5 (800,400)
- *     │
- *     4 (0,220)
- *     │
- *   (0,40) ◄──── 3 (400,40) ◄──── (900,40)
- *                                   2 (900,20)
- *   1 (0,0) ─────────────────────► (900,0)
- */
-function germanSchool(trips: TripDef[]): RouteDef {
-  return {
-    shape: [{ x: 0, y: 0 }, { x: 900, y: 0 }, { x: 900, y: 40 }, { x: 0, y: 40 }, { x: 0, y: 400 }, { x: 800, y: 400 }],
-    stops: [
-      { sequence: 1, at: { x: 0, y: 0 }, arrivalOffsetS: 0, departureOffsetS: 60 },
-      { sequence: 2, at: { x: 900, y: 20 }, arrivalOffsetS: 300, departureOffsetS: 330 },
-      { sequence: 3, at: { x: 400, y: 40 }, arrivalOffsetS: 480, departureOffsetS: 510 },
-      { sequence: 4, at: { x: 0, y: 220 }, arrivalOffsetS: 660, departureOffsetS: 690 },
-      { sequence: 5, at: { x: 800, y: 400 }, arrivalOffsetS: 900, departureOffsetS: 900 },
-    ],
-    trips,
-  };
-}
-// Stop positions along the shape (m): 0, 920, 1440, 2020, 3000.
-const STOP_M = { 1: 0, 2: 920, 3: 1440, 4: 2020, 5: 3000 } as const;
-
-/**
- * A loop that serves one stop twice (like the seed's Kitano-zaka): stops 2
- * and 5 are the same place; the shape's vertices are the stops.
- */
-function loopRoute(trips: TripDef[]): RouteDef {
-  const pts: XY[] = [
-    { x: 0, y: 0 }, { x: -300, y: -700 }, { x: 100, y: -1200 }, { x: -700, y: -1700 }, { x: -300, y: -700 }, { x: -600, y: -400 },
-  ];
-  let m = 0;
-  const dist = pts.map((p, i) => {
-    const prev = pts[i - 1];
-    if (prev) m += Math.hypot(p.x - prev.x, p.y - prev.y);
-    return m;
-  });
-  const offsets = [[0, 60], [300, 330], [540, 600], [900, 930], [1260, 1290], [1500, 1500]] as const;
-  return {
-    shape: pts,
-    stops: pts.map((p, i) => ({
-      sequence: i + 1, at: p, distM: dist[i] ?? 0, arrivalOffsetS: offsets[i]?.[0] ?? 0, departureOffsetS: offsets[i]?.[1] ?? 0,
-    })),
-    trips,
-  };
-}
-
-const FULL_RUN = ['1:arrived', '1:departed', '2:arrived', '2:departed', '3:arrived', '3:departed', '4:arrived', '4:departed', '5:arrived', '5:departed'];
-
-/** A normal run of the German School route, starting at the depot before the window opens. */
-function normalRun(s: Scenario, tripId: string, opts: { noisyOutbound?: boolean } = {}): Track {
-  const start = s.tripStart(tripId);
-  const t = new Track(s.shape, new Date(start.getTime() - 12 * 60_000));
-  t.dwell(12 * 60 + 60);
-  // Outbound: GPS pulled 25 m towards the return street, so the position is
-  // closer to the return street (15 m) than to the street the bus is on.
-  t.drive(850, 30, opts.noisyOutbound ? () => ({ x: 0, y: 25 }) : undefined);
-  t.drive(STOP_M[2] - 5, 30).dwell(30);
-  t.drive(STOP_M[3] - 2, 30).dwell(30);
-  t.drive(STOP_M[4] - 2, 30).dwell(30);
-  t.drive(STOP_M[5] - 2, 30).dwell(60);
-  t.goTo({ x: 800, y: 480 }, 15);
-  return t;
-}
 
 describe('replay: German School loop', () => {
   it('passing 40 m from stop 3 before stop 2 does not touch stop 3', async () => {

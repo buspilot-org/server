@@ -3,6 +3,8 @@
  * with the same write semantics as PgStore, and a fake clock. Positions are
  * fed through Engine.handlePosition exactly as the HTTP endpoint does.
  */
+import { AlertDispatcher, defaultAlertConfig, type AlertConfig } from '../../src/alerts/dispatcher.ts';
+import type { AlertStore, DeliveryClaim, PushMessage, PushSender, SendResult, Subscription } from '../../src/alerts/types.ts';
 import { defaultThresholds, type Thresholds } from '../../src/config.ts';
 import { Engine, type Clock, type PositionOutcome } from '../../src/core/engine.ts';
 import { serviceTime } from '../../src/core/time.ts';
@@ -43,9 +45,19 @@ export interface StopTransition {
   at: Date;
 }
 
+export interface DeliveryRow extends DeliveryClaim {
+  id: string;
+  sentAt: Date | null;
+  result: string;
+}
+
 /** In-memory Store with the same idempotent, forward-only semantics as PgStore. */
-export class MemoryStore implements Store {
+export class MemoryStore implements Store, AlertStore {
   rows: SnapshotRows;
+  subscriptions: Subscription[] = [];
+  deliveries: DeliveryRow[] = [];
+  clearedTokens: string[] = [];
+  failClaims = 0;
   vehicleState = new Map<string, NonNullable<Writes['vehicleState']>>();
   transitions: StopTransition[] = [];
   etaWrites = 0;
@@ -130,6 +142,41 @@ export class MemoryStore implements Store {
     return Promise.resolve({ tripApplied });
   }
 
+  loadSubscriptions(): Promise<Subscription[]> {
+    return Promise.resolve(structuredClone(this.subscriptions));
+  }
+
+  claimDelivery(c: DeliveryClaim): Promise<string | null> {
+    if (this.failClaims > 0) {
+      this.failClaims--;
+      return Promise.reject(new Error('simulated database failure'));
+    }
+    const exists = this.deliveries.some((d) => d.subscriptionId === c.subscriptionId && d.tripInstanceId === c.tripInstanceId
+      && d.stopSequence === c.stopSequence && d.kind === c.kind);
+    if (exists) return Promise.resolve(null);
+    const id = `delivery-${this.deliveries.length + 1}`;
+    this.deliveries.push({ ...c, id, sentAt: null, result: 'pending' });
+    return Promise.resolve(id);
+  }
+
+  finishDelivery(id: string, sentAt: Date | null, result: string): Promise<void> {
+    const d = this.deliveries.find((x) => x.id === id);
+    if (d) {
+      d.sentAt = sentAt;
+      d.result = result;
+    }
+    return Promise.resolve();
+  }
+
+  clearPushToken(deviceId: string, token: string): Promise<void> {
+    for (const s of this.subscriptions) {
+      if (s.deviceId === deviceId && s.pushToken === token) s.pushToken = '';
+    }
+    this.subscriptions = this.subscriptions.filter((s) => s.pushToken !== '');
+    this.clearedTokens.push(deviceId);
+    return Promise.resolve();
+  }
+
   createTripInstances(): Promise<number> {
     return Promise.resolve(0);
   }
@@ -182,6 +229,38 @@ export function hhmm(s: string): number {
   return (h ?? 0) * 3600 + (m ?? 0) * 60;
 }
 
+/** Records sent messages; `script` answers the next sends (default: ok). */
+export class FakeSender implements PushSender {
+  readonly sent: (PushMessage & { at: Date })[] = [];
+  readonly attempts: PushMessage[] = [];
+  script: SendResult[] = [];
+  readonly #clock: Clock;
+  constructor(clock: Clock) {
+    this.#clock = clock;
+  }
+  send(msg: PushMessage): Promise<SendResult> {
+    this.attempts.push(msg);
+    const res = this.script.shift() ?? { ok: true };
+    if (res.ok) this.sent.push({ ...msg, at: this.#clock.now() });
+    return Promise.resolve(res);
+  }
+  /** `kind@stop_sequence` of the sent messages, in order. */
+  kinds(): string[] {
+    return this.sent.map((m) => `${m.payload.data.kind ?? ''}@${m.payload.data.stop_sequence ?? ''}`);
+  }
+}
+
+/** A subscription for the test route, with defaults. */
+export function subscription(id: string, stopSequence: number, opts: Partial<Subscription> = {}): Subscription {
+  return {
+    id, operatorId: OPERATOR, deviceId: `device-of-${id}`, patternId: PATTERN, stopSequence,
+    trigger: 'minutes', triggerValue: 5, notifyPassed: false, mutedUntil: null, createdAt: new Date(0),
+    pushToken: `fid-${id}`, language: 'en', timezone: TZ, routeId: ROUTE, routeName: { ja: '朝便A', en: 'Morning route A' },
+    routeShortName: null, stopId: `stop-${stopSequence}`, stopName: { ja: `停留所${stopSequence}`, en: `Stop ${stopSequence}` },
+    ...opts,
+  };
+}
+
 export class Scenario {
   readonly plane = new LocalPlane(ORIGIN);
   /** Course of the generated fixes: the direction of travel (set to null to send none). */
@@ -191,12 +270,18 @@ export class Scenario {
   readonly clock: FakeClock;
   readonly def: RouteDef;
   readonly thresholds: Thresholds;
+  readonly alertConfig: AlertConfig;
+  readonly sender: FakeSender;
+  /** Waits between send retries the dispatcher asked for (ms). */
+  readonly sleeps: number[] = [];
+  alerts: AlertDispatcher;
   engine: Engine;
   #positionId = 1000;
 
-  private constructor(def: RouteDef, thresholds: Thresholds) {
+  private constructor(def: RouteDef, thresholds: Thresholds, alertConfig: Partial<AlertConfig>) {
     this.def = def;
     this.thresholds = thresholds;
+    this.alertConfig = { ...defaultAlertConfig, staleAfterS: thresholds.staleAfterS, ...alertConfig };
     this.shape = new Polyline(def.shape);
     const ll = (p: XY): [number, number] => {
       const q = this.plane.toLonLat(p);
@@ -227,23 +312,51 @@ export class Scenario {
     });
     const first = def.trips[0];
     this.clock = new FakeClock(first ? serviceTime(first.serviceDate, 0, TZ) : new Date(0));
+    this.sender = new FakeSender(this.clock);
+    this.alerts = this.#newDispatcher();
     this.engine = this.#newEngine();
   }
 
-  static async create(def: RouteDef, thresholds: Partial<Thresholds> = {}): Promise<Scenario> {
-    const s = new Scenario(def, { ...defaultThresholds, ...thresholds });
+  static async create(
+    def: RouteDef,
+    thresholds: Partial<Thresholds> = {},
+    opts: { subscriptions?: Subscription[]; alerts?: Partial<AlertConfig> } = {},
+  ): Promise<Scenario> {
+    const s = new Scenario(def, { ...defaultThresholds, ...thresholds }, opts.alerts ?? {});
+    s.store.subscriptions = opts.subscriptions ?? [];
+    await s.alerts.reloadSubscriptions();
     await s.engine.reload();
+    await s.alerts.idle();
     return s;
   }
 
-  #newEngine(): Engine {
-    return new Engine({ store: this.store, thresholds: this.thresholds, clock: this.clock, log: silentLogger });
+  #newDispatcher(): AlertDispatcher {
+    return new AlertDispatcher({
+      store: this.store, sender: this.sender, clock: this.clock, log: silentLogger, config: this.alertConfig,
+      sleep: (ms) => {
+        this.sleeps.push(ms);
+        return Promise.resolve();
+      },
+    });
   }
 
-  /** Simulates an engine restart: a new engine that only knows what is in the store. */
+  #newEngine(): Engine {
+    return new Engine({ store: this.store, thresholds: this.thresholds, clock: this.clock, log: silentLogger, observer: this.alerts });
+  }
+
+  /** Simulates an engine restart: a new engine (and dispatcher) that only knows what is in the store. */
   async restart(): Promise<void> {
+    this.alerts = this.#newDispatcher();
     this.engine = this.#newEngine();
+    await this.alerts.reloadSubscriptions();
     await this.engine.reload();
+    await this.alerts.idle();
+  }
+
+  /** Reloads the cache as the periodic job does (picks up database changes). */
+  async reload(): Promise<void> {
+    await this.engine.reload();
+    await this.alerts.idle();
   }
 
   tripStart(tripId: string): Date {
@@ -252,12 +365,15 @@ export class Scenario {
     return serviceTime(t.serviceDate, hhmm(t.start), TZ);
   }
 
-  /** Feeds fixes in order; the clock is set to each fix time (plus a second of latency). */
-  async feed(fixes: readonly Fix[], opts: { tickEveryS?: number } = {}): Promise<PositionOutcome[]> {
+  /**
+   * Feeds fixes in order; the clock is set to each fix time plus `latencyS`
+   * (default 1 s; more simulates positions arriving late, i.e. stale).
+   */
+  async feed(fixes: readonly Fix[], opts: { tickEveryS?: number; latencyS?: number } = {}): Promise<PositionOutcome[]> {
     const out: PositionOutcome[] = [];
     let lastTick: Date | null = null;
     for (const f of fixes) {
-      this.clock.set(new Date(f.t.getTime() + 1000));
+      this.clock.set(new Date(f.t.getTime() + (opts.latencyS ?? 1) * 1000));
       const ll = this.plane.toLonLat(f.xy);
       out.push(await this.engine.handlePosition({
         deviceId: f.deviceId ?? DEVICE,
@@ -270,6 +386,7 @@ export class Scenario {
         accuracyM: 5,
         valid: true,
       }));
+      await this.alerts.idle();
       if (opts.tickEveryS !== undefined && (!lastTick || f.t.getTime() - lastTick.getTime() >= opts.tickEveryS * 1000)) {
         await this.engine.tick();
         lastTick = f.t;

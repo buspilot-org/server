@@ -13,12 +13,13 @@
  * - vehicle_state only takes newer fixes.
  */
 import postgres from 'postgres';
+import type { AlertStore, DeliveryClaim, I18nText, Subscription } from '../alerts/types.ts';
 import type { StopState, TripStatus, Writes } from '../core/types.ts';
 import type { InstanceRow, PersistResult, SnapshotRows, Store } from './store.ts';
 
 type Sql = postgres.Sql;
 
-export class PgStore implements Store {
+export class PgStore implements Store, AlertStore {
   readonly sql: Sql;
 
   constructor(databaseUrl: string, options: { max?: number } = {}) {
@@ -215,6 +216,70 @@ export class PgStore implements Store {
       const tripRows = tripIndex >= 0 ? results[tripIndex] : undefined;
       return { tripApplied: tripIndex < 0 || (Array.isArray(tripRows) && tripRows.length > 0) };
     });
+  }
+
+  /**
+   * Subscriptions the engine may alert: the device has a push target, the
+   * route is active, and the device may see it (public, or a membership
+   * whose audience includes the route), as `private.route_access` decides
+   * for riders. Muting is checked when an alert is due.
+   */
+  async loadSubscriptions(): Promise<Subscription[]> {
+    const rows = await this.sql<{
+      id: string; operator_id: string; device_id: string; pattern_id: string; stop_sequence: number;
+      trigger: 'minutes' | 'stops'; trigger_value: number; notify_passed: boolean; muted_until: Date | null; created_at: Date;
+      push_token: string; language: string | null; timezone: string; route_id: string; route_name: I18nText;
+      route_short_name: string | null; stop_id: string; stop_name: I18nText;
+    }[]>`
+      select s.id, s.operator_id, s.device_id, s.pattern_id, s.stop_sequence, s.trigger::text as trigger,
+             s.trigger_value, s.notify_passed, s.muted_until, s.created_at,
+             d.push_token, d.language, o.timezone, r.id as route_id, r.name as route_name,
+             r.short_name as route_short_name, st.id as stop_id, st.name as stop_name
+        from public.subscription s
+        join public.device d on d.id = s.device_id
+        join public.trip_pattern p on p.id = s.pattern_id
+        join public.route r on r.id = p.route_id
+        join public.operator o on o.id = r.operator_id
+        join public.pattern_stop ps on ps.pattern_id = s.pattern_id and ps.stop_sequence = s.stop_sequence
+        join public.stop st on st.id = ps.stop_id
+       where d.push_token is not null and d.push_token <> ''
+         and r.active
+         and (coalesce(r.visibility, o.default_visibility) = 'public'
+              or exists (select 1
+                           from public.audience_route ar
+                           join public.membership m on m.audience_id = ar.audience_id
+                          where ar.route_id = r.id
+                            and m.device_id = s.device_id
+                            and m.revoked_at is null))`;
+    return rows.map((r) => ({
+      id: r.id, operatorId: r.operator_id, deviceId: r.device_id, patternId: r.pattern_id, stopSequence: r.stop_sequence,
+      trigger: r.trigger, triggerValue: r.trigger_value, notifyPassed: r.notify_passed, mutedUntil: r.muted_until,
+      createdAt: r.created_at, pushToken: r.push_token, language: r.language, timezone: r.timezone, routeId: r.route_id,
+      routeName: r.route_name, routeShortName: r.route_short_name, stopId: r.stop_id, stopName: r.stop_name,
+    }));
+  }
+
+  async claimDelivery(c: DeliveryClaim): Promise<string | null> {
+    try {
+      const rows = await this.sql<{ id: string }[]>`
+        insert into public.alert_delivery (operator_id, subscription_id, trip_instance_id, stop_sequence, kind, result)
+        values (${c.operatorId}, ${c.subscriptionId}, ${c.tripInstanceId}, ${c.stopSequence}, ${c.kind}::public.alert_kind, 'pending')
+        on conflict (subscription_id, trip_instance_id, stop_sequence, kind) do nothing
+        returning id`;
+      return rows[0]?.id ?? null;
+    } catch (err) {
+      // The subscription or trip instance was deleted meanwhile: nothing to send.
+      if (err instanceof postgres.PostgresError && err.code === '23503') return null;
+      throw err;
+    }
+  }
+
+  async finishDelivery(id: string, sentAt: Date | null, result: string): Promise<void> {
+    await this.sql`update public.alert_delivery set sent_at = ${sentAt}, result = ${result} where id = ${id}`;
+  }
+
+  async clearPushToken(deviceId: string, token: string): Promise<void> {
+    await this.sql`update public.device set push_token = null where id = ${deviceId} and push_token = ${token}`;
   }
 
   async createTripInstances(now: Date): Promise<number> {
