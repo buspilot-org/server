@@ -145,7 +145,7 @@ export function classifyFcmResponse(res: HttpResponse): SendResult {
   const fcmCode = body.error?.details?.find((d) => d['@type']?.endsWith('google.firebase.fcm.v1.FcmError'))?.errorCode;
   const code = fcmCode ?? body.error?.status ?? `HTTP_${res.status}`;
   const retryAfter = Number(res.header('retry-after'));
-  // Capped: a long Retry-After would hold a send slot and delay shutdown.
+  // Capped: a long Retry-After would keep the alert pending and delay shutdown.
   const retryAfterS = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter, 60) : undefined;
   const fail = (retryable: boolean, invalidTarget = false): SendResult => ({ ok: false, code, retryable, invalidTarget, ...(retryAfterS === undefined ? {} : { retryAfterS }) });
 

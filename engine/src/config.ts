@@ -166,7 +166,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (target !== 'fid' && target !== 'token') throw new Error('FCM_TARGET must be fid or token');
   const delayRaw = env.ALERT_DELAY_MINUTES;
   const delayMinutes = delayRaw === undefined || delayRaw === '' ? defaultAlertConfig.delayThresholdS / 60 : Number(delayRaw);
-  if (!/^\d+$/.test(delayRaw ?? '0') || !Number.isInteger(delayMinutes) || delayMinutes < 0) throw new Error('ALERT_DELAY_MINUTES must be a whole number ≥ 0 (0 = no delay alerts)');
+  if ((delayRaw !== undefined && delayRaw !== '' && !/^\d+$/.test(delayRaw)) || !Number.isInteger(delayMinutes) || delayMinutes < 0) throw new Error('ALERT_DELAY_MINUTES must be a whole number ≥ 0 (0 = no delay alerts)');
   return {
     databaseUrl,
     traccarSecret,

@@ -16,5 +16,9 @@ describe('config', () => {
     assert.throws(() => loadConfig({ ...base, TRACCAR_FORWARD_SECRET: 'short' }), /at least 32/);
     assert.throws(() => loadConfig({ ...base, TRACCAR_FORWARD_SECRET: 'x'.repeat(31) + '/' }), /letters, digits/);
     assert.throws(() => loadConfig({ ...base, PORT: 'abc' }), /PORT/);
+    assert.throws(() => loadConfig({ ...base, ALERT_DELAY_MINUTES: ' ' }), /ALERT_DELAY_MINUTES/);
+    assert.equal(loadConfig({ ...base, ALERT_DELAY_MINUTES: '' }).alerts.delayThresholdS, 600, 'blank: default');
+    assert.equal(loadConfig({ ...base, ALERT_DELAY_MINUTES: '0' }).alerts.delayThresholdS, 0);
+    assert.equal(loadConfig(base).push, null, 'no service account: alerts off');
   });
 });

@@ -54,7 +54,7 @@ export interface AlertMetrics {
   alertsClaimed: number;
   alertsSent: number;
   alertsFailed: number;
-  /** Not sent because they were no longer useful when a retry came up. */
+  /** Not sent because they were no longer useful when an attempt came up (bus left, muted, unsubscribed, trip ended). */
   alertsExpired: number;
   pushTokensCleared: number;
   lastSubscriptionReloadAt: string | null;
@@ -196,6 +196,8 @@ export class AlertDispatcher implements TripObserver {
       const now = this.#clock.now();
       for (const tr of trips) {
         seen.add(tr.instance.id);
+        // Trips completed by the tick or taken over from the database: retries see it.
+        if (this.#latest.has(tr.instance.id)) this.#latest.set(tr.instance.id, { status: tr.progress.status, stops: tr.progress.stops });
         if (tr.progress.status === 'cancelled') this.#cancelled(tr.instance, tr.progress, now);
       }
       for (const id of [...this.#claimed.keys()]) if (!seen.has(id)) this.#claimed.delete(id);
@@ -279,7 +281,7 @@ export class AlertDispatcher implements TripObserver {
   #check(p: Pending, now: Date): Pending | null {
     if (now > p.expiresAt) return null;
     const sub = this.#byPattern.get(p.sub.patternId)?.find((s) => s.id === p.sub.id && s.stopSequence === p.sub.stopSequence);
-    if (sub === undefined || isMuted(sub, now)) return null;
+    if (sub === undefined || isMuted(sub, now) || (p.variant === 'passed' && !sub.notifyPassed)) return null;
     if (p.variant === 'passed' || p.variant === 'cancelled') return { ...p, sub };
     const trip = this.#latest.get(p.instance.id);
     if (trip?.status !== 'active') return null;
@@ -321,7 +323,7 @@ export class AlertDispatcher implements TripObserver {
       if (res.ok) {
         this.metrics.alertsSent++;
         await this.#finish(id, this.#clock.now(), 'sent');
-        this.#log.info('alert sent', fields);
+        this.#log.info('alert sent', { ...fields, kind: p.variant });
         return;
       }
       if (res.invalidTarget) {
