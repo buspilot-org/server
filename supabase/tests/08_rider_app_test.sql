@@ -9,7 +9,7 @@
 --   riderA: member of the demo audience. riderB: no membership.
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(27);
+select plan(31);
 
 insert into auth.users (id, email, is_anonymous) values
   ('f8000000-0000-4000-8000-00000000000a', null, true),
@@ -221,6 +221,63 @@ select ok(
 select ok(
   exists (select 1 from auth.users where id = 'e8000000-0000-4000-8000-000000000001'),
   'the staff account is still there'
+);
+
+-- =============================================================================
+-- Mini map limit over time; stops visible anyway do not use a place
+-- =============================================================================
+-- riderB joins the hotel's invited route PI (two stops) and still follows
+-- the public route PR's stop.
+insert into public.stop (id, operator_id, name, location) values
+  ('82000000-0000-4000-8000-000000000002', '80000000-0000-4000-8000-000000000001', '{"en": "PS2"}', 'SRID=4326;POINT(135.2 34.7)'),
+  ('82000000-0000-4000-8000-000000000003', '80000000-0000-4000-8000-000000000001', '{"en": "PS3"}', 'SRID=4326;POINT(135.2 34.7)');
+insert into public.trip_pattern (id, operator_id, route_id, name) values
+  ('83000000-0000-4000-8000-000000000002', '80000000-0000-4000-8000-000000000001', '81000000-0000-4000-8000-000000000002', 'PI');
+insert into public.pattern_stop (operator_id, pattern_id, stop_sequence, stop_id, arrival_offset, departure_offset) values
+  ('80000000-0000-4000-8000-000000000001', '83000000-0000-4000-8000-000000000002', 1, '82000000-0000-4000-8000-000000000002', 0, 0),
+  ('80000000-0000-4000-8000-000000000001', '83000000-0000-4000-8000-000000000002', 2, '82000000-0000-4000-8000-000000000003', 60, 60);
+insert into public.membership (operator_id, device_id, audience_id) values
+  ('80000000-0000-4000-8000-000000000001', 'f8000000-0000-4000-8000-00000000000b', '85000000-0000-4000-8000-000000000001');
+
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub": "f8000000-0000-4000-8000-00000000000b", "role": "authenticated", "is_anonymous": true}', true);
+insert into public.subscription (operator_id, device_id, pattern_id, stop_sequence) values
+  ('80000000-0000-4000-8000-000000000001', 'f8000000-0000-4000-8000-00000000000b', '83000000-0000-4000-8000-000000000002', 1),
+  ('80000000-0000-4000-8000-000000000001', 'f8000000-0000-4000-8000-00000000000b', '83000000-0000-4000-8000-000000000002', 2);
+select set_eq(
+  $$ select id from public.stop_location where operator_id = '80000000-0000-4000-8000-000000000001' $$,
+  array['82000000-0000-4000-8000-000000000001', '82000000-0000-4000-8000-000000000002',
+        '82000000-0000-4000-8000-000000000003']::uuid[],
+  'the public route''s stop (visible anyway) does not use one of the two places'
+);
+
+-- 31 days later, still following: the places stay, also after the purge.
+reset role;
+update private.followed_stop_log set created_at = now() - interval '31 days'
+ where device_id = 'f8000000-0000-4000-8000-00000000000b';
+select private.purge_expired_data();
+select is(
+  (select count(*) from private.followed_stop_log where device_id = 'f8000000-0000-4000-8000-00000000000b'),
+  2::bigint,
+  'the purge keeps the log of stops still followed'
+);
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub": "f8000000-0000-4000-8000-00000000000b", "role": "authenticated", "is_anonymous": true}', true);
+select is(
+  (select count(*) from public.stop_location where operator_id = '80000000-0000-4000-8000-000000000001'),
+  3::bigint,
+  'a stop followed for more than 30 days still shows its location'
+);
+
+-- Unfollowed for more than 30 days: the place is freed.
+reset role;
+delete from public.subscription
+ where device_id = 'f8000000-0000-4000-8000-00000000000b' and pattern_id = '83000000-0000-4000-8000-000000000002' and stop_sequence = 1;
+select private.purge_expired_data();
+select results_eq(
+  $$ select stop_id from private.followed_stop_log where device_id = 'f8000000-0000-4000-8000-00000000000b' $$,
+  $$ values ('82000000-0000-4000-8000-000000000003'::uuid) $$,
+  'the purge frees the place of a stop unfollowed more than 30 days ago'
 );
 
 select * from finish();

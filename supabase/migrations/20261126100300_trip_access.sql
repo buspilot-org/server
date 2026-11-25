@@ -148,6 +148,15 @@ begin
     raise exception 'planned stops cannot move to another trip or position; delete and insert instead'
       using errcode = 'check_violation';
   end if;
+  if tg_op = 'UPDATE' and new.stop_id <> old.stop_id and exists (
+       select 1 from public.stop_event se
+        where se.trip_instance_id = old.trip_instance_id
+          and se.stop_sequence = old.stop_sequence
+          and se.state not in ('upcoming', 'approaching')
+     ) then
+    raise exception 'the bus has already reached or passed this stop; it cannot be replaced'
+      using errcode = 'check_violation';
+  end if;
   select ti.kind, ti.pattern_id into v_kind, v_pattern_id
     from public.trip_instance ti where ti.id = new.trip_instance_id;
   if v_kind is distinct from 'live' or v_pattern_id is not null then
@@ -340,15 +349,21 @@ as $$
         join public.trip_pattern p on p.id = ps.pattern_id
         where ps.stop_id = s.id
       ), 0),
-      -- Only live trips riders can still see that are planned, running or
+      -- Only live trips that are running, planned (from yesterday on) or
       -- ended within a day, so old tours do not slow down every stop read.
+      -- Afterwards a rider may still see an old trip's planned stops but no
+      -- longer the stop names and locations.
       coalesce((
         select max(private.trip_instance_access(tis.trip_instance_id))
         from public.trip_instance_stop tis
         join public.trip_instance ti on ti.id = tis.trip_instance_id
         where tis.operator_id = s.operator_id and tis.stop_id = s.id
           and (ti.visible_until is null or ti.visible_until > now())
-          and (ti.status in ('planned', 'active') or ti.ended_at > now() - interval '1 day')
+          and (
+            ti.status = 'active'
+            or (ti.status = 'planned' and ti.service_date >= current_date - 1)
+            or ti.ended_at > now() - interval '1 day'
+          )
       ), 0)
     )
   end::smallint
@@ -520,7 +535,9 @@ create trigger drop_inaccessible_subscriptions
 
 -- Realtime "route:<id>": route_access is 3 for every staff member, so
 -- drivers would receive every bus of the operator. Editors and owners still
--- do; drivers only for routes on which a trip they may see is active.
+-- do; drivers for routes on which a trip they may see is active, otherwise
+-- like a visitor (public routes). Topics are per route: such a driver gets
+-- every bus on the route, and keeps the channel until it is closed.
 create or replace function private.route_topic_access(p_topic text)
 returns smallint
 language plpgsql
@@ -547,7 +564,10 @@ begin
             and ti.status = 'active'
             and private.staff_trip_access(ti.operator_id, ti.vehicle_id, ti.trip_id)
        ) then
-      return 0;
+      return case when exists (
+        select 1 from public.route r join public.operator o on o.id = r.operator_id
+         where r.id = v_route_id and r.active and coalesce(r.visibility, o.default_visibility) = 'public'
+      ) then 2 else 0 end;
     end if;
   end if;
   return v_level;

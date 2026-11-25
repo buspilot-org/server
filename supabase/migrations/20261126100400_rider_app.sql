@@ -46,14 +46,17 @@ grant execute on function public.delete_my_device() to authenticated;
 -- Stop locations: own followed stop, service role
 -- -----------------------------------------------------------------------------
 
--- Which stops a device followed, per operator, for 30 days. Without a limit
--- a member could follow every stop of an arrival-times-only route in turn
--- and so map all stops (often next to children's homes). The mini map shows
--- only the first two distinct stops a device followed at an operator within
--- 30 days (morning and afternoon stop, or two children); following others
--- works for alerts but shows no location. Mapping more stops needs more
--- devices, i.e. more invite code redemptions. Not exposed; deleted with the
--- device and after 30 days (purge job).
+-- Which stops a device followed whose location it could not see otherwise,
+-- per operator. Without a limit a member could follow every stop of an
+-- arrival-times-only route in turn and so map all stops (often next to
+-- children's homes). The mini map shows only the first two such stops
+-- (morning and afternoon stop, or two children); following others works for
+-- alerts but shows no location. A stop keeps its place while the device
+-- follows it; after unfollowing, the place is freed 30 days later (purge
+-- job). So a device reveals at most two new stops per operator and 30 days;
+-- more needs more devices, i.e. more invite code redemptions. Stops the
+-- device sees on the map anyway (public or map-level routes) are not
+-- logged. Not exposed; deleted with the device.
 create table private.followed_stop_log (
   id bigint generated always as identity primary key,
   device_id uuid not null references public.device (id) on delete cascade,
@@ -67,43 +70,70 @@ create index followed_stop_log_device_idx on private.followed_stop_log (device_i
 alter table private.followed_stop_log enable row level security;
 revoke all on private.followed_stop_log from public, anon, authenticated;
 
+-- The stops a device follows now (pattern and live-trip subscriptions).
+create function private.device_followed_stops(p_device_id uuid)
+returns table (operator_id uuid, stop_id uuid)
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select s.operator_id, ps.stop_id
+    from public.subscription s
+    join public.pattern_stop ps
+      on ps.operator_id = s.operator_id and ps.pattern_id = s.pattern_id and ps.stop_sequence = s.stop_sequence
+   where s.device_id = p_device_id
+  union
+  select s.operator_id, tis.stop_id
+    from public.subscription s
+    join public.trip_instance_stop tis
+      on tis.operator_id = s.operator_id and tis.trip_instance_id = s.trip_instance_id and tis.stop_sequence = s.stop_sequence
+   where s.device_id = p_device_id
+$$;
+
+-- Runs as the rider (auth.uid() from the request), so stop_access is the
+-- rider's level.
 create function private.log_followed_stop()
 returns trigger
 language plpgsql
 security definer
 set search_path = ''
 as $$
+declare
+  v_stop_id uuid;
 begin
-  insert into private.followed_stop_log (device_id, operator_id, stop_id)
-  select new.device_id, new.operator_id, ps.stop_id
-    from public.pattern_stop ps
-   where new.pattern_id is not null
-     and ps.pattern_id = new.pattern_id
-     and ps.stop_sequence = new.stop_sequence
-  union all
-  select new.device_id, new.operator_id, tis.stop_id
-    from public.trip_instance_stop tis
-   where new.trip_instance_id is not null
-     and tis.trip_instance_id = new.trip_instance_id
-     and tis.stop_sequence = new.stop_sequence;
+  if new.pattern_id is not null then
+    select ps.stop_id into v_stop_id
+      from public.pattern_stop ps
+     where ps.pattern_id = new.pattern_id and ps.stop_sequence = new.stop_sequence;
+  else
+    select tis.stop_id into v_stop_id
+      from public.trip_instance_stop tis
+     where tis.trip_instance_id = new.trip_instance_id and tis.stop_sequence = new.stop_sequence;
+  end if;
+  if v_stop_id is not null and private.stop_access(v_stop_id) < 2 then
+    insert into private.followed_stop_log (device_id, operator_id, stop_id)
+    values (new.device_id, new.operator_id, v_stop_id);
+  end if;
   return null;
 end;
 $$;
 
 create trigger log_followed_stop
-  after insert on public.subscription
+  after insert or update of pattern_id, trip_instance_id, stop_sequence on public.subscription
   for each row execute function private.log_followed_stop();
 
--- Existing subscriptions count as followed now.
-insert into private.followed_stop_log (device_id, operator_id, stop_id)
-select s.device_id, s.operator_id, ps.stop_id
+-- Existing subscriptions count as followed, in the order they were made.
+insert into private.followed_stop_log (device_id, operator_id, stop_id, created_at)
+select s.device_id, s.operator_id, ps.stop_id, s.created_at
   from public.subscription s
-  join public.pattern_stop ps on ps.pattern_id = s.pattern_id and ps.stop_sequence = s.stop_sequence;
+  join public.pattern_stop ps on ps.pattern_id = s.pattern_id and ps.stop_sequence = s.stop_sequence
+ order by s.created_at, s.id;
 
 -- True if the current user follows the stop (has a subscription to it, on a
 -- pattern or a live trip) and still sees that route or trip, and the stop is
--- one of the first two distinct stops the device followed at this operator
--- within 30 days (private.followed_stop_log). Arrival-time-only audiences
+-- one of the first two logged stops of the device at this operator
+-- (private.followed_stop_log, see above). Arrival-time-only audiences
 -- then get the location for a mini map, nothing else (decided 2026-11-23).
 create function private.follows_stop(p_stop_id uuid)
 returns boolean
@@ -142,15 +172,15 @@ as $$
         from private.followed_stop_log l
        where l.device_id = (select auth.uid())
          and l.operator_id = (select st.operator_id from public.stop st where st.id = p_stop_id)
-         and l.created_at > now() - interval '30 days'
        group by l.stop_id
-       order by min(l.created_at), l.stop_id
+       order by min(l.id)
        limit 2
     )
 $$;
 
 -- Map-level stops, the stops one follows (see above), and everything for
--- the service role and postgres (SQL editor, scripts). A view's function calls are checked against the caller, so the
+-- the service role. (postgres sessions, like the engine, read stop.location
+-- directly.) A view's function calls are checked against the caller, so the
 -- service role needs EXECUTE on the helpers (it had none: "permission denied
 -- for function stop_access").
 create or replace view public.stop_location
@@ -158,7 +188,7 @@ with (security_barrier = true)
 as
 select s.id, s.operator_id, s.location
 from public.stop s
-where current_user in ('service_role', 'postgres')
+where current_user = 'service_role'
    or private.stop_access(s.id) >= 2
    or private.follows_stop(s.id);
 
@@ -263,7 +293,7 @@ revoke execute on function public.my_routes() from public, anon;
 grant execute on function public.my_routes() to authenticated;
 
 
--- Retention: the followed-stop log is kept 30 days (20261123111634_retention.sql
+-- Retention: the followed-stop log is kept while followed, then 30 days (20261123111634_retention.sql
 -- plus this line).
 create or replace function private.purge_expired_data()
 returns void
@@ -276,7 +306,13 @@ begin
   delete from public.vehicle_event where received_at < now() - interval '30 days';
   delete from public.boarding_event where occurred_at < now() - interval '30 days';
   delete from private.invite_redemption_failure where attempted_at < now() - interval '1 day';
-  delete from private.followed_stop_log where created_at < now() - interval '30 days';
+  -- Followed-stop log: freed 30 days after the device stopped following.
+  delete from private.followed_stop_log l
+   where l.created_at < now() - interval '30 days'
+     and not exists (
+       select 1 from private.device_followed_stops(l.device_id) f
+        where f.operator_id = l.operator_id and f.stop_id = l.stop_id
+     );
 
   -- Inactive rider devices: delete the anonymous auth user; device,
   -- memberships, subscriptions and alert log follow by cascade.

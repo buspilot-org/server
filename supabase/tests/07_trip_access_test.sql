@@ -15,7 +15,7 @@
 --   staff: editor E, driver D (drives V1), driver D2 (no vehicle)
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(50);
+select plan(54);
 
 insert into auth.users (id, email, is_anonymous) values
   ('e7000000-0000-4000-8000-0000000000e1', 'editor-t@example.test', false),
@@ -379,12 +379,26 @@ select ok(
   and not exists (select 1 from public.vehicle_state where vehicle_id = '75000000-0000-4000-8000-000000000002'),
   'a per-trip audience with map sees a live trip on an invited_eta route, but not the bus'
 );
+select is_empty(
+  $$ select 1 from public.stop_location where id in ('72000000-0000-4000-8000-000000000001', '72000000-0000-4000-8000-000000000002') $$,
+  '... and no stop locations of that route'
+);
 
 reset role;
 set local role authenticated;
 select set_config('request.jwt.claims', '{"sub": "e7000000-0000-4000-8000-0000000000d2", "role": "authenticated"}', true);
 select is(private.route_topic_access('route:71000000-0000-4000-8000-000000000001'), 0::smallint,
   'a driver without an active trip on the route gets no Realtime positions of it');
+reset role;
+update public.route set visibility = 'public' where id = '71000000-0000-4000-8000-000000000001';
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub": "e7000000-0000-4000-8000-0000000000d2", "role": "authenticated"}', true);
+select is(private.route_topic_access('route:71000000-0000-4000-8000-000000000001'), 2::smallint,
+  '... but on a public route like any visitor');
+reset role;
+update public.route set visibility = null where id = '71000000-0000-4000-8000-000000000001';
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub": "e7000000-0000-4000-8000-0000000000d2", "role": "authenticated"}', true);
 reset role;
 set local role authenticated;
 select set_config('request.jwt.claims', '{"sub": "e7000000-0000-4000-8000-0000000000d1", "role": "authenticated"}', true);
@@ -404,9 +418,19 @@ select throws_ok(
   '23514', null, 'a planned stop the bus already reached cannot be removed'
 );
 select throws_ok(
+  $$ update public.trip_instance_stop set stop_id = '72000000-0000-4000-8000-000000000004'
+      where trip_instance_id = '77000000-0000-4000-8000-0000000000b1' and stop_sequence = 1 $$,
+  '23514', null, '... nor replaced by another stop'
+);
+select throws_ok(
   $$ update public.trip_instance set pattern_id = '73000000-0000-4000-8000-000000000001'
       where id = '77000000-0000-4000-8000-0000000000b1' $$,
   '23514', null, 'a live trip with planned stops cannot get a pattern'
+);
+select throws_ok(
+  $$ update public.trip_instance set kind = 'scheduled', trip_id = '76000000-0000-4000-8000-000000000003'
+      where id = '77000000-0000-4000-8000-0000000000b3' $$,
+  '23514', null, 'a live trip with its own audiences cannot become scheduled'
 );
 select lives_ok(
   $$ delete from public.trip_instance where id = '77000000-0000-4000-8000-0000000000b1' $$,
