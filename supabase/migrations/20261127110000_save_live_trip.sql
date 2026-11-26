@@ -37,9 +37,16 @@
 --   p_stops          null = leave the planned stops as they are; else a JSON
 --                    array of {stop_id, stop_sequence, planned_arrival,
 --                    planned_departure}, the full new plan
---   p_audiences      null = leave the audiences as they are (drivers cannot
---                    read audiences); else a JSON array of {audience_id,
---                    can_see_map}, the full new list
+--   p_audiences      null = leave the audiences as they are (for a client
+--                    that does not manage audiences); else a JSON array of
+--                    {audience_id, can_see_map}, the full new list
+--                    (can_see_map left out = false)
+-- On update the call saves the whole form: p_title, p_vehicle_id,
+-- p_route_id and p_visible_until replace the saved values, so null clears
+-- them (any vehicle, no route, no limit). Pass the saved values to keep
+-- them: clearing the route drops the followers who saw the trip only
+-- through the route. Only p_service_date, p_stops and p_audiences mean
+-- "keep" when null.
 -- The trip is saved with kind 'live' and started_by 'driver'; its status is
 -- not changed here.
 --
@@ -159,8 +166,8 @@ begin
     );
   else
     -- Locks the trip against a concurrent save. Only rows the caller may
-    -- update are found (RLS "staff update trips"); the explicit check also
-    -- refuses staff who only see the trip as riders would.
+    -- update are found (RLS "staff update trips"; riders and other drivers
+    -- find nothing).
     select ti.* into v_trip
       from public.trip_instance ti
      where ti.id = p_trip_id
@@ -183,13 +190,40 @@ begin
   end if;
 
   -- 1. Audiences added or changed (before anything can take access away).
+  -- Statement triggers on these tables (follower re-check over all
+  -- subscriptions, engine notification) fire even when no row changes, so
+  -- statements with nothing to do are skipped here and below.
   if p_audiences is not null then
-    insert into public.trip_instance_audience (operator_id, trip_instance_id, audience_id, can_see_map)
-    select v_operator_id, v_id, a.audience_id, coalesce(a.can_see_map, false)
-      from jsonb_to_recordset(p_audiences) as a(audience_id uuid, can_see_map boolean)
-    on conflict (trip_instance_id, audience_id) do update
-      set can_see_map = excluded.can_see_map
-      where public.trip_instance_audience.can_see_map is distinct from excluded.can_see_map;
+    if exists (
+      select 1 from jsonb_to_recordset(p_audiences) as a(audience_id uuid)
+       where not exists (
+         select 1 from public.trip_instance_audience tia
+          where tia.trip_instance_id = v_id and tia.audience_id = a.audience_id
+       )
+    ) then
+      insert into public.trip_instance_audience (operator_id, trip_instance_id, audience_id, can_see_map)
+      select v_operator_id, v_id, a.audience_id, coalesce(a.can_see_map, false)
+        from jsonb_to_recordset(p_audiences) as a(audience_id uuid, can_see_map boolean)
+       where not exists (
+         select 1 from public.trip_instance_audience tia
+          where tia.trip_instance_id = v_id and tia.audience_id = a.audience_id
+       );
+    end if;
+    if exists (
+      select 1
+        from public.trip_instance_audience tia
+        join jsonb_to_recordset(p_audiences) as a(audience_id uuid, can_see_map boolean)
+          on a.audience_id = tia.audience_id
+       where tia.trip_instance_id = v_id
+         and tia.can_see_map is distinct from coalesce(a.can_see_map, false)
+    ) then
+      update public.trip_instance_audience tia
+         set can_see_map = coalesce(a.can_see_map, false)
+        from jsonb_to_recordset(p_audiences) as a(audience_id uuid, can_see_map boolean)
+       where tia.trip_instance_id = v_id
+         and tia.audience_id = a.audience_id
+         and tia.can_see_map is distinct from coalesce(a.can_see_map, false);
+    end if;
   end if;
 
   -- 2. Planned stops.
@@ -254,7 +288,13 @@ begin
 
   -- 4. Audiences removed: riders who lose the trip with them lose their
   -- subscriptions to it (statement trigger), the others keep them.
-  if p_audiences is not null then
+  if p_audiences is not null and exists (
+    select 1 from public.trip_instance_audience tia
+     where tia.trip_instance_id = v_id
+       and tia.audience_id not in (
+         select a.audience_id from jsonb_to_recordset(p_audiences) as a(audience_id uuid)
+       )
+  ) then
     delete from public.trip_instance_audience tia
      where tia.trip_instance_id = v_id
        and tia.audience_id not in (
@@ -318,12 +358,14 @@ declare
 begin
   delete from public.subscription s
    using public.trip_instance ti
+   join public.operator o on o.id = ti.operator_id
    where ti.id = s.trip_instance_id
      and ti.kind = 'live'
      and (
        (ti.status in ('completed', 'cancelled') and coalesce(ti.ended_at, ti.updated_at) < now() - interval '1 hour')
        or ti.visible_until <= now()
-       or (ti.status in ('planned', 'active') and ti.service_date < current_date - 7)
+       -- service_date is a date in the operator's time zone.
+       or (ti.status in ('planned', 'active') and ti.service_date < (now() at time zone o.timezone)::date - 7)
      );
   get diagnostics v_deleted = row_count;
   return v_deleted;

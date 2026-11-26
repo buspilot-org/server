@@ -11,7 +11,7 @@
 -- is kept in the setting test.r1.
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(44);
+select plan(49);
 
 insert into auth.users (id, email, is_anonymous) values
   ('aa000000-0000-4000-8000-0000000000e1', 'editor-slt@example.test', false),
@@ -404,6 +404,26 @@ select throws_ok(
      ) $$,
   '23502', null, 'a live trip needs a title'
 );
+-- Audience C added (step 1) and stop 5 replaced, dropping rRC's follow
+-- (step 2), then the trip update (step 3) is refused: all of it is undone.
+select throws_ok(
+  $$ select public.save_live_trip(
+       p_trip_id => (current_setting('test.r1')::jsonb ->> 'id')::uuid,
+       p_title => '{"en": "Broken"}',
+       p_vehicle_id => 'a5000000-0000-4000-8000-000000000002',
+       p_route_id => 'a1000000-0000-4000-8000-000000000001',
+       p_stops => '[
+         {"stop_id": "a2000000-0000-4000-8000-000000000001", "stop_sequence": 1},
+         {"stop_id": "a2000000-0000-4000-8000-000000000003", "stop_sequence": 2},
+         {"stop_id": "a2000000-0000-4000-8000-000000000002", "stop_sequence": 5}
+       ]',
+       p_audiences => '[
+         {"audience_id": "a8000000-0000-4000-8000-00000000000b"},
+         {"audience_id": "a8000000-0000-4000-8000-00000000000c", "can_see_map": true}
+       ]'
+     ) $$,
+  '42501', null, 'a refusal in the last steps undoes the audience and stop writes before it'
+);
 
 reset role;
 select set_config('request.jwt.claims', '', true);
@@ -437,31 +457,71 @@ select is(
   'the refused new trip was not created'
 );
 
+-- Driver D2 may create a trip without a vehicle ("any vehicle").
+set local role authenticated;
+select set_config('request.jwt.claims', '{"sub": "aa000000-0000-4000-8000-0000000000d2", "role": "authenticated"}', true);
+select lives_ok(
+  $$ select public.save_live_trip(
+       p_operator_id => 'a0000000-0000-4000-8000-000000000001',
+       p_title => '{"en": "Any vehicle"}'
+     ) $$,
+  'a driver creates a live trip without a vehicle'
+);
+
+-- =============================================================================
+-- Whole-form save: clearing the route and every audience (editor E)
+-- =============================================================================
+select set_config('request.jwt.claims', '{"sub": "aa000000-0000-4000-8000-0000000000e1", "role": "authenticated"}', true);
+select lives_ok(
+  $$ select public.save_live_trip(
+       p_trip_id => (current_setting('test.r1')::jsonb ->> 'id')::uuid,
+       p_title => '{"en": "Tour 3"}',
+       p_vehicle_id => 'a5000000-0000-4000-8000-000000000001',
+       p_route_id => null,
+       p_audiences => '[]'
+     ) $$,
+  'editor E clears the route and all audiences'
+);
+reset role;
+select set_config('request.jwt.claims', '', true);
+select is(
+  (select count(*) from public.trip_instance_audience where trip_instance_id = (current_setting('test.r1')::jsonb ->> 'id')::uuid),
+  0::bigint,
+  'an empty audience list removes every audience'
+);
+select is_empty(
+  $$ select 1 from public.subscription where trip_instance_id = (current_setting('test.r1')::jsonb ->> 'id')::uuid $$,
+  'rRC (route only) and rB (audience B) lose their follows'
+);
+
 -- =============================================================================
 -- Purge of subscriptions on finished live trips
 -- =============================================================================
 -- rB follows a stop on each: done (completed 2 h ago, stop S2), recent
 -- (completed 10 min ago), expired (visible_until passed), stale (planned,
--- 8 days ago), running (active today). rB also still follows T1 (planned
--- 2026-12-05).
+-- 8 days ago), running (active today), cancelled (no ended_at, last
+-- updated 2 h ago).
 insert into public.trip_instance (id, operator_id, service_date, kind, status, started_by, title, visible_until, ended_at) values
   ('a7000000-0000-4000-8000-000000000001', 'a0000000-0000-4000-8000-000000000001', current_date, 'live', 'completed', 'driver', '{"en": "done"}', null, now() - interval '2 hours'),
   ('a7000000-0000-4000-8000-000000000002', 'a0000000-0000-4000-8000-000000000001', current_date, 'live', 'completed', 'driver', '{"en": "recent"}', null, now() - interval '10 minutes'),
   ('a7000000-0000-4000-8000-000000000003', 'a0000000-0000-4000-8000-000000000001', current_date, 'live', 'active', 'driver', '{"en": "expired"}', now() - interval '1 minute', null),
   ('a7000000-0000-4000-8000-000000000004', 'a0000000-0000-4000-8000-000000000001', current_date - 8, 'live', 'planned', 'driver', '{"en": "stale"}', null, null),
   ('a7000000-0000-4000-8000-000000000005', 'a0000000-0000-4000-8000-000000000001', current_date, 'live', 'active', 'driver', '{"en": "running"}', null, null);
+insert into public.trip_instance (id, operator_id, service_date, kind, status, started_by, title, updated_at) values
+  ('a7000000-0000-4000-8000-000000000006', 'a0000000-0000-4000-8000-000000000001', current_date, 'live', 'cancelled', 'driver', '{"en": "cancelled"}', now() - interval '2 hours');
 insert into public.trip_instance_stop (operator_id, trip_instance_id, stop_sequence, stop_id) values
   ('a0000000-0000-4000-8000-000000000001', 'a7000000-0000-4000-8000-000000000001', 1, 'a2000000-0000-4000-8000-000000000002'),
   ('a0000000-0000-4000-8000-000000000001', 'a7000000-0000-4000-8000-000000000002', 1, 'a2000000-0000-4000-8000-000000000001'),
   ('a0000000-0000-4000-8000-000000000001', 'a7000000-0000-4000-8000-000000000003', 1, 'a2000000-0000-4000-8000-000000000001'),
   ('a0000000-0000-4000-8000-000000000001', 'a7000000-0000-4000-8000-000000000004', 1, 'a2000000-0000-4000-8000-000000000001'),
-  ('a0000000-0000-4000-8000-000000000001', 'a7000000-0000-4000-8000-000000000005', 1, 'a2000000-0000-4000-8000-000000000001');
+  ('a0000000-0000-4000-8000-000000000001', 'a7000000-0000-4000-8000-000000000005', 1, 'a2000000-0000-4000-8000-000000000001'),
+  ('a0000000-0000-4000-8000-000000000001', 'a7000000-0000-4000-8000-000000000006', 1, 'a2000000-0000-4000-8000-000000000001');
 insert into public.subscription (operator_id, device_id, trip_instance_id, stop_sequence)
 select 'a0000000-0000-4000-8000-000000000001', 'ab000000-0000-4000-8000-00000000000b', t::uuid, 1
 from unnest(array[
   'a7000000-0000-4000-8000-000000000001', 'a7000000-0000-4000-8000-000000000002',
   'a7000000-0000-4000-8000-000000000003', 'a7000000-0000-4000-8000-000000000004',
-  'a7000000-0000-4000-8000-000000000005'
+  'a7000000-0000-4000-8000-000000000005', 'a7000000-0000-4000-8000-000000000006'
 ]) as t;
 
 select is(
@@ -474,9 +534,8 @@ select is(
 select lives_ok($$ select private.purge_expired_data() $$, 'the daily retention job runs');
 select set_eq(
   $$ select trip_instance_id from public.subscription where device_id = 'ab000000-0000-4000-8000-00000000000b' $$,
-  array[(current_setting('test.r1')::jsonb ->> 'id')::uuid,
-        'a7000000-0000-4000-8000-000000000002', 'a7000000-0000-4000-8000-000000000005']::uuid[],
-  'subscriptions of trips completed over an hour ago, past visible_until or stale are purged; others stay'
+  array['a7000000-0000-4000-8000-000000000002', 'a7000000-0000-4000-8000-000000000005']::uuid[],
+  'subscriptions of trips completed or cancelled over an hour ago, past visible_until or stale are purged; others stay'
 );
 select isnt(
   (select released_at from private.followed_stop_log
