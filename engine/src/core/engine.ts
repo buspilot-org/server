@@ -20,7 +20,8 @@ import { errorMessage } from '../log.ts';
 import type { PersistResult, Store } from '../store/store.ts';
 import type { StartStreak } from './assigner.ts';
 import {
-  activeTrip, chooseStart, evaluateStart, liveStartCandidates, releasedProgress, scheduledInstance, startCandidates, takeoverDue, windowOpen,
+  activeTrip, chooseStart, evaluateStart, liveStartCandidates, ownScheduledDue, releasedProgress, scheduledInstance, startCandidates,
+  takeoverEligible, windowOpen,
 } from './assigner.ts';
 import type { Cache } from './cache.ts';
 import { alignStops, buildCache, progressFromRow } from './cache.ts';
@@ -386,22 +387,30 @@ export class Engine {
       trip = undefined;
     }
     // A live trip started too early (no first planned time, no stop reached)
-    // gives the vehicle back to a scheduled trip that is now due.
+    // gives the vehicle back to a due scheduled trip once the bus actually
+    // starts it (the same start detection as without a live trip).
     let released: TripRuntime | null = null;
-    if (
-      trip && !this.#releaseRefused.has(trip.instance.id)
-      && takeoverDue(trip, this.#trips.values(), vehicle, at, t, (x) => this.#refused.has(`${vehicle.id}:${x.instance.id}`))
-    ) {
-      writes.release = trip.instance.id;
-      updates.set(trip, { base: trip.progress, next: releasedProgress(trip.progress) });
-      logs.push(['live trip released for a scheduled trip', { tripInstanceId: trip.instance.id, vehicleId: vehicle.id }]);
-      released = trip;
-      trip = undefined;
+    let takeover: StartOption | undefined;
+    let takeoverStreaks: Map<string, StartStreak> | null = null;
+    if (trip && !this.#releaseRefused.has(trip.instance.id) && takeoverEligible(trip)) {
+      const own = ownScheduledDue(this.#trips.values(), vehicle, at, t, (x) => this.#refused.has(`${vehicle.id}:${x.instance.id}`));
+      if (own.length > 0) {
+        streaks = new Map();
+        takeover = this.#evaluateStarts(own, this.#streaks.get(vehicle.id), streaks, xy, at, p.speedKmh);
+        takeoverStreaks = streaks;
+      }
+      if (takeover) {
+        writes.release = trip.instance.id;
+        updates.set(trip, { base: trip.progress, next: releasedProgress(trip.progress) });
+        logs.push(['live trip released for a scheduled trip', { tripInstanceId: trip.instance.id, vehicleId: vehicle.id }]);
+        released = trip;
+        trip = undefined;
+      }
     }
     if (trip) {
       progress = { ...trip.progress };
     } else if (writes.trip === null) {
-      const started = this.#startTrip(vehicle, xy, at, p.speedKmh);
+      const started = this.#startTrip(vehicle, xy, at, p.speedKmh, takeover);
       streaks = started.streaks;
       if (started.trip) {
         trip = started.trip;
@@ -527,6 +536,9 @@ export class Engine {
       }
       const progress = released.progress;
       this.#notify((o) => { o.tripUpdated({ instance: released.instance, progress, etas: new Map(), fixAt: at }); });
+      // The scheduled start was not written: keep its streak, so it starts
+      // with the next position as it would have without the live trip.
+      if (takeoverStreaks !== null) streaks = takeoverStreaks;
     } else if (released && releaseApplied) {
       this.#released.set(released.instance.id, released.progress.startedAt);
       this.#trustRow.delete(released.instance.id);
@@ -573,7 +585,29 @@ export class Engine {
    * the route, moving); one with planned stops or neither starts at once
    * (staff planned it for this vehicle; its stops are only reached in order).
    */
-  #startTrip(vehicle: Vehicle, xy: XY, at: Date, speedKmh: number): {
+  /**
+   * Which of the candidates the bus starts with this position, if any.
+   * Records each candidate's start streak in `streaks`.
+   */
+  #evaluateStarts(
+    cands: readonly TripRuntime[], prevStreaks: ReadonlyMap<string, StartStreak> | undefined, streaks: Map<string, StartStreak>,
+    xy: XY, at: Date, speedKmh: number,
+  ): StartOption | undefined {
+    const options: StartOption[] = [];
+    for (const cand of cands) {
+      if (cand.instance.pattern === null) {
+        options.push({ trip: cand, startM: 0, streak: null });
+        continue;
+      }
+      const ev = evaluateStart(cand, prevStreaks?.get(cand.instance.id) ?? null, xy, at, speedKmh, this.#t);
+      if (ev.streak) streaks.set(cand.instance.id, ev.streak);
+      if (ev.startM !== null) options.push({ trip: cand, startM: ev.startM, streak: ev.streak });
+    }
+    // Live trips: the earliest due (candidates come sorted); scheduled: the best fit to the schedule.
+    return options[0]?.trip.instance.kind === 'live' ? options[0] : chooseStart(options, at);
+  }
+
+  #startTrip(vehicle: Vehicle, xy: XY, at: Date, speedKmh: number, takeover?: StartOption): {
     trip: TripRuntime | null; progress: TripProgress | null; streaks: Map<string, StartStreak>;
     stopEvents: StopEventWrite[]; logs: LogLine[];
   } {
@@ -581,22 +615,11 @@ export class Engine {
     const prevStreaks = this.#streaks.get(vehicle.id);
     const streaks = new Map<string, StartStreak>();
     const refused = (tr: TripRuntime): boolean => this.#refused.has(`${vehicle.id}:${tr.instance.id}`);
-    const evaluate = (cands: TripRuntime[]): { trip: TripRuntime; startM: number; streak: StartStreak | null } | undefined => {
-      const options: { trip: TripRuntime; startM: number; streak: StartStreak | null }[] = [];
-      for (const cand of cands) {
-        if (refused(cand)) continue;
-        if (cand.instance.pattern === null) {
-          options.push({ trip: cand, startM: 0, streak: null });
-          continue;
-        }
-        const ev = evaluateStart(cand, prevStreaks?.get(cand.instance.id) ?? null, xy, at, speedKmh, t);
-        if (ev.streak) streaks.set(cand.instance.id, ev.streak);
-        if (ev.startM !== null) options.push({ trip: cand, startM: ev.startM, streak: ev.streak });
-      }
-      // Live trips: the earliest due (candidates come sorted); scheduled: the best fit to the schedule.
-      return options[0]?.trip.instance.kind === 'live' ? options[0] : chooseStart(options, at);
-    };
-    const chosen = evaluate(liveStartCandidates(this.#trips.values(), vehicle, at, t, refused))
+    const evaluate = (cands: TripRuntime[]): StartOption | undefined =>
+      this.#evaluateStarts(cands.filter((c) => !refused(c)), prevStreaks, streaks, xy, at, speedKmh);
+    // A takeover starts the scheduled trip it detected (assigner.ts rule 5).
+    const chosen = takeover
+      ?? evaluate(liveStartCandidates(this.#trips.values(), vehicle, at, t, refused))
       ?? evaluate(startCandidates(this.#trips.values(), vehicle, at, t));
     if (!chosen) return { trip: null, progress: null, streaks, stopEvents: [], logs: [] };
     streaks.clear();
@@ -721,6 +744,12 @@ export class Engine {
 }
 
 type LogLine = [string, Record<string, string | number>];
+
+interface StartOption {
+  trip: TripRuntime;
+  startM: number;
+  streak: StartStreak | null;
+}
 
 interface FollowResult {
   progress: TripProgress;

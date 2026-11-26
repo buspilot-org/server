@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { serviceTime } from '../../src/core/time.ts';
 import type { XY } from '../../src/geo/plane.ts';
-import { ROUTE, Scenario, TZ, Track, VEHICLE, VEHICLE_2, subscription } from './harness.ts';
+import { ROUTE, Scenario, TZ, Track, VEHICLE, VEHICLE_2, subscription, type Fix } from './harness.ts';
 import { EXAMPLE_M, exampleRoute, exampleRun } from './routes.ts';
 
 const DATE = '2026-11-24';
@@ -39,6 +39,15 @@ const tourStops = [
 ];
 const liveSub = (id: string, seq: number, over = {}) =>
   subscription(id, seq, { patternId: null, tripInstanceId: 'L2', routeId: null, routeName: null, ...over });
+
+/** Feeds fixes one at a time until the live trip is no longer active in the engine; returns how many were fed. */
+async function feedUntilReleased(s: Scenario, fixes: readonly Fix[], liveId: string): Promise<number> {
+  for (let i = 0; i < fixes.length; i++) {
+    await s.feed(fixes.slice(i, i + 1));
+    if (s.engine.trips.get(liveId)?.progress.status !== 'active') return i + 1;
+  }
+  return fixes.length;
+}
 
 function tourRun(s: Scenario): Track {
   const t = new Track(s.shape, local('08:58'), { startXY: HOTEL, intervalS: 10 });
@@ -200,9 +209,16 @@ describe('precedence on one vehicle', () => {
     assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, 'L6');
     assert.deepEqual(s.sender.kinds(), ['approaching@1']);
 
-    // 07:15 the school run is due: it takes over at the next position.
+    // 07:15 the school run is due. While the bus stands at the depot, nothing
+    // changes: being due is not enough. It takes over when the bus pulls away
+    // on the route, detected as any scheduled start.
     const run = exampleRun(s, 'T1');
-    await s.feed(run.fixes.slice(0, 1));
+    const pullAway = run.fixes.findIndex((f) => f.speedKmh > 0);
+    await s.feed(run.fixes.slice(0, pullAway));
+    assert.equal(s.store.instance('L6').status, 'active', 'still the live trip while the bus stands at the depot');
+    assert.deepEqual(s.store.releases, []);
+    const fed = pullAway + await feedUntilReleased(s, run.fixes.slice(pullAway), 'L6');
+    assert.equal(s.store.instance('T1').status, 'active', 'the school run starts with the takeover');
     const l6 = s.store.instance('L6');
     assert.equal(l6.status, 'planned');
     assert.equal(l6.vehicleId, VEHICLE);
@@ -210,9 +226,9 @@ describe('precedence on one vehicle', () => {
     assert.equal(l6.startedAt, null);
     assert.ok(l6.stopEvents.every((e) => e.state === 'upcoming' && e.eta === null));
     assert.deepEqual(s.store.releases, ['L6']);
-    assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, null, 'vehicle_state no longer linked to the live trip');
+    assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, 'T1', 'vehicle_state linked to the school run');
 
-    await s.feed(run.fixes.slice(1));
+    await s.feed(run.fixes.slice(fed));
     assert.equal(s.store.instance('T1').status, 'completed');
     assert.deepEqual(s.transitions('T1'), ALL_SIX);
     // Once the school run has ended, the live trip starts again and is followed to the stadium.
@@ -238,14 +254,14 @@ describe('precedence on one vehicle', () => {
     await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
     const stale = structuredClone(s.store.rows);
     const run = exampleRun(s, 'T1');
-    await s.feed(run.fixes.slice(0, 1));
+    const fed = await feedUntilReleased(s, run.fixes, 'L7');
     assert.deepEqual(s.store.releases, ['L7']);
     const load = s.store.loadSnapshot.bind(s.store);
     s.store.loadSnapshot = () => Promise.resolve(structuredClone(stale));
     await s.reload();
     s.store.loadSnapshot = load;
     assert.equal(s.engine.trips.get('L7')?.progress.status, 'planned');
-    await s.feed(run.fixes.slice(1));
+    await s.feed(run.fixes.slice(fed));
     assert.deepEqual(s.transitions('T1'), ALL_SIX);
     assert.equal(s.store.instance('L7').status, 'active', 'started again after the school run');
   });
@@ -268,19 +284,26 @@ describe('precedence on one vehicle', () => {
     await s.reload();
     await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
     const run = exampleRun(s, 'T1');
-    // The write commits but its acknowledgement is lost.
+    // The write with the release commits but its acknowledgement is lost.
     const persist = s.store.persist.bind(s.store);
     s.store.persist = async (w) => {
+      const res = await persist(w);
+      if (w.release === null) return res;
       s.store.persist = persist;
-      await persist(w);
       throw new Error('connection lost after commit');
     };
-    await assert.rejects(s.feed(run.fixes.slice(0, 1)));
+    let fed = 0;
+    for (; fed < run.fixes.length && s.store.releases.length === 0; fed++) {
+      const fix = run.fixes.slice(fed, fed + 1);
+      if (s.store.persist === persist) await s.feed(fix);
+      else await s.feed(fix).catch(() => undefined);
+    }
+    assert.deepEqual(s.store.releases, ['L7']);
     assert.equal(s.store.instance('L7').status, 'planned');
     assert.equal(s.engine.trips.get('L7')?.progress.status, 'active', 'memory did not see it');
     await s.reload();
     assert.equal(s.engine.trips.get('L7')?.progress.status, 'planned');
-    await s.feed(run.fixes.slice(1));
+    await s.feed(run.fixes.slice(fed));
     assert.deepEqual(s.transitions('T1'), ALL_SIX);
   });
 
@@ -290,11 +313,29 @@ describe('precedence on one vehicle', () => {
     await s.reload();
     await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
     s.store.instance('L7').vehicleId = VEHICLE_2; // Not reloaded yet.
-    await s.feed(exampleRun(s, 'T1').fixes.slice(0, 1));
+    const run = exampleRun(s, 'T1');
+    const fed = await feedUntilReleased(s, run.fixes, 'L7');
     const p = s.engine.trips.get('L7')?.progress;
     assert.equal(p?.vehicleId, VEHICLE_2);
     assert.equal(p.startedAt, null);
     assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, null);
+    await s.feed(run.fixes.slice(fed));
+    assert.deepEqual(s.transitions('T1'), ALL_SIX, 'the school run starts at the next position');
+  });
+
+  it('a position-only live trip far from the route (an away game) is never taken over: the due scheduled trip stays planned', async () => {
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s.addLiveTrip({ id: 'L9', serviceDate: DATE, createdAt: local('06:00') });
+    await s.reload();
+    // 06:30 to 09:00: driving and standing 40 km away, through T1's window (07:15–08:16).
+    const away = new Track(s.shape, local('06:30'), { startXY: { x: 0, y: 40_000 }, intervalS: 30 });
+    away.goTo({ x: 20_000, y: 40_000 }, 50).dwell(30 * 60).goTo({ x: 0, y: 40_000 }, 50).dwell(60 * 60);
+    await s.feed(away.fixes);
+    assert.ok((away.fixes.at(-1)?.t ?? new Date(0)) > local('08:30'));
+    assert.deepEqual(s.store.releases, []);
+    assert.equal(s.store.instance('L9').status, 'active');
+    assert.equal(s.store.instance('T1').status, 'planned');
+    assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, 'L9');
   });
 
   it('a position-only live trip started early is taken over too; a timed one never', async () => {

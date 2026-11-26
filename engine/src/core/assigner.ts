@@ -19,12 +19,14 @@
  * 4. So while a live trip runs, no scheduled trip starts on its vehicle; a
  *    scheduled trip that was not started in its window stays planned.
  * 5. Except: a running live trip without a planned time at its first stop
- *    that has reached no stop yet is taken over when a scheduled trip of the
- *    vehicle becomes due (as in rule 3). It goes back to `planned` (its
- *    vehicle kept, no progress, no ETAs, no alerts) and starts again by
- *    rule 3 once no scheduled trip is due. Decided 2026-11-26: a trip saved
- *    hours ahead and started by an early position at the depot must not
- *    keep the morning run from starting.
+ *    that has reached no stop yet (position-only trips included) is taken
+ *    over when the bus actually starts a due scheduled trip of the vehicle
+ *    (as in rule 3), detected as any scheduled start is (evaluateStart: on
+ *    the first part of the route, moving in route direction). A window
+ *    alone is not enough: a bus far away on an away game is never taken
+ *    over. The live trip goes back to `planned` (its vehicle kept, no
+ *    progress, no ETAs, no alerts) and starts again by rule 3 once no
+ *    scheduled trip is due. Decided 2026-11-26.
  * Live trips are only followed with a vehicle (`trip_instance.vehicle_id`);
  * one saved for "any vehicle" waits until staff choose one.
  */
@@ -142,18 +144,14 @@ export function liveStartCandidates(
   return out.sort((a, b) => a.instance.startAt.getTime() - b.instance.startAt.getTime());
 }
 
-/** Rule 5: a due scheduled trip of the vehicle takes over this running live trip. */
-export function takeoverDue(
-  tr: TripRuntime,
-  trips: Iterable<TripRuntime>,
-  vehicle: Vehicle,
-  at: Date,
-  t: Thresholds,
-  refused: (tr: TripRuntime) => boolean = () => false,
-): boolean {
+/**
+ * Rule 5: this running live trip may be taken over (untimed, reached no
+ * stop). It is, once a due scheduled trip of the vehicle (ownScheduledDue)
+ * actually starts.
+ */
+export function takeoverEligible(tr: TripRuntime): boolean {
   if (tr.instance.kind !== 'live' || tr.instance.timedStart || tr.progress.status !== 'active') return false;
-  if (tr.progress.stops.some((s) => s.state !== 'upcoming' && s.state !== 'approaching')) return false;
-  return scheduledTripDue(trips, vehicle, at, t, refused);
+  return tr.progress.stops.every((s) => s.state === 'upcoming' || s.state === 'approaching');
 }
 
 /** The state a released live trip goes back to: planned, its vehicle kept, nothing else. */
@@ -190,10 +188,18 @@ export function scheduledTripDue(
   t: Thresholds,
   refused: (tr: TripRuntime) => boolean = () => false,
 ): boolean {
-  for (const tr of startCandidates(trips, vehicle, at, t)) {
-    if ((tr.progress.vehicleId ?? tr.scheduledVehicleId) === vehicle.id && !refused(tr)) return true;
-  }
-  return false;
+  return ownScheduledDue(trips, vehicle, at, t, refused).length > 0;
+}
+
+/** The due scheduled trips of this vehicle (as scheduledTripDue counts them). */
+export function ownScheduledDue(
+  trips: Iterable<TripRuntime>,
+  vehicle: Vehicle,
+  at: Date,
+  t: Thresholds,
+  refused: (tr: TripRuntime) => boolean = () => false,
+): TripRuntime[] {
+  return startCandidates(trips, vehicle, at, t).filter((tr) => (tr.progress.vehicleId ?? tr.scheduledVehicleId) === vehicle.id && !refused(tr));
 }
 
 /** A vehicle's streak of fixes towards starting one trip (kept per vehicle and trip, outside the trip's state). */
