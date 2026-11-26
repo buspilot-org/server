@@ -307,6 +307,48 @@ describe('precedence on one vehicle', () => {
     assert.deepEqual(s.transitions('T1'), ALL_SIX);
   });
 
+  it('a takeover write that failed: a stopped bus right after sends it again at once; the released trip is never followed meanwhile', async () => {
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s.addLiveTrip({ id: 'L6', serviceDate: DATE, createdAt: local('06:00'), stops: [{ sequence: 1, at: { x: 0, y: 10_000 } }, { sequence: 2, at: { x: 0, y: 12_000 } }] });
+    await s.reload();
+    await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
+    const run = exampleRun(s, 'T1');
+    const persist = s.store.persist.bind(s.store);
+    const lost = { done: false };
+    s.store.persist = async (w) => {
+      const res = await persist(w);
+      if (w.release !== null && !lost.done) {
+        lost.done = true;
+        throw new Error('connection lost after commit');
+      }
+      return res;
+    };
+    let fed = 0;
+    for (; fed < run.fixes.length && !lost.done; fed++) await s.feed(run.fixes.slice(fed, fed + 1)).catch(() => undefined);
+    assert.equal(s.store.instance('L6').status, 'planned');
+    // Right after, the bus stops (a red light): no start is detected, yet nothing of L6 is followed.
+    const last = run.fixes[fed - 1];
+    assert.ok(last);
+    await s.feed(new Track(s.shape, last.t, { startXY: last.xy, intervalS: 10 }).dwell(240).fixes);
+    const l6 = s.store.instance('L6');
+    assert.equal(l6.status, 'planned');
+    assert.ok(l6.stopEvents.every((e) => e.eta === null), 'no ETAs for the released trip');
+    assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, 'T1');
+    assert.equal(s.engine.trips.get('L6')?.progress.status, 'planned');
+    assert.equal(s.engine.trips.get('T1')?.progress.status, 'active');
+  });
+
+  it('the takeover starts the scheduled trip it detected, also when a timed live trip of the vehicle is due then', async () => {
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s.addLiveTrip({ id: 'L7', serviceDate: DATE, createdAt: local('06:00') });
+    s.addLiveTrip({ id: 'L8', serviceDate: DATE, stops: [{ sequence: 1, at: { x: 0, y: 10_000 }, plannedDeparture: local('07:40') }, { sequence: 2, at: { x: 0, y: 12_000 } }] });
+    await s.reload();
+    await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
+    await feedUntilReleased(s, exampleRun(s, 'T1').fixes, 'L7');
+    assert.equal(s.store.instance('T1').status, 'active');
+    assert.equal(s.store.instance('L8').status, 'planned');
+  });
+
   it('a release refused because staff moved the live trip to another vehicle: nothing of this run stays with it', async () => {
     const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
     s.addLiveTrip({ id: 'L7', serviceDate: DATE, createdAt: local('06:00') });

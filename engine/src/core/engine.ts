@@ -102,6 +102,14 @@ export class Engine {
    * the trip. The next reload takes their row as it is.
    */
   readonly #trustRow = new Set<string>();
+  /**
+   * A takeover whose write failed (it may have committed), by live trip: the
+   * following positions send the same release and start again at once
+   * (idempotent) instead of waiting for the start to be detected again, so
+   * the released trip is never followed meanwhile. Until a write succeeds or
+   * the next reload.
+   */
+  readonly #pendingTakeover = new Map<string, StartOption>();
   /** Terminal states taken from a refused release before any reload saw them: an older snapshot does not revive the trip. */
   readonly #endedSeen = new Map<string, TripStatus>();
   /** The last vehicle_state written per vehicle (throttling). */
@@ -238,6 +246,7 @@ export class Engine {
     }
     this.#refused.clear();
     this.#releaseRefused.clear();
+    this.#pendingTakeover.clear();
     this.#cache = cache;
     this.metrics.lastReloadAt = this.#clock.now().toISOString();
     this.#notify((o) => { o.tripsReloaded(this.#trips.values()); });
@@ -394,7 +403,10 @@ export class Engine {
     let takeoverStreaks: Map<string, StartStreak> | null = null;
     if (trip && !this.#releaseRefused.has(trip.instance.id) && takeoverEligible(trip)) {
       const own = ownScheduledDue(this.#trips.values(), vehicle, at, t, (x) => this.#refused.has(`${vehicle.id}:${x.instance.id}`));
-      if (own.length > 0) {
+      const pending = this.#pendingTakeover.get(trip.instance.id);
+      if (pending !== undefined && pending.trip.progress.status === 'planned') {
+        takeover = pending;
+      } else if (own.length > 0) {
         streaks = new Map();
         takeover = this.#evaluateStarts(own, this.#streaks.get(vehicle.id), streaks, xy, at, p.speedKmh);
         takeoverStreaks = streaks;
@@ -503,7 +515,10 @@ export class Engine {
         // The release may have committed with only the acknowledgement lost.
         // A retry of this position finds it released (idempotent); a reload
         // before any retry takes the row as it is.
-        if (writes.release !== null) this.#trustRow.add(writes.release);
+        if (writes.release !== null) {
+          this.#trustRow.add(writes.release);
+          if (takeover) this.#pendingTakeover.set(writes.release, takeover);
+        }
         throw err;
       }
     }
@@ -512,6 +527,7 @@ export class Engine {
     // The trip compared next time is the one the engine assigned (not what the
     // database linked), so a refused trip write does not force a write per fix.
     if (writes.vehicleState) this.#stateWritten.set(vehicle.id, { at, tripInstanceId: activeId, offRoute });
+    if (released !== null) this.#pendingTakeover.delete(released.instance.id);
     const releaseRefused = released !== null && !releaseApplied;
     if (releaseRefused && released) {
       // The database did not take the release, and nothing of a trip start
@@ -579,13 +595,6 @@ export class Engine {
   }
 
   /**
-   * Starts a trip for a vehicle without a running one (assigner.ts):
-   * a due live trip of the vehicle first, else a scheduled trip. A live
-   * trip on a pattern starts like a scheduled trip (on the first part of
-   * the route, moving); one with planned stops or neither starts at once
-   * (staff planned it for this vehicle; its stops are only reached in order).
-   */
-  /**
    * Which of the candidates the bus starts with this position, if any.
    * Records each candidate's start streak in `streaks`.
    */
@@ -607,6 +616,14 @@ export class Engine {
     return options[0]?.trip.instance.kind === 'live' ? options[0] : chooseStart(options, at);
   }
 
+  /**
+   * Starts a trip for a vehicle without a running one (assigner.ts):
+   * a due live trip of the vehicle first, else a scheduled trip. A live
+   * trip on a pattern starts like a scheduled trip (on the first part of
+   * the route, moving); one with planned stops or neither starts at once
+   * (staff planned it for this vehicle; its stops are only reached in order).
+   * A takeover starts the scheduled trip it detected.
+   */
   #startTrip(vehicle: Vehicle, xy: XY, at: Date, speedKmh: number, takeover?: StartOption): {
     trip: TripRuntime | null; progress: TripProgress | null; streaks: Map<string, StartStreak>;
     stopEvents: StopEventWrite[]; logs: LogLine[];
