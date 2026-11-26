@@ -83,6 +83,17 @@ describe('precedence', () => {
     const otherVehicle = trip('S3', {});
     otherVehicle.scheduledVehicleId = 'v2';
     assert.deepEqual(ids([untimed, otherVehicle], min(1)), ['L']);
+    // Staff assigned another vehicle's trip to v1 for the day: it counts for v1.
+    const assigned = trip('S4', {}, { vehicleId: 'v1' });
+    assigned.scheduledVehicleId = 'v2';
+    assert.deepEqual(ids([untimed, assigned], min(1)), []);
+    // Cancelled, or refused to this vehicle by the database: not due.
+    const cancelled = trip('S5', {}, { status: 'cancelled' });
+    cancelled.scheduledVehicleId = 'v1';
+    assert.deepEqual(ids([untimed, cancelled], min(1)), ['L']);
+    const refusedTrip = trip('S6', {});
+    refusedTrip.scheduledVehicleId = 'v1';
+    assert.deepEqual(liveStartCandidates([untimed, refusedTrip], vehicle, min(1), t, (x) => x === refusedTrip).map((x) => x.instance.id), ['L']);
   });
 
   it('several active trips on one vehicle (only through database changes): the live trip wins', () => {

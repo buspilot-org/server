@@ -10,11 +10,12 @@
  * 2. A vehicle without a running trip starts a due live trip of its own
  *    before any scheduled trip: staff planned it for this vehicle on purpose
  *    (an away game after the morning run).
- * 3. Except: a live trip without a planned time at its first stop yields to
- *    the vehicle's scheduled trips. It does not start while a scheduled trip
- *    of that vehicle is due (window open, not started), only once none is.
- *    (Decided 2026-11-26: such a trip saved hours ahead must not keep the
- *    vehicle's scheduled runs from starting.)
+ * 3. Except: a live trip without a planned time at its first stop (this
+ *    includes every live trip on a pattern) yields to the vehicle's
+ *    scheduled trips. It does not start while a scheduled trip of that
+ *    vehicle is due (window open, not started), only once none is (decided
+ *    2026-11-26). Once started in a gap it keeps the vehicle (rule 1),
+ *    also through later scheduled trips.
  * 4. So while a live trip runs, no scheduled trip starts on its vehicle; a
  *    scheduled trip that was not started in its window stays planned.
  * Live trips are only followed with a vehicle (`trip_instance.vehicle_id`);
@@ -111,7 +112,14 @@ export function startCandidates(trips: Iterable<TripRuntime>, vehicle: Vehicle, 
  * first planned time is left out while a scheduled trip of this vehicle is
  * due (rule 3).
  */
-export function liveStartCandidates(trips: Iterable<TripRuntime>, vehicle: Vehicle, at: Date, t: Thresholds): TripRuntime[] {
+export function liveStartCandidates(
+  trips: Iterable<TripRuntime>,
+  vehicle: Vehicle,
+  at: Date,
+  t: Thresholds,
+  /** Scheduled trips the database refused to this vehicle: not due for it. */
+  refused: (tr: TripRuntime) => boolean = () => false,
+): TripRuntime[] {
   const all = [...trips];
   const out: TripRuntime[] = [];
   let scheduledDue: boolean | null = null;
@@ -119,7 +127,7 @@ export function liveStartCandidates(trips: Iterable<TripRuntime>, vehicle: Vehic
     if (tr.instance.kind !== 'live' || tr.progress.status !== 'planned' || tr.progress.vehicleId !== vehicle.id) continue;
     if (tr.instance.operatorId !== vehicle.operatorId || !windowOpen(tr, at, t)) continue;
     if (!tr.instance.timedStart) {
-      scheduledDue ??= scheduledTripDue(all, vehicle, at, t);
+      scheduledDue ??= scheduledTripDue(all, vehicle, at, t, refused);
       if (scheduledDue) continue;
     }
     out.push(tr);
@@ -132,9 +140,15 @@ export function liveStartCandidates(trips: Iterable<TripRuntime>, vehicle: Vehic
  * default vehicle) is due: planned, window open. Trips any vehicle may run
  * do not count.
  */
-export function scheduledTripDue(trips: Iterable<TripRuntime>, vehicle: Vehicle, at: Date, t: Thresholds): boolean {
+export function scheduledTripDue(
+  trips: Iterable<TripRuntime>,
+  vehicle: Vehicle,
+  at: Date,
+  t: Thresholds,
+  refused: (tr: TripRuntime) => boolean = () => false,
+): boolean {
   for (const tr of startCandidates(trips, vehicle, at, t)) {
-    if ((tr.progress.vehicleId ?? tr.scheduledVehicleId) === vehicle.id) return true;
+    if ((tr.progress.vehicleId ?? tr.scheduledVehicleId) === vehicle.id && !refused(tr)) return true;
   }
   return false;
 }

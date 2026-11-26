@@ -502,7 +502,7 @@ export class Engine {
       // Live trips: the earliest due (candidates come sorted); scheduled: the best fit to the schedule.
       return options[0]?.trip.instance.kind === 'live' ? options[0] : chooseStart(options, at);
     };
-    const chosen = evaluate(liveStartCandidates(this.#trips.values(), vehicle, at, t))
+    const chosen = evaluate(liveStartCandidates(this.#trips.values(), vehicle, at, t, refused))
       ?? evaluate(startCandidates(this.#trips.values(), vehicle, at, t));
     if (!chosen) return { trip: null, progress: null, streaks, stopEvents: [], logs: [] };
     streaks.clear();
