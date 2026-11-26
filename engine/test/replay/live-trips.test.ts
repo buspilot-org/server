@@ -164,17 +164,92 @@ describe('precedence on one vehicle', () => {
     assert.ok(t1End && l2.startedAt && l2.startedAt > t1End);
   });
 
-  it('while a live trip runs, no scheduled trip starts on its vehicle', async () => {
+  it('a live trip that has reached a stop keeps its vehicle: no scheduled trip starts on it', async () => {
     const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
-    s.addLiveTrip({ id: 'L3', serviceDate: DATE }); // Positions only, until the end of the day.
+    // No planned times; its first stop is the depot.
+    s.addLiveTrip({ id: 'L3', serviceDate: DATE, stops: [{ sequence: 1, at: { x: 0, y: 0 } }, { sequence: 2, at: { x: 0, y: 5000 } }] });
     await s.reload();
-    // Started at 06:30, when no scheduled trip of the vehicle was due.
+    // Started at 06:30, when no scheduled trip of the vehicle was due, and arrived at the depot stop.
     await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
-    assert.equal(s.store.instance('L3').status, 'active');
+    assert.equal(s.state('L3', 1), 'arrived');
     await s.feed(exampleRun(s, 'T1').fixes);
     assert.equal(s.store.instance('L3').status, 'active');
     assert.equal(s.store.instance('T1').status, 'planned');
+    assert.deepEqual(s.store.releases, []);
     assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, 'L3');
+  });
+
+  it('06:00 saved, 06:30 depot fix, 07:30 school run: the school run takes over, the live trip starts again afterwards, no alert twice', async () => {
+    const STADIUM: XY = { x: 0, y: 10_000 };
+    // A rider follows the stadium (60 minutes before: the ETA from the depot is within that at once).
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]), {}, {
+      subscriptions: [liveSub('A', 1, { tripInstanceId: 'L6', triggerValue: 60 })],
+    });
+    const seen: string[] = [];
+    s.observers.push({
+      tripUpdated: (u) => { if (u.instance.id === 'L6' && seen.at(-1) !== u.progress.status) seen.push(u.progress.status); },
+      tripsReloaded: () => undefined,
+    });
+    await s.restart();
+    s.addLiveTrip({ id: 'L6', serviceDate: DATE, createdAt: local('06:00'), stops: [{ sequence: 1, at: STADIUM }, { sequence: 2, at: { x: 0, y: 12_000 } }] });
+    await s.reload();
+
+    // 06:30: the bus is switched on at the depot. No scheduled trip is due: the live trip starts.
+    await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(120).fixes);
+    assert.equal(s.store.instance('L6').status, 'active');
+    assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, 'L6');
+    assert.deepEqual(s.sender.kinds(), ['approaching@1']);
+
+    // 07:15 the school run is due: it takes over at the next position.
+    const run = exampleRun(s, 'T1');
+    await s.feed(run.fixes.slice(0, 1));
+    const l6 = s.store.instance('L6');
+    assert.equal(l6.status, 'planned');
+    assert.equal(l6.vehicleId, VEHICLE);
+    assert.equal(l6.progressM, 0);
+    assert.equal(l6.startedAt, null);
+    assert.ok(l6.stopEvents.every((e) => e.state === 'upcoming' && e.eta === null));
+    assert.deepEqual(s.store.releases, ['L6']);
+    assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, null, 'vehicle_state no longer linked to the live trip');
+
+    await s.feed(run.fixes.slice(1));
+    assert.equal(s.store.instance('T1').status, 'completed');
+    assert.deepEqual(s.transitions('T1'), ALL_SIX);
+    // Once the school run has ended, the live trip starts again and is followed to the stadium.
+    const restarted = s.store.instance('L6');
+    assert.equal(restarted.status, 'active');
+    const t1End = s.store.instance('T1').endedAt;
+    assert.ok(t1End && restarted.startedAt && restarted.startedAt > t1End);
+    await s.feed(new Track(s.shape, run.time, { startXY: { x: 4000, y: 300 }, intervalS: 10 }).goTo(STADIUM, 40).dwell(60).fixes);
+    assert.equal(s.state('L6', 1), 'arrived');
+    assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, 'L6');
+
+    // Alerts: the approaching alert of the early start is not sent again, and
+    // "at your stop" shares its key (exactly once per subscription, trip, stop, kind).
+    assert.deepEqual(s.sender.kinds(), ['approaching@1']);
+    assert.deepEqual(s.store.deliveries.map((d) => `${d.tripInstanceId}:${d.stopSequence}:${d.kind}`), ['L6:1:approaching']);
+    assert.deepEqual(seen, ['active', 'planned', 'active']);
+  });
+
+  it('a position-only live trip started early is taken over too; a timed one never', async () => {
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s.addLiveTrip({ id: 'L7', serviceDate: DATE, createdAt: local('06:00') });
+    await s.reload();
+    await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
+    assert.equal(s.store.instance('L7').status, 'active');
+    await s.feed(exampleRun(s, 'T1').fixes);
+    assert.deepEqual(s.transitions('T1'), ALL_SIX);
+    assert.deepEqual(s.store.releases, ['L7']);
+    assert.equal(s.store.instance('L7').status, 'active', 'started again after the school run');
+
+    const s2 = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s2.addLiveTrip({ id: 'L8', serviceDate: DATE, stops: [{ sequence: 1, at: { x: 0, y: 10_000 }, plannedDeparture: local('06:40') }, { sequence: 2, at: { x: 0, y: 12_000 } }] });
+    await s2.reload();
+    await s2.feed(new Track(s2.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
+    await s2.feed(exampleRun(s2, 'T1').fixes);
+    assert.deepEqual(s2.store.releases, []);
+    assert.equal(s2.store.instance('L8').status, 'active');
+    assert.equal(s2.store.instance('T1').status, 'planned');
   });
 
   it('a live trip of another vehicle, or without a vehicle, is not started by this one', async () => {

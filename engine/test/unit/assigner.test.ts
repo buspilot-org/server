@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { defaultThresholds } from '../../src/config.ts';
-import { activeTrip, liveStartCandidates, scheduleStart, startCandidates, tripWindow } from '../../src/core/assigner.ts';
+import { activeTrip, liveStartCandidates, releasedProgress, scheduleStart, startCandidates, takeoverDue, tripWindow } from '../../src/core/assigner.ts';
 import { progressFromRow } from '../../src/core/cache.ts';
 import type { TripInstance, TripProgress, TripRuntime, Vehicle } from '../../src/core/types.ts';
 import { Polyline } from '../../src/geo/plane.ts';
@@ -94,6 +94,31 @@ describe('precedence', () => {
     const refusedTrip = trip('S6', {});
     refusedTrip.scheduledVehicleId = 'v1';
     assert.deepEqual(liveStartCandidates([untimed, refusedTrip], vehicle, min(1), t, (x) => x === refusedTrip).map((x) => x.instance.id), ['L']);
+  });
+
+  it('takeover: a running untimed live trip that reached no stop yields to a due scheduled trip of its vehicle', () => {
+    const live = (over: Partial<TripInstance>, progress: Partial<TripProgress> = {}): TripRuntime =>
+      trip('L', { kind: 'live', tripId: null, timedStart: false, timedEnd: false, startAt: min(-60), endAt: min(24 * 60), ...over },
+        { status: 'active', vehicleId: 'v1', startedAt: min(-30), progressM: 300, ...progress });
+    const due = trip('S', {});
+    due.scheduledVehicleId = 'v1';
+    const L = live({});
+    assert.equal(takeoverDue(L, [L, due], vehicle, min(1), t), true);
+    assert.equal(takeoverDue(L, [L, due], vehicle, min(-20), t), false, 'S not due yet');
+    assert.equal(takeoverDue(L, [L, due], vehicle, min(1), t, (x) => x === due), false, 'S refused to this vehicle');
+    const reached = live({}, { stops: L.progress.stops.map((s, i) => (i === 0 ? { ...s, state: 'passed', passedAt: min(-5) } : s)) });
+    assert.equal(takeoverDue(reached, [reached, due], vehicle, min(1), t), false, 'reached a stop: rule 1');
+    const timed = live({ timedStart: true });
+    assert.equal(takeoverDue(timed, [timed, due], vehicle, min(1), t), false, 'timed: never');
+    const sched = trip('S2', {}, { status: 'active', vehicleId: 'v1' });
+    assert.equal(takeoverDue(sched, [sched, due], vehicle, min(1), t), false, 'only live trips');
+
+    const r = releasedProgress({ ...L.progress, stops: L.progress.stops.map((s) => ({ ...s, eta: min(10) })) });
+    assert.equal(r.status, 'planned');
+    assert.equal(r.vehicleId, 'v1');
+    assert.equal(r.progressM, 0);
+    assert.equal(r.startedAt, null);
+    assert.ok(r.stops.every((s) => s.eta === null && s.state === 'upcoming'));
   });
 
   it('several active trips on one vehicle (only through database changes): the live trip wins', () => {

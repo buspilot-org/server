@@ -181,6 +181,24 @@ export class PgStore implements Store, AlertStore, LiveStore {
   async persist(w: Writes): Promise<PersistResult> {
     return this.sql.begin(async (sql) => {
       const v = w.vehicleId;
+      // A live trip released for a scheduled trip (before the scheduled trip
+      // is claimed): planned again, without progress or ETAs, only while it
+      // runs on this vehicle and has reached no stop.
+      let releaseApplied = false;
+      if (w.release !== null) {
+        const released = await sql`
+          update public.trip_instance ti set
+            status = 'planned', progress_m = 0, progress_at = null, last_confirmed_stop_sequence = null,
+            off_route_since = null, started_at = null, ended_at = null
+           where ti.id = ${w.release} and ti.kind = 'live' and ti.status = 'active' and ti.vehicle_id = ${v}
+             and not exists (select 1 from public.stop_event se
+                              where se.trip_instance_id = ti.id and se.state not in ('upcoming', 'approaching'))
+          returning ti.id`;
+        releaseApplied = released.length > 0;
+        if (releaseApplied) {
+          await sql`update public.stop_event set eta = null where trip_instance_id = ${w.release} and eta is not null`;
+        }
+      }
       // Claim the trip for this vehicle first. The row lock makes a second
       // vehicle starting the same "any vehicle" trip wait for this
       // transaction, and then see that the trip is taken.
@@ -280,7 +298,8 @@ export class PgStore implements Store, AlertStore, LiveStore {
       // when it is first awaited, and Promise.all awaits in array order).
       const results = await Promise.all(queries);
       const tripRows = tripIndex >= 0 ? results[tripIndex] : undefined;
-      return { tripApplied: tripIndex < 0 || (Array.isArray(tripRows) && tripRows.length > 0) };
+      const tripApplied = tripIndex < 0 || (Array.isArray(tripRows) && tripRows.length > 0);
+      return w.release === null ? { tripApplied } : { tripApplied, releaseApplied };
     });
   }
 

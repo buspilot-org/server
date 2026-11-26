@@ -19,7 +19,9 @@ import type { Logger } from '../log.ts';
 import { errorMessage } from '../log.ts';
 import type { Store } from '../store/store.ts';
 import type { StartStreak } from './assigner.ts';
-import { activeTrip, chooseStart, evaluateStart, liveStartCandidates, scheduledInstance, startCandidates, windowOpen } from './assigner.ts';
+import {
+  activeTrip, chooseStart, evaluateStart, liveStartCandidates, releasedProgress, scheduledInstance, startCandidates, takeoverDue, windowOpen,
+} from './assigner.ts';
 import type { Cache } from './cache.ts';
 import { alignStops, buildCache, progressFromRow } from './cache.ts';
 import { computeEtas, expectedProgressAt } from './eta.ts';
@@ -252,7 +254,7 @@ export class Engine {
         const base = tr.progress;
         if (base.status !== 'active' || windowOpen(tr, now, this.#t)) return;
         const next = complete(base, now);
-        const res = await this.#store.persist({ vehicleId, vehicleState: null, trip: tripWrite(tr, next), stopEvents: [], etas: [] });
+        const res = await this.#store.persist({ vehicleId, release: null, vehicleState: null, trip: tripWrite(tr, next), stopEvents: [], etas: [] });
         if (!res.tripApplied) {
           // Not this vehicle's trip any more: take the database's state.
           tr.progress = { ...base, status: 'completed', endedAt: now };
@@ -330,7 +332,7 @@ export class Engine {
     const xy = operator.plane.toXY(p);
     const updates = new Map<TripRuntime, PendingUpdate>();
     let streaks: Map<string, StartStreak> | null = null;
-    const writes: Writes = { vehicleId: vehicle.id, vehicleState: null, trip: null, stopEvents: [], etas: [] };
+    const writes: Writes = { vehicleId: vehicle.id, release: null, vehicleState: null, trip: null, stopEvents: [], etas: [] };
     const logs: LogLine[] = [];
     let etas: ReadonlyMap<number, Date> = new Map();
 
@@ -343,6 +345,16 @@ export class Engine {
       writes.trip = tripWrite(trip, done);
       updates.set(trip, { base: trip.progress, next: done });
       logs.push(['trip completed', { tripInstanceId: trip.instance.id, reason: 'window_closed' }]);
+      trip = undefined;
+    }
+    // A live trip started too early (no first planned time, no stop reached)
+    // gives the vehicle back to a scheduled trip that is now due.
+    let released: TripRuntime | null = null;
+    if (trip && takeoverDue(trip, this.#trips.values(), vehicle, at, t, (x) => this.#refused.has(`${vehicle.id}:${x.instance.id}`))) {
+      writes.release = trip.instance.id;
+      updates.set(trip, { base: trip.progress, next: releasedProgress(trip.progress) });
+      logs.push(['live trip released for a scheduled trip', { tripInstanceId: trip.instance.id, vehicleId: vehicle.id }]);
+      released = trip;
       trip = undefined;
     }
     if (trip) {
@@ -428,9 +440,12 @@ export class Engine {
     };
 
     let tripApplied = true;
+    let releaseApplied = true;
     if (!isEmpty(writes)) {
       try {
-        tripApplied = (await this.#store.persist(writes)).tripApplied;
+        const res = await this.#store.persist(writes);
+        tripApplied = res.tripApplied;
+        releaseApplied = res.releaseApplied ?? writes.release !== null;
       } catch (err) {
         this.metrics.positionsFailed++;
         throw err;
@@ -442,6 +457,12 @@ export class Engine {
     // database linked), so a refused trip write does not force a write per fix.
     if (writes.vehicleState) this.#stateWritten.set(vehicle.id, { at, tripInstanceId: activeId, offRoute });
     for (const [tr, u] of updates) {
+      if (tr === released && !releaseApplied) {
+        // The database did not take the release (the trip reached a stop or
+        // ended meanwhile): memory keeps its state; the next reload aligns.
+        this.#log.warn('live trip release not applied', { tripInstanceId: tr.instance.id, vehicleId: vehicle.id });
+        continue;
+      }
       if (!tripApplied && writes.trip?.id === tr.instance.id) {
         // Another vehicle runs this trip (or it was cancelled): the database
         // did not take the change, so memory does not either. The next
@@ -452,10 +473,12 @@ export class Engine {
         continue;
       }
       this.#commit(tr, u);
-      // Alerts only from a state that was written and kept.
-      if (tr === trip && tr.progress === u.next) {
+      // Alerts only from a state that was written and kept. A released live
+      // trip is announced as planned (no alerts are due for it then).
+      if ((tr === trip || tr === released) && tr.progress === u.next) {
         const progress = tr.progress;
-        this.#notify((o) => { o.tripUpdated({ instance: tr.instance, progress, etas, fixAt: at }); });
+        const tripEtas = tr === released ? new Map<number, Date>() : etas;
+        this.#notify((o) => { o.tripUpdated({ instance: tr.instance, progress, etas: tripEtas, fixAt: at }); });
       }
     }
     if (streaks !== null) this.#streaks.set(vehicle.id, streaks);

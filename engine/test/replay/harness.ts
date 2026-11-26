@@ -63,6 +63,8 @@ export class MemoryStore implements Store, AlertStore {
   /** Fix times of all vehicle_state writes, in order. */
   vehicleStateWrites: Date[] = [];
   transitions: StopTransition[] = [];
+  /** Live trips released (put back to planned) by the engine, in order. */
+  releases: string[] = [];
   etaWrites = 0;
   persistCalls = 0;
   failNext = 0;
@@ -84,7 +86,18 @@ export class MemoryStore implements Store, AlertStore {
       return Promise.reject(new Error('simulated database failure'));
     }
     const v = w.vehicleId;
-    // Same order and guards as PgStore: claim, vehicle state, stop events, ETAs, trip.
+    // Same order and guards as PgStore: release, claim, vehicle state, stop events, ETAs, trip.
+    let releaseApplied = false;
+    if (w.release !== null) {
+      const row = this.instance(w.release);
+      if (row.kind === 'live' && row.status === 'active' && row.vehicleId === v
+        && row.stopEvents.every((e) => e.state === 'upcoming' || e.state === 'approaching')) {
+        Object.assign(row, { status: 'planned', progressM: 0, progressAt: null, lastConfirmedStopSequence: null, offRouteSince: null, startedAt: null, endedAt: null });
+        for (const e of row.stopEvents) e.eta = null;
+        releaseApplied = true;
+        this.releases.push(w.release);
+      }
+    }
     if (w.trip && w.trip.status !== 'planned') {
       const row = this.instance(w.trip.id);
       if (row.vehicleId === null && row.status === 'planned') row.vehicleId = v;
@@ -149,7 +162,7 @@ export class MemoryStore implements Store, AlertStore {
         row.endedAt ??= tr.endedAt;
       }
     }
-    return Promise.resolve({ tripApplied });
+    return Promise.resolve({ tripApplied, releaseApplied });
   }
 
   loadSubscriptions(): Promise<Subscription[]> {

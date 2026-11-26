@@ -104,6 +104,8 @@ export interface SnapshotRows {
 
 export interface PersistResult {
   tripApplied: boolean;
+  /** The release (if any) was applied: the live trip is planned again. */
+  releaseApplied?: boolean;
 }
 
 export interface Store {

@@ -256,6 +256,12 @@ export interface Writes {
    * apply to a trip instance this vehicle runs (or that no vehicle runs yet).
    */
   vehicleId: string;
+  /**
+   * A running live trip of this vehicle to put back to `planned` (a due
+   * scheduled trip takes over, assigner.ts rule 5): no progress, no ETAs.
+   * Applied first, only while it has reached no stop.
+   */
+  release: string | null;
   vehicleState: VehicleStateWrite | null;
   trip: TripWrite | null;
   stopEvents: StopEventWrite[];
@@ -263,5 +269,5 @@ export interface Writes {
 }
 
 export function isEmpty(w: Writes): boolean {
-  return w.vehicleState === null && w.trip === null && w.stopEvents.length === 0 && w.etas.length === 0;
+  return w.release === null && w.vehicleState === null && w.trip === null && w.stopEvents.length === 0 && w.etas.length === 0;
 }

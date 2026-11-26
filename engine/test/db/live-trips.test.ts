@@ -31,6 +31,8 @@ const START = new Date('2027-03-04T22:30:00Z'); // 07:30 JST on 03-05
 
 const L_PATTERN = 'b1170000-0000-4000-8000-000000000001';
 const L_TOUR = 'b1170000-0000-4000-8000-000000000002';
+const L_EARLY = 'b1170000-0000-4000-8000-000000000003';
+const L_REACHED = 'b1170000-0000-4000-8000-000000000004';
 const DEV = { member: 'b1170000-0000-4000-8000-0000000000d1', outsider: 'b1170000-0000-4000-8000-0000000000d2' } as const;
 const SUB = { member: 'b1170000-0000-4000-8000-0000000000e1', outsider: 'b1170000-0000-4000-8000-0000000000e2' } as const;
 
@@ -39,7 +41,7 @@ const sql = store.sql;
 let savedVehicleState: Record<string, unknown>[] = [];
 
 async function cleanup(): Promise<void> {
-  await sql`delete from public.trip_instance where id = any(${[L_PATTERN, L_TOUR]}::uuid[])`;
+  await sql`delete from public.trip_instance where id = any(${[L_PATTERN, L_TOUR, L_EARLY, L_REACHED]}::uuid[])`;
   await sql`delete from auth.users where id = any(${Object.values(DEV)}::uuid[])`;
 }
 
@@ -188,5 +190,31 @@ describe('live trips against the seeded database', () => {
     // The tour (no vehicle) was not started by Bus 1.
     const [tour] = await sql<{ status: string }[]>`select status::text as status from public.trip_instance where id = ${L_TOUR}`;
     assert.equal(tour?.status, 'planned');
+  });
+
+  it('releases a live trip started too early: planned again, no progress or ETAs; refused once it reached a stop', async () => {
+    const started = '2027-03-05T06:30:00+09:00';
+    await sql`
+      insert into public.trip_instance (id, operator_id, service_date, kind, started_by, title, vehicle_id, status, started_at, progress_m, progress_at)
+      values (${L_EARLY}, ${OPERATOR}, ${DATE}, 'live', 'driver', ${sql.json({ en: 'Early' })}, ${VEHICLE}, 'active', ${started}, 250, ${started}),
+             (${L_REACHED}, ${OPERATOR}, ${DATE}, 'live', 'driver', ${sql.json({ en: 'Reached' })}, ${VEHICLE}, 'active', ${started}, 250, ${started})`;
+    await sql`
+      insert into public.trip_instance_stop (operator_id, trip_instance_id, stop_sequence, stop_id) values
+        (${OPERATOR}, ${L_EARLY}, 1, ${stopIds[0] ?? ''}), (${OPERATOR}, ${L_REACHED}, 1, ${stopIds[0] ?? ''})`;
+    await sql`update public.stop_event set eta = ${started} where trip_instance_id = ${L_EARLY}`;
+    await sql`update public.stop_event set state = 'arrived', arrived_at = ${started} where trip_instance_id = ${L_REACHED}`;
+    const release = (id: string) => store.persist({ vehicleId: VEHICLE, release: id, vehicleState: null, trip: null, stopEvents: [], etas: [] });
+
+    assert.deepEqual(await release(L_EARLY), { tripApplied: true, releaseApplied: true });
+    const [early] = await sql<{ status: string; progress_m: number; started_at: Date | null; progress_at: Date | null; vehicle_id: string }[]>`
+      select status::text as status, progress_m, started_at, progress_at, vehicle_id from public.trip_instance where id = ${L_EARLY}`;
+    assert.deepEqual(early, { status: 'planned', progress_m: 0, started_at: null, progress_at: null, vehicle_id: VEHICLE });
+    const [ev] = await sql<{ state: string; eta: Date | null }[]>`select state::text as state, eta from public.stop_event where trip_instance_id = ${L_EARLY}`;
+    assert.deepEqual(ev, { state: 'upcoming', eta: null });
+    assert.equal((await release(L_EARLY)).releaseApplied, false, 'only a running trip');
+
+    assert.equal((await release(L_REACHED)).releaseApplied, false, 'not once it reached a stop');
+    const [reached] = await sql<{ status: string; progress_m: number }[]>`select status::text as status, progress_m from public.trip_instance where id = ${L_REACHED}`;
+    assert.deepEqual(reached, { status: 'active', progress_m: 250 });
   });
 });

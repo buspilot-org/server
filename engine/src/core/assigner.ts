@@ -18,6 +18,13 @@
  *    also through later scheduled trips.
  * 4. So while a live trip runs, no scheduled trip starts on its vehicle; a
  *    scheduled trip that was not started in its window stays planned.
+ * 5. Except: a running live trip without a planned time at its first stop
+ *    that has reached no stop yet is taken over when a scheduled trip of the
+ *    vehicle becomes due (as in rule 3). It goes back to `planned` (its
+ *    vehicle kept, no progress, no ETAs, no alerts) and starts again by
+ *    rule 3 once no scheduled trip is due. Decided 2026-11-26: a trip saved
+ *    hours ahead and started by an early position at the depot must not
+ *    keep the morning run from starting.
  * Live trips are only followed with a vehicle (`trip_instance.vehicle_id`);
  * one saved for "any vehicle" waits until staff choose one.
  */
@@ -26,7 +33,7 @@ import type { XY } from '../geo/plane.ts';
 import { distance } from '../geo/plane.ts';
 import { expectedProgressAt } from './eta.ts';
 import { addSeconds } from './time.ts';
-import type { TripInstance, TripRuntime, Vehicle } from './types.ts';
+import type { TripInstance, TripProgress, TripRuntime, Vehicle } from './types.ts';
 
 /**
  * When a trip may run: it starts only inside the window, and a running trip
@@ -133,6 +140,42 @@ export function liveStartCandidates(
     out.push(tr);
   }
   return out.sort((a, b) => a.instance.startAt.getTime() - b.instance.startAt.getTime());
+}
+
+/** Rule 5: a due scheduled trip of the vehicle takes over this running live trip. */
+export function takeoverDue(
+  tr: TripRuntime,
+  trips: Iterable<TripRuntime>,
+  vehicle: Vehicle,
+  at: Date,
+  t: Thresholds,
+  refused: (tr: TripRuntime) => boolean = () => false,
+): boolean {
+  if (tr.instance.kind !== 'live' || tr.instance.timedStart || tr.progress.status !== 'active') return false;
+  if (tr.progress.stops.some((s) => s.state !== 'upcoming' && s.state !== 'approaching')) return false;
+  return scheduledTripDue(trips, vehicle, at, t, refused);
+}
+
+/** The state a released live trip goes back to: planned, its vehicle kept, nothing else. */
+export function releasedProgress(p: TripProgress): TripProgress {
+  return {
+    ...p,
+    status: 'planned',
+    startedAt: null,
+    endedAt: null,
+    progressM: 0,
+    progressAt: null,
+    lastFixAt: null,
+    lastFixXY: null,
+    lastConfirmedStopSequence: null,
+    awaySince: null,
+    offRouteSince: null,
+    pendingJump: null,
+    reachedFinalStop: false,
+    finalLeaveCount: 0,
+    stops: p.stops.map((s) => (s.eta === null ? s : { ...s, eta: null })),
+    itinerary: p.itinerary === null ? null : { touchedSeq: null, touchedAt: null, dwell: null },
+  };
 }
 
 /**
