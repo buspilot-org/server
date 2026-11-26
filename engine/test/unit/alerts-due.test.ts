@@ -23,7 +23,7 @@ function stops(states: Partial<Record<number, StopState>>, extra: Partial<StopPr
 function input(over: Partial<DueInput> = {}): DueInput {
   return {
     sub: subscription('A', 40),
-    pattern,
+    sequences: pattern.stops.map((p) => p.sequence),
     tripStatus: 'active',
     stops: stops({}),
     etas: new Map([[40, new Date(NOW.getTime() + 300_000)]]),

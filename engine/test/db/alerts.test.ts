@@ -96,7 +96,7 @@ describe('alerts against the seeded database', () => {
     assert.equal(s.timezone, 'Asia/Tokyo');
     assert.equal(s.routeId, ROUTE);
     assert.equal(s.routeShortName, 'A');
-    assert.equal(s.routeName.ja, '朝便A');
+    assert.equal(s.routeName?.ja, '朝便A');
     assert.equal(s.stopName.en, 'Motomachi');
     assert.equal(subs.find((x) => x.id === SUB.memberLoop)?.stopName.en, 'Kitano-zaka', 'the second visit of the loop');
 
@@ -128,7 +128,7 @@ describe('alerts against the seeded database', () => {
     const cache = buildCache(await store.loadSnapshot(NOW));
     const entry = cache.instances.get(tripInstanceId);
     assert.ok(entry, 'trip instance in the cache');
-    const progress = { ...progressFromRow(entry.row, entry.instance.pattern), status: 'active' as const };
+    const progress = { ...progressFromRow(entry.row, entry.instance), status: 'active' as const };
     const update: TripUpdate = { instance: entry.instance, progress, etas: new Map([[4, new Date(NOW.getTime() + 240_000)]]), fixAt: NOW };
     const engines = [store, store2].map((st) => {
       const sender = new FakeSender(clock);

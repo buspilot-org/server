@@ -149,7 +149,7 @@ describe('FCM error classification', () => {
 describe('push messages', () => {
   const now = new Date('2026-11-24T07:35:00+09:00');
   const base = {
-    sub: subscription('A', 4, { routeShortName: 'A' }), tripInstanceId: 'T1', serviceDate: '2026-11-24',
+    sub: subscription('A', 4, { routeShortName: 'A' }), tripInstanceId: 'T1', serviceDate: '2026-11-24', tripKind: 'scheduled' as const, tripTitle: null,
     tripStart: new Date('2026-11-24T07:30:00+09:00'), eta: new Date(now.getTime() + 290_000), delayS: null, deliveryId: 'd1', now, ttlS: 1800,
   };
 

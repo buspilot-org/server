@@ -76,6 +76,23 @@ export interface Thresholds {
   /** …for this many consecutive fixes (GPS multipath while parked). */
   finalLeaveFixes: number;
 
+  /** Live trip along planned stops (no shape): near a stop within this distance (m). */
+  itineraryArrivedRadiusM: number;
+  /** …left the stop the bus was at: farther than this (m)… */
+  itineraryLeaveM: number;
+  /** …for this many consecutive fixes. */
+  itineraryLeaveFixes: number;
+  /** A stop at most this many places after the next open stop can be arrived at by skipping the ones between… */
+  itinerarySkipStops: number;
+  /** …once the bus has stood near it this long (s)… */
+  itinerarySkipDwellS: number;
+  /** …and not earlier than this before its planned time (s). */
+  itinerarySkipEarlyS: number;
+  /** ETA without planned times: straight-line distance × this factor (roads are not straight)… */
+  itineraryDetourFactor: number;
+  /** …at this speed (km/h). */
+  itinerarySpeedKmh: number;
+
   /** No position for longer than this during a trip → stale (s). */
   staleAfterS: number;
   /**
@@ -121,6 +138,14 @@ export const defaultThresholds: Thresholds = {
   passedMarginM: 50,
   finalLeaveM: 50,
   finalLeaveFixes: 2,
+  itineraryArrivedRadiusM: 75,
+  itineraryLeaveM: 150,
+  itineraryLeaveFixes: 3,
+  itinerarySkipStops: 2,
+  itinerarySkipDwellS: 180,
+  itinerarySkipEarlyS: 3600,
+  itineraryDetourFactor: 1.3,
+  itinerarySpeedKmh: 30,
   staleAfterS: 120,
   vehicleStateIntervalS: 30,
   etaMaxSpeedKmh: 60,

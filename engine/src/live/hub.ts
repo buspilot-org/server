@@ -222,7 +222,7 @@ export class LiveHub implements TripObserver {
   // --- TripObserver (from the engine) -----------------------------------
 
   tripUpdated(u: TripUpdate): void {
-    this.#emit({ all: false, routeIds: [u.instance.pattern.routeId], tripIds: [u.instance.id] });
+    this.#emit({ all: false, routeIds: u.instance.routeId === null ? [] : [u.instance.routeId], tripIds: [u.instance.id] });
   }
 
   tripsReloaded(): void {
@@ -238,7 +238,7 @@ export class LiveHub implements TripObserver {
     if (tripIds.length === 0) return;
     const routeIds = new Set<string>();
     for (const id of tripIds) {
-      const routeId = this.#trips().get(id)?.instance.pattern.routeId ?? this.#dir?.instances.get(id)?.routeId;
+      const routeId = this.#trips().get(id)?.instance.routeId ?? this.#dir?.instances.get(id)?.routeId;
       if (routeId) routeIds.add(routeId);
     }
     this.#emit({ all: false, routeIds: [...routeIds], tripIds: [...new Set(tripIds)] });

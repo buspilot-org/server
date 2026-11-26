@@ -8,7 +8,7 @@ import type { AlertStore, DeliveryClaim, PushMessage, PushSender, SendResult, Su
 import { defaultThresholds, type Thresholds } from '../../src/config.ts';
 import { Engine, type Clock, type PositionOutcome } from '../../src/core/engine.ts';
 import { serviceTime } from '../../src/core/time.ts';
-import type { StopState, TripStatus, Writes } from '../../src/core/types.ts';
+import type { I18nText, StopState, TripStatus, Writes } from '../../src/core/types.ts';
 import { stopStateRank } from '../../src/core/types.ts';
 import { LocalPlane, Polyline, distance, type XY } from '../../src/geo/plane.ts';
 import { silentLogger } from '../../src/log.ts';
@@ -103,8 +103,14 @@ export class MemoryStore implements Store, AlertStore {
     for (const e of w.stopEvents) {
       if (!runs(e.tripInstanceId)) continue;
       const row = this.instance(e.tripInstanceId);
-      const ev = row.stopEvents.find((x) => x.sequence === e.sequence);
-      if (!ev) throw new Error(`missing stop event ${e.sequence}`);
+      let ev = row.stopEvents.find((x) => x.sequence === e.sequence);
+      if (!ev) {
+        // PgStore inserts a missing stop event (a live trip on a pattern gets them when it starts).
+        ev = { sequence: e.sequence, state: 'upcoming', arrivedAt: null, departedAt: null, passedAt: null, eta: null };
+        row.stopEvents.push(ev);
+        row.stopEvents.sort((a, b) => a.sequence - b.sequence);
+        if (e.state === 'upcoming') continue;
+      }
       if (stopStateRank[ev.state] >= stopStateRank[e.state] || ev.state === 'departed' || ev.state === 'passed') continue;
       if (e.state === 'passed' && ev.arrivedAt !== null) continue;
       if (e.state === 'departed' && (ev.arrivedAt ?? e.arrivedAt) === null) continue;
@@ -228,6 +234,22 @@ export interface RouteDef {
   trips: TripDef[];
 }
 
+/** A live trip as staff save it (save_live_trip): on the test pattern, with planned stops, or neither. */
+export interface LiveTripDef {
+  id: string;
+  serviceDate: string;
+  /** Default: VEHICLE. */
+  vehicleId?: string | null;
+  /** On the test pattern (no planned stops then). */
+  onPattern?: boolean;
+  stops?: { sequence: number; at: XY; plannedArrival?: Date | null; plannedDeparture?: Date | null }[];
+  title?: I18nText;
+  visibleUntil?: Date | null;
+  /** When it was saved. Default: the start of the Unix epoch (long before). */
+  createdAt?: Date;
+  routeId?: string | null;
+}
+
 export function hhmm(s: string): number {
   const [h, m] = s.split(':').map(Number);
   return (h ?? 0) * 3600 + (m ?? 0) * 60;
@@ -257,7 +279,7 @@ export class FakeSender implements PushSender {
 /** A subscription for the test route, with defaults. */
 export function subscription(id: string, stopSequence: number, opts: Partial<Subscription> = {}): Subscription {
   return {
-    id, operatorId: OPERATOR, deviceId: `device-of-${id}`, patternId: PATTERN, stopSequence,
+    id, operatorId: OPERATOR, deviceId: `device-of-${id}`, patternId: PATTERN, tripInstanceId: null, stopSequence,
     trigger: 'minutes', triggerValue: 5, notifyPassed: false, mutedUntil: null, createdAt: new Date(0),
     pushToken: `fid-${id}`, language: 'en', timezone: TZ, routeId: ROUTE, routeName: { ja: '朝便A', en: 'Morning route A' },
     routeShortName: null, stopId: `stop-${stopSequence}`, stopName: { ja: `停留所${stopSequence}`, en: `Stop ${stopSequence}` },
@@ -309,7 +331,8 @@ export class Scenario {
         };
       }),
       instances: def.trips.map((t) => ({
-        id: t.id, operatorId: OPERATOR, serviceDate: t.serviceDate, tripId: `trip-${t.id}`, patternId: PATTERN,
+        id: t.id, operatorId: OPERATOR, serviceDate: t.serviceDate, kind: 'scheduled' as const, tripId: `trip-${t.id}`, patternId: PATTERN,
+        routeId: ROUTE, title: null, visibleUntil: null, createdAt: new Date(0), plannedStops: [],
         startTimeS: hhmm(t.start), vehicleId: null, defaultVehicleId: t.vehicleId === undefined ? VEHICLE : t.vehicleId,
         status: 'planned', startedBy: 'schedule', progressM: 0, progressAt: null, lastConfirmedStopSequence: null,
         offRouteSince: null, startedAt: null, endedAt: null,
@@ -363,6 +386,26 @@ export class Scenario {
   async reload(): Promise<void> {
     await this.engine.reload();
     await this.alerts.idle();
+  }
+
+  /**
+   * Adds a live trip to the database (as save_live_trip does: planned, with
+   * an `upcoming` stop event per planned stop). Call reload() afterwards.
+   */
+  addLiveTrip(def: LiveTripDef): void {
+    const stops = def.stops ?? [];
+    this.store.rows.instances.push({
+      id: def.id, operatorId: OPERATOR, serviceDate: def.serviceDate, kind: 'live', tripId: null,
+      patternId: def.onPattern ? PATTERN : null, routeId: def.onPattern ? ROUTE : (def.routeId ?? null), startTimeS: null,
+      vehicleId: def.vehicleId === undefined ? VEHICLE : def.vehicleId, defaultVehicleId: null, status: 'planned', startedBy: 'driver',
+      progressM: 0, progressAt: null, lastConfirmedStopSequence: null, offRouteSince: null, startedAt: null, endedAt: null,
+      stopEvents: stops.map((p) => ({ sequence: p.sequence, state: 'upcoming', arrivedAt: null, departedAt: null, passedAt: null, eta: null })),
+      title: def.title ?? { ja: 'アウェー戦', en: 'Away game' }, visibleUntil: def.visibleUntil ?? null, createdAt: def.createdAt ?? new Date(0),
+      plannedStops: stops.map((p) => {
+        const ll = this.plane.toLonLat(p.at);
+        return { sequence: p.sequence, lon: ll.lon, lat: ll.lat, plannedArrival: p.plannedArrival ?? null, plannedDeparture: p.plannedDeparture ?? null };
+      }),
+    });
   }
 
   tripStart(tripId: string): Date {

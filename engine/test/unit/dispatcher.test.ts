@@ -26,7 +26,7 @@ async function setup() {
   });
   await d.reloadSubscriptions();
   const update = (state: StopState, eta: Date | null): TripUpdate => {
-    const progress = { ...progressFromRow(entry.row, entry.instance.pattern), status: 'active' as const };
+    const progress = { ...progressFromRow(entry.row, entry.instance), status: 'active' as const };
     progress.stops = progress.stops.map((x) => (x.sequence === 4 ? { ...x, state } : x));
     return { instance: entry.instance, progress, etas: eta ? new Map([[4, eta]]) : new Map(), fixAt: clock.now() };
   };

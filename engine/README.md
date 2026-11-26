@@ -76,7 +76,7 @@ The secret is part of the URL path: make sure a reverse proxy, tunnel or load ba
 
 1. **Accept or drop**: unknown device → `202`, counted, nothing else. Positions of one vehicle are processed one at a time, in order.
 2. **Deduplicate**: same Traccar position ID, or a fix time not newer than the last one (also after a restart: `vehicle_state.recorded_at` or the active trip's `progress_at`, whichever is newer). Invalid fixes and fixes far in the future are dropped.
-3. **Trip assigner**: the vehicle's active trip instance, or a planned one whose window is open (scheduled start − 15 min … scheduled end + 30 min) for this vehicle: `trip_instance.vehicle_id` if staff set one for the day, else the trip's default `trip.vehicle_id`, else any vehicle of the operator. A trip starts when the bus moves in route direction on the first kilometre of the route (two fixes, at least 30 m, currently moving). A bus parked at the first stop does not start a trip (holidays); once it pulls away, the first stop counts as arrived (at the time the bus was first seen standing there inside the trip window). If several trips could start, the one whose schedule fits the position best wins. **No trip → no stop events.** A cancellation, a driver start or a vehicle change made in the database is picked up at the next cache reload.
+3. **Trip assigner**: the vehicle's active trip instance, or a planned one whose window is open (scheduled start − 15 min … scheduled end + 30 min) for this vehicle: `trip_instance.vehicle_id` if staff set one for the day, else the trip's default `trip.vehicle_id`, else any vehicle of the operator. A trip starts when the bus moves in route direction on the first kilometre of the route (two fixes, at least 30 m, currently moving). A bus parked at the first stop does not start a trip (holidays); once it pulls away, the first stop counts as arrived (at the time the bus was first seen standing there inside the trip window). If several trips could start, the one whose schedule fits the position best wins. **No trip → no stop events.** A cancellation, a driver start or a vehicle change made in the database is picked up at the next cache reload. Live trips go first and follow their own rules ([Live trips](#live-trips)).
 4. **Route matcher**: shapes are projected once to metres (a local plane per operator; distances scaled to the PostGIS geodesic length). Each fix is matched only inside a window from progress − 30 m to + 1.5 km (more after a gap); progress only increases. Where the route passes the same place twice:
    - passes are told apart geometrically: two points of the route belong to the same pass only if the route between them is no longer than the way through the fix (plus 10 m), so the two sides of a tight turn are two passes;
    - above 10 km/h the GPS course must fit the direction of the route;
@@ -94,25 +94,56 @@ The secret is part of the URL path: make sure a reverse proxy, tunnel or load ba
 8. **Alerts** (below) are evaluated on the written state, in the background: they never delay or fail a position.
 9. **Live API** (below): the state just written and the position are published to open streams.
 
-On start (and every few minutes) the engine loads vehicles, shapes, patterns and the planned/active trip instances around today. A restarted engine continues active trips from the database.
+On start (and every few minutes) the engine loads vehicles, shapes, patterns and the scheduled and live trip instances around today. A restarted engine continues active trips from the database.
+
+## Live trips
+
+One-off trips that staff or a driver save with `save_live_trip()` (`trip_instance.kind = 'live'`): an away game, a tour. Code: `src/core/assigner.ts` (window, precedence), `src/core/itinerary.ts` (planned stops), `src/core/engine.ts`.
+
+**How a live trip is followed** depends on what it has:
+
+| The live trip has | Followed by | Stop events | Alerts |
+|---|---|---|---|
+| a pattern (`pattern_id`) | the shape, as a scheduled trip: route matcher, stop state machine, ETA v1 (steps 4–6 above) | created by the engine when the trip starts (one per pattern stop) | subscribers of the pattern's stops |
+| planned stops (`trip_instance_stop`), no pattern | the planned stops in order (below) | created with the planned stops (database trigger) | subscribers of its planned stops (`subscription.trip_instance_id`) |
+| neither | position only (live map, `vehicle_state` linked to the trip) | none | none |
+
+**Which vehicle, when, and precedence over scheduled trips.**
+
+- A live trip is followed only with a vehicle (`trip_instance.vehicle_id`). One saved for "any vehicle" waits until staff choose one.
+- Window: with planned times, from the first planned time − 15 min to the last planned time + 30 min. Without: from when it was saved (not before its service day) to the end of its service day + 30 min; a live trip on a pattern, once started, until its start + the pattern's running time + 30 min. Never after `visible_until`: riders no longer see the trip then, so the engine completes it and sends nothing more.
+- Start: a live trip on a pattern starts like a scheduled trip (moving in route direction on the first kilometre). One with planned stops or neither starts with the first position in its window (staff planned it for this vehicle; its stops can only be reached in order anyway). The engine sets `status = 'active'`; `started_by` stays `driver`.
+- Precedence on one vehicle: (1) a running trip keeps its vehicle until it ends (last stop, window closed, cancelled or completed by staff), whatever its kind: nothing pre-empts it; (2) a vehicle without a running trip starts a due live trip before any scheduled trip; (3) so while a live trip runs, no scheduled trip starts on its vehicle, and a scheduled trip that was not started in its window stays `planned`.
+- Staff can edit the planned stops while the trip runs: at the next cache reload, stops already reached keep their state, new ones are followed, removed ones are dropped (the database refuses removing a stop the bus has reached).
+- Cancelled by staff: as for scheduled trips (taken over at the next reload, `cancelled` alerts below).
+
+**Planned stops without a shape: order, not circles.** The trial app's 500 m geofence circles fired false and double alerts on loops, because the bus entered the circle of a later stop first. Here:
+
+- Only the **next open stop** (the first one not yet departed or passed) can be arrived at by being near it: within 75 m (`itineraryArrivedRadiusM`) and below 5 km/h. Being near any other stop does nothing, except for the skip rule. On a tour that starts and ends at the hotel, the hotel at the end is not arrived at in the morning.
+- **Touched in order**: coming near the next open stop, then the one after it, and so on, "touches" those stops in plan order, also without stopping. Arriving at a touched stop closes all open stops before it: `departed` if the bus had arrived there, else `passed` (it drove past without stopping). So `passed` is only known once the bus arrives at a later stop.
+- **Skip**: a stop up to 2 places after the next open stop (`itinerarySkipStops`) that was not touched in order is arrived at only after the bus has stood near it for 3 min (`itinerarySkipDwellS`, arrived since it started standing there), and not earlier than 1 h before its planned time (`itinerarySkipEarlyS`). A red light next to a later stop, or a return to the hotel hours before the planned return, does not skip the plan.
+- **Departed only by leaving**: farther than 150 m (`itineraryLeaveM`) from the stop for 3 fixes in a row (`itineraryLeaveFixes`), or arriving at a later stop. Never by time: a long planned stay (10:30–12:00) stays `arrived` however long the bus stands there, with GPS jitter, and later stops are neither passed nor departed early. (If the bus drops the group and parks elsewhere, the stop is departed when it leaves; plan the pick-up as its own stop.)
+- **Progress** (`progress_m`): straight-line distance along the planned stops: up to the last stop reached, plus the position projected onto the leg to the next open stop. Only grows. Such a trip is never off route.
+- **ETA**: from the bus now, or while it stands at a stop, from that stop at its planned departure (not before now; a long planned stay is not a delay). Travel to each stop: the planned time between the two stops (planned arrival − the previous stop's planned departure), for the first leg in proportion to the straight-line distance still to go; without planned times, straight-line distance × 1.3 at 30 km/h (`itineraryDetourFactor`, `itinerarySpeedKmh`). Never sooner than the straight-line distance at 60 km/h. The bus leaves each later stop at its planned departure, or at once without one.
+- The last stop is departed by leaving it like the others; then the trip is completed. Otherwise the window closes it.
 
 ## Arrival alerts
 
 Rules from arrival-alerts.md ("Decisions (2026-11-26)"); code in `src/alerts/`.
 
-**Who.** A subscription (`device`, `pattern_id`, `stop_sequence`, trigger) applies to every scheduled trip of its pattern. The engine loads only subscriptions whose device has a push target and may see the route, as `private.route_access` decides for riders: the route is active, and it is public or the device has a membership (not revoked) in an audience that includes the route. Reloaded every `SUBSCRIPTION_RELOAD_SECONDS`, so a new subscription, a revoked membership or a new push token counts within a minute. `muted_until` in the future: nothing is sent (and nothing is used up: an alert still due after the mute ends is sent then).
+**Who.** A subscription (`device`, `pattern_id`, `stop_sequence`, trigger) applies to every trip of its pattern, live trips on the pattern included. A subscription to a live trip (`device`, `trip_instance_id`, `stop_sequence`) applies to that planned stop of that one trip. The engine loads only subscriptions whose device has a push target and may see the route, as `private.route_access` decides for riders: the route is active, and it is public or the device has a membership (not revoked) in an audience that includes the route; for a live trip, its route as above or a membership in one of the trip's audiences (`private.device_can_see_trip_instance`). Live trips: nothing once `visible_until` has passed. Reloaded every `SUBSCRIPTION_RELOAD_SECONDS`, so a new subscription, a revoked membership or a new push token counts within a minute. `muted_until` in the future: nothing is sent (and nothing is used up: an alert still due after the mute ends is sent then).
 
-**When.** After every processed position, for each subscription of the trip's pattern, on the state just written (`src/alerts/due.ts`), at most one alert per subscription and position:
+**When.** After every processed position, for each subscription of the trip (its pattern's and its own), on the state just written (`src/alerts/due.ts`), at most one alert per subscription and position:
 
 | Subscribed stop | Alert |
 |---|---|
 | `upcoming`, "N minutes before": ETA − now ≤ N minutes (inclusive) | **approaching** |
-| `upcoming`, "N stops before": the stop N places earlier in the pattern is departed or passed (fewer than N stops before it: the first stop; assumption, the open point in arrival-alerts.md) | **approaching** |
-| `upcoming`, not yet approaching, ETA ≥ scheduled arrival + `ALERT_DELAY_MINUTES` | **delayed** (once per trip and subscription) |
+| `upcoming`, "N stops before": the stop N places earlier in the trip (pattern or planned stops) is departed or passed (fewer than N stops before it: the first stop; assumption, the open point in arrival-alerts.md) | **approaching** |
+| `upcoming`, not yet approaching, ETA ≥ scheduled arrival + `ALERT_DELAY_MINUTES` (live trips: the planned arrival; none on a pattern, which has no times of its own) | **delayed** (once per trip and subscription) |
 | `arrived` (the approaching alert was missed: data gap, late subscription) | **arrived** "the bus is at your stop", stored with kind `approaching`, so it goes out only if no approaching alert did |
 | `passed`, `notify_passed` on, passed less than 10 min ago and after the subscription was made | **passed** |
 | `departed`, or `passed` without `notify_passed` | nothing, ever |
-| any, trip instance cancelled by staff (seen at the next cache reload, every `CACHE_RELOAD_SECONDS`), trip starting within 24 h, stop not yet served (a trip that never started: scheduled in the future) | **cancelled** |
+| any, trip instance cancelled by staff (seen at the next cache reload, every `CACHE_RELOAD_SECONDS`), trip starting within 24 h, stop not yet served (a trip that never started: scheduled or planned in the future; a live trip without planned times: until the end of its day) | **cancelled** |
 
 - **Passed is checked before triggers**: the stop states are final before triggers are looked at, so stops passed in one update (after a GPS gap or a confirmed jump) never get an approaching alert.
 - **Held** while the position is stale (fix older than 2 min when processed) or the bus is off route: nothing is due. The next fresh position on the route evaluates again, so a held alert goes out if it is still due, or becomes *arrived* / *passed* / nothing by the rules above.
@@ -149,7 +180,7 @@ One FCM HTTP v1 message per alert, addressed with `message.fid` (`FCM_TARGET=tok
       "v": "1", "type": "stop_alert", "kind": "approaching",
       "alert_id": "<alert_delivery.id>", "subscription_id": "…",
       "operator_id": "…", "route_id": "…", "pattern_id": "…", "stop_id": "…", "stop_sequence": "4",
-      "trip_instance_id": "…", "service_date": "2026-11-24", "trip_start": "2026-11-23T22:30:00.000Z",
+      "trip_instance_id": "…", "trip_kind": "scheduled", "service_date": "2026-11-24", "trip_start": "2026-11-23T22:30:00.000Z",
       "eta": "2026-11-23T22:39:10.000Z", "delay_s": ""
     },
     "notification": { "title": "A Morning route A", "body": "The bus arrives at Motomachi in about 5 min." },
@@ -159,6 +190,7 @@ One FCM HTTP v1 message per alert, addressed with `message.fid` (`FCM_TARGET=tok
 }
 ```
 
+- Live trips: `trip_kind` is `live`, the title is `trip_instance.title` in the device's language (not the route name), and `cancelled` says "This trip is cancelled." `pattern_id` and `route_id` are `""` when the trip has none; `trip_instance_id` always identifies the trip. `trip_start` is the first planned time (or when the trip may start).
 - `kind`: `approaching`, `arrived`, `passed`, `delayed`, `cancelled`. `eta` (ISO 8601, UTC) for approaching and delayed when known, else `""`; `delay_s` for delayed. All `data` values are strings (FCM requires it). **No positions**: only IDs, times and names the rider already follows.
 - `notification` is localised from `device.language`: `ja`, `en` or `de` (base subtag; other languages get English, no language gets Japanese), with the route and stop names from the database in that language. This deviates from rider-app.md ("text built on the phone"): with a ready text, Android shows the notification while the app is in the background or killed without any app code. `data` still has everything to build a different text.
 - One notification per trip and stop on the phone (`tag`, `apns-collapse-id`): "at your stop" replaces "arrives in 5 min". TTL: until the alert is useless (approaching / arrived / delayed 30 min, passed 10 min, cancelled until the scheduled time at the stop).
@@ -287,8 +319,11 @@ npm run test:db   # integration test against the local Supabase database
 - `test/unit/live-*.test.ts`: access token verification (JWKS, rotation, outage, rejected algorithms and claims), the access rules case by case, and the serialisation (scheduled times, delay, positions only from the linked trip, followed-stop locations, the stop window).
 - `test/replay/live-api.test.ts`: the live API over HTTP on replayed trips: arrival-time and map members, stale and off route, the trip end, public routes and stops, 401/404, a revoked membership, a failed reload, failing closed after `LIVE_MAX_AGE_SECONDS`, per-table reloads, starting while the live snapshot fails, a loop's stop visited twice, a live trip with planned stops; Server-Sent Events (updates, heartbeat, per-user, per-IP and total limits, access lost, shutdown, token expiry, early abort); the `vehicle_state` throttle. `test/unit/live-streams.test.ts`: clients that stop reading are dropped.
 - `test/db/live-parity.test.ts`: for the seed and a fixture operator (all visibilities, live trips with audiences and planned stops or on a pattern, members, staff, drivers, a revoked membership, followed and released stops), every viewer's route, trip and stop level and stop location equals what RLS returns for the same user, and trip views name a pattern's stops exactly when RLS shows that pattern's stops.
+- `test/unit/itinerary.test.ts`, `test/unit/assigner.test.ts`: live trips along planned stops (a tour that starts and ends at the hotel, a later stop's circle entered first, a red light next to it, a revisit before its planned time, a long planned stay with GPS jitter, driving past a stop, skips, progress, ETAs), trip windows and precedence.
+- `test/replay/live-trips.test.ts`: live trips through the engine and the dispatcher: on a pattern (auto start, stop events created, ETAs from the actual start, pattern subscribers alerted with the trip title), precedence against a scheduled trip on the same vehicle (both due, a running trip not pre-empted, no scheduled start during a live trip, other vehicles), a timed trip's window, planned-stop subscriptions (approaching, stops before, delayed, exactly once across a restart), planned stops edited while running, cancellation, `visible_until`, position only.
+- `test/db/live-trips.test.ts`: live trips and their planned stops loaded from the database, planned-stop subscriptions with access through the trip's audiences, an alert claimed once, and a live trip on the seed's pattern run end to end.
 - `test/db/`: the seed's loop against the real database: trip instance creation, projection compared with PostGIS, a full trip with a restart, idempotent writes; alert subscriptions with access as RLS decides it, and exactly-once claims with two engines on two connections at the same time.
 
 ## Not yet
 
-Following live trips (positions, stop states and ETAs for `kind = 'live'` trips; the live API shows their plan and stored states until then), alerts for live trips (subscriptions with `trip_instance_id`), alerts to staff, departure reminders, per-operator alert thresholds, the vehicle events endpoint, Realtime broadcast, backfill from Traccar's REST API after downtime, the Supabase outage journal, driver overrides (`trip_start` / `trip_end`), national holidays in calendars (`skip_national_holidays`), per-operator thresholds.
+Ending a live trip from the admin console or driver app (only cancel exists; the engine completes it at the last stop or when its window closes), alerts to staff, departure reminders, per-operator alert thresholds, the vehicle events endpoint, Realtime broadcast, backfill from Traccar's REST API after downtime, the Supabase outage journal, driver overrides (`trip_start` / `trip_end`), national holidays in calendars (`skip_national_holidays`), per-operator thresholds.

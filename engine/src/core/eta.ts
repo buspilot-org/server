@@ -33,7 +33,7 @@ export function scheduledOffsetAt(stops: readonly PatternStop[], m: number): num
 
 /** Expected progress at a time, from the schedule (the inverse of scheduledOffsetAt). */
 export function expectedProgressAt(inst: TripInstance, at: Date): number {
-  const stops = inst.pattern.stops;
+  const stops = inst.pattern?.stops ?? [];
   const s = secondsBetween(inst.startAt, at);
   const first = stops[0];
   if (first === undefined) return 0;
@@ -60,7 +60,7 @@ export function computeEtas(
   now: Date,
   t: Thresholds,
 ): Map<number, Date> {
-  const pstops = inst.pattern.stops;
+  const pstops = inst.pattern?.stops ?? [];
   let delayS = secondsBetween(addSeconds(inst.startAt, scheduledOffsetAt(pstops, progressM)), now);
   const dwelling = [...stops].reverse().find((s) => s.state === 'arrived');
   const dwellStop = dwelling ? pstops.find((p) => p.sequence === dwelling.sequence) : undefined;
