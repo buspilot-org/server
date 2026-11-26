@@ -68,7 +68,8 @@ export interface StopRef {
 
 export interface StopVisitView {
   sequence: number;
-  stop: StopRef;
+  /** null: the viewer may see the trip's stop times but not this stop (as RLS: stop_event without stop). */
+  stop: StopRef | null;
   state: StopState;
   /** From the schedule (scheduled trips) or the plan (live trips). */
   scheduledArrival: string | null;
@@ -186,13 +187,28 @@ export function routeRef(r: LiveRouteRow): RouteRef {
   return { id: r.id, slug: r.slug, name: r.name, shortName: r.shortName, color: r.color, textColor: r.textColor };
 }
 
-function stopRef(ctx: ViewContext, viewer: Viewer, stop: LiveStopRow, cache?: Map<string, boolean>): StopRef {
-  let visible = cache?.get(stop.id);
-  if (visible === undefined) {
-    visible = ctx.dir.access.stopLocationVisible(viewer.uid, stop.id, ctx.now);
-    cache?.set(stop.id, visible);
+/**
+ * The stop as the viewer may see it: null if RLS hides the stop row itself
+ * (stop_access 0: e.g. a live trip on a pattern the viewer's route access
+ * does not cover), the location only where stop_location shows it.
+ */
+function stopRef(ctx: ViewContext, viewer: Viewer, stop: LiveStopRow, cache?: Map<string, StopRef | null>): StopRef | null {
+  const cached = cache?.get(stop.id);
+  if (cached !== undefined) return cached;
+  let ref: StopRef | null = null;
+  if (ctx.dir.access.stopAccess(viewer.uid, stop.id, ctx.now) >= 1) {
+    const visible = ctx.dir.access.stopLocationVisible(viewer.uid, stop.id, ctx.now);
+    ref = { id: stop.id, slug: stop.slug, name: stop.name, location: visible ? [round(stop.lon, 6), round(stop.lat, 6)] : null };
   }
-  return { id: stop.id, slug: stop.slug, name: stop.name, location: visible ? [round(stop.lon, 6), round(stop.lat, 6)] : null };
+  cache?.set(stop.id, ref);
+  return ref;
+}
+
+/** The trip's status: the engine's, unless the database already ended it (cancelled by staff). */
+function statusOf(ctx: ViewContext, i: LiveInstanceRow): TripStatus {
+  const rt = ctx.runtime(i.id)?.progress.status;
+  if (rt === undefined || i.status === 'cancelled' || i.status === 'completed') return i.status;
+  return rt;
 }
 
 /** Today's trips (operator-local service date) and active ones. */
@@ -235,13 +251,14 @@ function tripState(ctx: ViewContext, i: LiveInstanceRow): TripState {
     };
   }
   const p = rt.progress;
-  const active = p.status === 'active';
+  const status = statusOf(ctx, i);
+  const active = status === 'active';
   const fix = active && p.vehicleId !== null ? ctx.fix(p.vehicleId) ?? null : null;
   let lastSeen = p.lastFixAt;
   if (fix && (!lastSeen || fix.at > lastSeen)) lastSeen = fix.at;
   const stale = active && (lastSeen === null || (ctx.now.getTime() - lastSeen.getTime()) / 1000 > ctx.staleAfterS);
   return {
-    status: p.status, startedAt: p.startedAt, endedAt: p.endedAt, offRoute: active && p.offRouteSince !== null,
+    status, startedAt: p.startedAt, endedAt: p.endedAt ?? i.endedAt, offRoute: active && p.offRouteSince !== null,
     tracked: true, stale, lastSeenAt: active ? lastSeen : null,
     events: new Map(p.stops.map((s) => [s.sequence, s])), scheduledStart, timeOf, fix,
   };
@@ -289,22 +306,24 @@ function headsignOf(ctx: ViewContext, i: LiveInstanceRow): I18nText | null {
 }
 
 /** A trip as the viewer may see it; null if not at all. */
-export function tripView(ctx: ViewContext, viewer: Viewer, i: LiveInstanceRow, locations = new Map<string, boolean>()): TripView | null {
+export function tripView(ctx: ViewContext, viewer: Viewer, i: LiveInstanceRow, stopRefs = new Map<string, StopRef | null>()): TripView | null {
   const level = ctx.dir.access.tripAccess(viewer.uid, i.id, ctx.now);
   if (level === 0) return null;
   const st = tripState(ctx, i);
   const visits = visitsOf(ctx, i, st);
   const last = visits[visits.length - 1];
   const fix = st.fix;
+  // The fix must be linked to this trip by the engine, and come from the
+  // vehicle the database says runs it (a reassignment by staff wins at once).
   const showVehicle = level >= 2 && st.status === 'active' && st.tracked && !st.offRoute && !st.stale
-    && fix !== null && fix.tripInstanceId === i.id;
+    && fix !== null && fix.tripInstanceId === i.id && i.vehicleId === fix.vehicleId;
   const stops: StopVisitView[] = [];
   for (const x of visits) {
     const stop = ctx.dir.stops.get(x.v.stopId);
     if (!stop) continue;
     stops.push({
       sequence: x.v.sequence,
-      stop: stopRef(ctx, viewer, stop, locations),
+      stop: stopRef(ctx, viewer, stop, stopRefs),
       state: x.state,
       scheduledArrival: iso(x.scheduledArrival),
       scheduledDeparture: iso(x.scheduledDeparture),
@@ -355,12 +374,11 @@ export function routeView(ctx: ViewContext, viewer: Viewer, routeId: string): Ro
   if (level === 0) return null;
   const operator = operatorRef(ctx, route.operatorId);
   if (!operator) return null;
-  const locations = new Map<string, boolean>();
+  const stopRefs = new Map<string, StopRef | null>();
   const trips: TripView[] = [];
   for (const i of ctx.dir.instancesOfRoute(routeId)) {
-    const status = ctx.runtime(i.id)?.progress.status ?? i.status;
-    if (!isCurrent(ctx, i, status)) continue;
-    const t = tripView(ctx, viewer, i, locations);
+    if (!isCurrent(ctx, i, statusOf(ctx, i))) continue;
+    const t = tripView(ctx, viewer, i, stopRefs);
     if (t) trips.push(t);
   }
   trips.sort((a, b) => startKey(a).localeCompare(startKey(b)) || a.id.localeCompare(b.id));
@@ -370,7 +388,8 @@ export function routeView(ctx: ViewContext, viewer: Viewer, routeId: string): Ro
 /** GET /v1/live/trips/:tripInstanceId: null = 404. */
 export function tripOnlyView(ctx: ViewContext, viewer: Viewer, tripInstanceId: string): TripOnlyView | null {
   const i = ctx.dir.instances.get(tripInstanceId);
-  if (!i) return null;
+  // Only today's and active trips: no history of older ones.
+  if (!i || !isCurrent(ctx, i, statusOf(ctx, i))) return null;
   const trip = tripView(ctx, viewer, i);
   const operator = operatorRef(ctx, i.operatorId);
   if (!trip || !operator) return null;
@@ -385,9 +404,9 @@ export function tripOnlyView(ctx: ViewContext, viewer: Viewer, tripInstanceId: s
 export function stopView(ctx: ViewContext, viewer: Viewer, stopId: string): StopView | null {
   const stop = ctx.dir.stops.get(stopId);
   if (!stop) return null;
-  if (ctx.dir.access.stopAccess(viewer.uid, stopId, ctx.now) === 0) return null;
+  const ref = stopRef(ctx, viewer, stop);
   const operator = operatorRef(ctx, stop.operatorId);
-  if (!operator) return null;
+  if (!ref || !operator) return null;
   const arrivals: (StopArrivalView & { sortAt: number })[] = [];
   const routes = new Map<string, RouteRef>();
   for (const i of ctx.dir.instancesAtStop(stopId)) {
@@ -439,7 +458,7 @@ export function stopView(ctx: ViewContext, viewer: Viewer, stopId: string): Stop
     v: FORMAT_VERSION,
     generatedAt: ctx.now.toISOString(),
     operator,
-    stop: stopRef(ctx, viewer, stop),
+    stop: ref,
     routes: [...routes.values()],
     arrivals: kept,
   };

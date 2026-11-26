@@ -85,12 +85,21 @@ insert into public.trip_instance (id, operator_id, service_date, kind, route_id,
   ('${id('913')}', '${OP}', current_date, 'live', null, null, 'active', '{"en": "over"}', now() - interval '1 minute', null),
   -- Yesterday's tour, ended more than a day ago: loaded, but its planned stops no longer count.
   ('${id('914')}', '${OP}', current_date - 1, 'live', null, null, 'completed', '{"en": "old"}', null, now() - interval '30 hours'),
-  ('${id('915')}', '${OP}', current_date + 1, 'live', '${ROUTES.map}', '${id('702')}', 'planned', '{"en": "map trip"}', null, null);
+  ('${id('915')}', '${OP}', current_date + 1, 'live', '${ROUTES.map}', '${id('702')}', 'planned', '{"en": "map trip"}', null, null),
+  -- Planned three days ago and never run: not loaded by the engine.
+  ('${id('917')}', '${OP}', current_date - 3, 'live', null, null, 'planned', '{"en": "stale plan"}', null, null),
+  -- Ended two hours ago: its planned stops still count.
+  ('${id('918')}', '${OP}', current_date, 'live', null, null, 'completed', '{"en": "just ended"}', null, now() - interval '2 hours');
+-- A live trip on the eta route's pattern with its own audience (no planned stops).
+insert into public.trip_instance (id, operator_id, service_date, kind, pattern_id, status, title) values
+  ('${id('916')}', '${OP}', current_date, 'live', '${id('303')}', 'active', '{"en": "on pattern"}');
 insert into public.trip_instance_stop (operator_id, trip_instance_id, stop_sequence, stop_id) values
   ('${OP}', '${id('911')}', 1, '${STOPS.tour}'), ('${OP}', '${id('911')}', 2, '${STOPS.s1}'),
   ('${OP}', '${id('913')}', 1, '${STOPS.s3}'),
   ('${OP}', '${id('914')}', 1, '${STOPS.s5}'),
-  ('${OP}', '${id('915')}', 1, '${STOPS.s3}');
+  ('${OP}', '${id('915')}', 1, '${STOPS.s3}'),
+  ('${OP}', '${id('917')}', 1, '${STOPS.s5}'),
+  ('${OP}', '${id('918')}', 1, '${STOPS.s5}');
 insert into public.audience (id, operator_id, name) values
   ('${id('601')}', '${OP}', '{"en": "eta"}'), ('${id('602')}', '${OP}', '{"en": "map"}'), ('${id('603')}', '${OP}', '{"en": "tour"}');
 insert into public.audience_route (operator_id, audience_id, route_id, can_see_map) values
@@ -99,7 +108,8 @@ insert into public.audience_route (operator_id, audience_id, route_id, can_see_m
 insert into public.trip_instance_audience (operator_id, trip_instance_id, audience_id, can_see_map) values
   ('${OP}', '${id('911')}', '${id('603')}', true), ('${OP}', '${id('912')}', '${id('603')}', true),
   ('${OP}', '${id('913')}', '${id('603')}', true), ('${OP}', '${id('914')}', '${id('603')}', true),
-  ('${OP}', '${id('915')}', '${id('603')}', false);
+  ('${OP}', '${id('915')}', '${id('603')}', false), ('${OP}', '${id('916')}', '${id('603')}', true),
+  ('${OP}', '${id('917')}', '${id('603')}', true), ('${OP}', '${id('918')}', '${id('603')}', false);
 insert into public.membership (operator_id, device_id, audience_id, revoked_at) values
   ('${OP}', '${USERS.member}', '${id('601')}', null), ('${OP}', '${USERS.mapper}', '${id('602')}', null),
   ('${OP}', '${USERS.tourist}', '${id('603')}', null), ('${OP}', '${USERS.revoked}', '${id('602')}', now()),
@@ -111,6 +121,9 @@ insert into public.subscription (operator_id, device_id, pattern_id, stop_sequen
   ('${OP}', '${USERS.member}', '${id('303')}', 3);
 insert into public.subscription (operator_id, device_id, trip_instance_id, stop_sequence) values
   ('${OP}', '${USERS.tourist}', '${id('911')}', 2);
+-- The member stops following s1: its log row is released but keeps its place,
+-- so s3 (third) still gets no location.
+delete from public.subscription where device_id = '${USERS.member}' and pattern_id = '${id('303')}' and stop_sequence = 1;
 `;
 
 async function cleanup(): Promise<void> {
@@ -141,6 +154,7 @@ describe('live API access = RLS (parity)', () => {
   let now: Date;
   const routeIds = [...Object.values(ROUTES), SEED_ROUTE];
   let tripIds: string[] = [];
+  let loaded = new Set<string>();
   let stopIds: string[] = [];
   const viewers: [string, Claims][] = [['visitor', null], ...Object.entries(USERS)];
 
@@ -150,7 +164,9 @@ describe('live API access = RLS (parity)', () => {
     const snapshot = await store.loadLiveSnapshot();
     index = new AccessIndex(snapshot);
     now = snapshot.loadedAt;
-    tripIds = snapshot.instances.filter((i) => i.operatorId === OP || i.operatorId === SEED_OP).map((i) => i.id);
+    // From the database, not the snapshot: instances the snapshot leaves out are compared too.
+    tripIds = (await sql<{ id: string }[]>`select id from public.trip_instance where operator_id in (${OP}, ${SEED_OP})`).map((r) => r.id);
+    loaded = new Set(snapshot.instances.map((i) => i.id));
     stopIds = snapshot.stops.filter((s) => s.operatorId === OP || s.operatorId === SEED_OP).map((s) => s.id);
     assert.ok(tripIds.length >= 8, 'fixture trips loaded');
   });
@@ -183,6 +199,12 @@ describe('live API access = RLS (parity)', () => {
       });
       for (const r of db.levels) {
         const mine = index.tripAccess(uid, r.id, now);
+        if (!loaded.has(r.id)) {
+          // Not loaded (older than the access rules' windows): the live API
+          // never shows it, which is stricter than RLS.
+          assert.equal(mine, 0, `trip instance ${r.id} not loaded`);
+          continue;
+        }
         assert.equal(mine, r.level, `trip instance ${r.id}`);
         assert.equal(mine >= 1, db.visible.has(r.id), `trip instance ${r.id} visible`);
       }
@@ -208,7 +230,12 @@ describe('live API access = RLS (parity)', () => {
       for (const t of tripIds) seen.add(index.tripAccess(uid, t, now));
     }
     assert.deepEqual([...seen].sort(), [0, 1, 2, 3]);
-    assert.equal(index.stopLocationVisible(USERS.member, STOPS.s1, now), true, 'first followed stop');
-    assert.equal(index.stopLocationVisible(USERS.member, STOPS.s3, now), false, 'third followed stop');
+    assert.equal(index.stopLocationVisible(USERS.member, STOPS.s2, now), true, 'second followed stop');
+    assert.equal(index.stopLocationVisible(USERS.member, STOPS.s1, now), false, 'released: no longer followed');
+    assert.equal(index.stopLocationVisible(USERS.member, STOPS.s3, now), false, 'third followed stop, the released one keeps its place');
+    assert.ok(!loaded.has(id('917')), 'an old plan is not loaded');
+    assert.equal(index.tripAccess(USERS.tourist, id('916'), now), 1, 'live trip on an invited_eta pattern: arrival times');
+    assert.equal(index.stopAccess(USERS.tourist, STOPS.s1, now), 2, 'planned stop of the tour');
+    assert.equal(index.stopAccess(USERS.tourist, STOPS.s5, now), 1, 'planned stop of a live trip that ended two hours ago');
   });
 });

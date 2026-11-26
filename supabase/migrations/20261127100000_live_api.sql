@@ -70,8 +70,9 @@ end;
 $$;
 
 -- trip_instance is updated by the engine on every position (progress); only
--- changes made by staff or the scheduler matter here: new or deleted trips,
--- cancellations, starts and ends, vehicle, route and visibility.
+-- the columns the access rules and the live API read matter here: new or
+-- deleted trips, cancellations, starts and ends, vehicle, trip, route, date
+-- and visibility.
 create trigger notify_live_change_insert_delete
   after insert or delete or truncate on public.trip_instance
   for each statement execute function private.notify_live_change();
@@ -83,6 +84,9 @@ create trigger notify_live_change_update
     old.status is distinct from new.status
     or old.visible_until is distinct from new.visible_until
     or old.vehicle_id is distinct from new.vehicle_id
+    or old.trip_id is distinct from new.trip_id
+    or old.service_date is distinct from new.service_date
+    or old.ended_at is distinct from new.ended_at
     or old.route_id is distinct from new.route_id
     or old.pattern_id is distinct from new.pattern_id
     or old.title is distinct from new.title

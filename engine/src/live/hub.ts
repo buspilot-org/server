@@ -30,6 +30,8 @@ export interface HubOptions {
   staleAfterS: number;
   /** Wait this long after a change notification before reloading (coalesces bursts) (ms). */
   debounceMs?: number;
+  /** At least this long between reloads caused by notifications (ms): steady churn (subscriptions) costs one reload per interval. */
+  minReloadIntervalMs?: number;
 }
 
 export class LiveHub implements TripObserver {
@@ -39,6 +41,8 @@ export class LiveHub implements TripObserver {
   readonly #trips: () => ReadonlyMap<string, TripRuntime>;
   readonly #staleAfterS: number;
   readonly #debounceMs: number;
+  readonly #minReloadIntervalMs: number;
+  #lastReloadStart = 0;
   #dir: Directory | null = null;
   readonly #fixes = new Map<string, VehicleFix>();
   readonly #listeners = new Set<ChangeListener>();
@@ -55,6 +59,7 @@ export class LiveHub implements TripObserver {
     this.#trips = o.trips;
     this.#staleAfterS = o.staleAfterS;
     this.#debounceMs = o.debounceMs ?? 500;
+    this.#minReloadIntervalMs = o.minReloadIntervalMs ?? 2000;
   }
 
   get loaded(): boolean {
@@ -99,6 +104,7 @@ export class LiveHub implements TripObserver {
     this.#reloading = (async () => {
       for (;;) {
         this.#again = false;
+        this.#lastReloadStart = Date.now();
         try {
           const snapshot = await this.#store.loadLiveSnapshot();
           this.#dir = new Directory(snapshot);
@@ -126,10 +132,16 @@ export class LiveHub implements TripObserver {
   #scheduleReload(): void {
     this.metrics.notifications++;
     if (this.#timer) return;
+    const wait = Math.max(this.#debounceMs, this.#lastReloadStart + this.#minReloadIntervalMs - Date.now());
     this.#timer = setTimeout(() => {
       this.#timer = null;
       this.reload().catch(() => undefined);
-    }, this.#debounceMs);
+    }, wait);
+  }
+
+  /** Whether LISTEN is set up (it is retried by the periodic reload otherwise). */
+  get listening(): boolean {
+    return this.#unlisten !== null;
   }
 
   /** Listens for change notifications (LISTEN buspilot_live); reloads on every (re)connect too. */

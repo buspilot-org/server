@@ -491,7 +491,9 @@ export class Engine {
     }
     // The trip the database linked this fix to (vehicle_state.trip_instance_id).
     const linkedTrip = !tripApplied && writes.trip?.id === activeId ? null : activeId;
-    if (writes.vehicleState) this.#stateWritten.set(vehicle.id, { at, tripInstanceId: linkedTrip, offRoute });
+    // The trip compared next time is the one the engine assigned (not what the
+    // database linked), so a refused trip write does not force a write per fix.
+    if (writes.vehicleState) this.#stateWritten.set(vehicle.id, { at, tripInstanceId: activeId, offRoute });
     for (const [tr, u] of updates) {
       if (!tripApplied && writes.trip?.id === tr.instance.id) {
         // Another vehicle runs this trip (or it was cancelled): the database

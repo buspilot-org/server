@@ -36,7 +36,7 @@ async function setup(opts: { extras?: Partial<LiveExtras>; limits?: Partial<Stre
   const trips = [{ id: TRIP, serviceDate: DATE, start: '07:30' }];
   const s = await Scenario.create(opts.route === 'loop' ? loopRoute(trips) : germanSchool(trips));
   const live = new MemoryLiveStore(s, { memberships: [{ deviceId: MEMBER, audienceId: AUDIENCE }], ...opts.extras });
-  const hub = new LiveHub({ store: live, clock: s.clock, log: silentLogger, trips: () => s.engine.trips, staleAfterS: s.thresholds.staleAfterS, debounceMs: 0 });
+  const hub = new LiveHub({ store: live, clock: s.clock, log: silentLogger, trips: () => s.engine.trips, staleAfterS: s.thresholds.staleAfterS, debounceMs: 0, minReloadIntervalMs: 0 });
   s.observers.push(hub);
   await s.restart();
   await hub.reload();
@@ -92,7 +92,7 @@ describe('live API: members polling a route', () => {
     assert.deepEqual(trip.stops.map((x) => x.state), ['departed', 'departed', 'upcoming', 'upcoming', 'upcoming']);
     assert.ok(trip.stops[2]?.eta, 'ETA for the next stop');
     assert.equal(trip.stops[0]?.eta, null, 'no ETA for a departed stop');
-    assert.ok(trip.stops.every((x) => x.stop.location === null), 'no stop locations');
+    assert.ok(trip.stops.every((x) => x.stop?.location === null), 'no stop locations');
     assert.equal(typeof trip.delayS, 'number');
     // No coordinates anywhere in the response.
     assert.doesNotMatch(JSON.stringify(body), /"lon"|"lat"/);
@@ -111,6 +111,7 @@ describe('live API: members polling a route', () => {
     const t = await setup({ extras: { visibility: 'invited_map', audienceRoutes: [{ audienceId: AUDIENCE, routeId: ROUTE, canSeeMap: true }] } });
     const fixes = firstHalf(t.s).fixes;
     await t.s.feed(fixes);
+    await changed(t); // the trip start notifies (status, vehicle_id)
     let body = await json<RouteView>(await t.get(`/v1/live/routes/${ROUTE}`));
     assert.equal(body.access, 'map');
     const vehicle = body.trips[0]?.vehicle;
@@ -120,7 +121,7 @@ describe('live API: members polling a route', () => {
     const ll = t.s.plane.toLonLat(last.xy);
     assert.ok(Math.abs(vehicle.lon - ll.lon) < 1e-5 && Math.abs(vehicle.lat - ll.lat) < 1e-5);
     assert.equal(vehicle.recordedAt, last.t.toISOString());
-    assert.ok(body.trips[0]?.stops.every((x) => x.stop.location !== null), 'stop locations at map level');
+    assert.ok(body.trips[0]?.stops.every((x) => x.stop?.location !== null), 'stop locations at map level');
 
     // Three minutes without a position: stale, no position, only the time.
     t.s.clock.set(new Date(last.t.getTime() + 180_000));
@@ -183,6 +184,7 @@ describe('live API: public routes and stops', () => {
   it('a public route by slug: anyone, position while active, cacheable at the edge', async () => {
     const t = await setup({ extras: { visibility: 'public' } });
     await t.s.feed(firstHalf(t.s).fixes);
+    await changed(t);
     const res = await t.get(`/v1/public/routes/${OPERATOR_SLUG}/${ROUTE_SLUG}`, null);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('cache-control'), 'public, max-age=5, s-maxage=5');
@@ -250,11 +252,11 @@ describe('live API: stops and live trips', () => {
     assert.equal(body.trip.tracked, false);
     assert.equal(body.trip.vehicle, null);
     assert.equal(body.trip.access, 'map');
-    assert.deepEqual(body.trip.stops.map((x) => [x.stop.id, x.state, x.scheduledArrival]), [
+    assert.deepEqual(body.trip.stops.map((x) => [x.stop?.id, x.state, x.scheduledArrival]), [
       [stopId(1), 'departed', start.toISOString()],
       [TOUR_STOP, 'upcoming', new Date(start.getTime() + 3600_000).toISOString()],
     ]);
-    assert.ok(body.trip.stops[1]?.stop.location, 'map level: planned stop locations');
+    assert.ok(body.trip.stops[1]?.stop?.location, 'map level: planned stop locations');
     assert.equal((await t.get(`/v1/live/trips/${LIVE_TRIP}`, MEMBER)).status, 404);
     const stop = await json<StopView>(await t.get(`/v1/live/stops/${TOUR_STOP}`, TOURIST));
     assert.deepEqual(stop.arrivals.map((a) => [a.tripInstanceId, a.kind]), [[LIVE_TRIP, 'live']]);
@@ -359,6 +361,17 @@ describe('live API: Server-Sent Events', () => {
     const r = new SseReader(await Promise.resolve(t.app.request(`/v1/live/routes/${ROUTE}/stream`, { headers: { Authorization: `Bearer ${token}` } })));
     await r.until((x) => x.includes('event: end'), 4000);
     assert.deepEqual(r.events('end'), [{ reason: 'token_expired' }]);
+  });
+
+  it('a client that goes away at once frees its slot and leaves no timers behind', async () => {
+    const t = await setup({ limits: { heartbeatS: 1 } });
+    for (let i = 0; i < 3; i++) {
+      const res = await t.get(`/v1/live/routes/${ROUTE}/stream`);
+      await res.body?.cancel();
+    }
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(t.streams.size, 0);
+    // A leaked heartbeat interval would keep this test file from finishing.
   });
 
   it('a stream for a route the user may not see is 404, not a stream', async () => {

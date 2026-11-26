@@ -28,7 +28,9 @@ export class PgStore implements Store, AlertStore, LiveStore {
     this.sql = postgres(databaseUrl, {
       max: options.max ?? 5,
       onnotice: () => undefined,
-      connection: { application_name: 'buspilot-engine' },
+      // UTC like Supabase's default: the live API's access rules use
+      // current_date in UTC (private.stop_access), as the snapshot query does.
+      connection: { application_name: 'buspilot-engine', TimeZone: 'UTC' },
     });
   }
 

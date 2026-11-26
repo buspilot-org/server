@@ -113,6 +113,12 @@ export interface StreamSpec {
   relevant(c: Change): boolean;
   /** When the viewer's access token expires (ms since epoch). */
   expiresAt: number;
+  /**
+   * Closes the connection at once (destroys the socket). Used when the
+   * client does not read: its pending writes would otherwise keep the
+   * socket, its buffers and server.close() waiting.
+   */
+  drop(): void;
 }
 
 /** Runs one SSE stream until the client goes away or the stream ends. */
@@ -200,11 +206,21 @@ export async function runStream(
     for (const t of timers) clearInterval(t);
     unsubscribe();
     slot.release();
-    if (reason !== null && reason !== 'slow_client' && !stream.aborted) {
-      await Promise.race([
-        stream.write(`event: end\ndata: ${JSON.stringify({ reason })}\n\n`),
-        new Promise((r) => setTimeout(r, 1000).unref()),
+    let dropped = reason === 'slow_client';
+    if (reason !== null && !dropped && !stream.aborted) {
+      // A client that does not take the end message within a second is dropped.
+      const sent = await Promise.race([
+        stream.write(`event: end\ndata: ${JSON.stringify({ reason })}\n\n`).then(() => true),
+        new Promise<false>((r) => setTimeout(() => { r(false); }, 1000).unref()),
       ]);
+      dropped = !sent;
+    }
+    if (dropped) {
+      try {
+        spec.drop();
+      } catch (err) {
+        log.warn('dropping a live stream connection failed', { error: errorMessage(err) });
+      }
     }
     resolveDone();
   }
@@ -215,12 +231,13 @@ export async function runStream(
   slot.register({ end: (reason) => { void finish(reason); }, done });
   stream.onAbort(() => { void finish(null); });
 
-  await write(`retry: ${limits.retryMs}\n\n`);
-  await sendContent(first);
+  // Timers before the first write: finish() (abort, shutdown, slow client)
+  // can run during it and must find them to clear them.
   timers.push(setInterval(() => {
     if (!writing && !finished) void write(': ping\n\n');
   }, limits.heartbeatS * 1000));
   const untilExpiry = Math.min(spec.expiresAt - Date.now(), 2 ** 31 - 1);
   timers.push(setTimeout(() => { void finish('token_expired'); }, Math.max(0, untilExpiry)));
+  if (await write(`retry: ${limits.retryMs}\n\n`)) await sendContent(first);
   await done;
 }

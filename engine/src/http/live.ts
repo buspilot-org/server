@@ -13,6 +13,7 @@
  * Unknown, not visible and invalid IDs all answer 404, so the existence of
  * a private route is not revealed.
  */
+import type { ServerResponse } from 'node:http';
 import type { Context, Next } from 'hono';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
@@ -151,6 +152,8 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
       return c.json({ error: 'too many streams' }, 429);
     }
     c.header('X-Accel-Buffering', 'no');
+    // @hono/node-server passes the Node response as c.env.outgoing.
+    const outgoing = (c.env as { outgoing?: ServerResponse } | undefined)?.outgoing;
     return streamSSE(c, async (s) => {
       try {
         await runStream(s, {
@@ -161,6 +164,7 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
           },
           relevant,
           expiresAt: claims.exp * 1000,
+          drop: () => { outgoing?.destroy(); },
         }, first, hub, slot, streams.limits, log);
       } finally {
         slot.release();

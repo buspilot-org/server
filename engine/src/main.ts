@@ -98,7 +98,10 @@ void start().then(async () => {
     log.error('LISTEN for live changes failed; relying on the periodic reload', { error: errorMessage(err) });
   }
   timers.push(
-    every('live reload', config.live.reloadS, () => liveHub.reload()),
+    every('live reload', config.live.reloadS, async () => {
+      if (!liveHub.listening) await liveHub.listen().catch((err: unknown) => { log.warn('LISTEN for live changes failed', { error: errorMessage(err) }); });
+      await liveHub.reload();
+    }),
     every('cache reload', config.cacheReloadS, () => engine.reload()),
     every('trip instance creation', config.schedulerIntervalS, async () => {
       if (await createInstances() > 0) await engine.reload();

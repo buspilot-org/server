@@ -21,7 +21,7 @@ docker run --env-file .env -p 8080:8080 buspilot-engine
 
 | Variable | Default | |
 |---|---|---|
-| `DATABASE_URL` | – | Direct Postgres connection with a role that bypasses RLS (as the service role does). Local: `postgres://postgres:postgres@127.0.0.1:55322/postgres` |
+| `DATABASE_URL` | – | Direct Postgres connection (or the session pooler; not the transaction pooler on port 6543, where `LISTEN` does nothing) with a role that bypasses RLS (as the service role does). Local: `postgres://postgres:postgres@127.0.0.1:55322/postgres` |
 | `TRACCAR_FORWARD_SECRET` | – | At least 32 URL-safe characters (`openssl rand -hex 32`) |
 | `PORT`, `HOST` | `8080`, `0.0.0.0` | |
 | `CACHE_RELOAD_SECONDS` | `300` | Safety-net reload of vehicles, shapes, patterns and trip instances |
@@ -180,7 +180,7 @@ Live positions and ETAs for the rider app and the public web pages, served by th
 |---|---|---|
 | `GET /v1/live/routes/:routeId` | Members | The route with today's trips (operator time zone) and active ones: status, stops with state and ETA, the bus position where allowed |
 | `GET /v1/live/routes/:routeId/stream` | Members | The same as Server-Sent Events while the route or map screen is open |
-| `GET /v1/live/trips/:tripInstanceId` | Members | One trip, e.g. a live trip without a route (a tour) for its audiences |
+| `GET /v1/live/trips/:tripInstanceId` | Members | One of today's or an active trip, e.g. a live trip without a route (a tour) for its audiences; older trips answer `404` (no history) |
 | `GET /v1/live/trips/:tripInstanceId/stream` | Members | The same as Server-Sent Events |
 | `GET /v1/live/stops/:stopId` | Members | Today's arrivals at a stop (home cards): the latest served visits and what comes next, at most 50 |
 | `GET /v1/public/routes/:operatorSlug/:routeSlug` | Anyone | A `public` route (`buspilot.org/r/<operator>/<route>`) |
@@ -195,6 +195,7 @@ Live positions and ETAs for the rider app and the public web pages, served by th
 - **Map** viewers (`access: "map"`: public routes, `invited_map` with `can_see_map`, a live trip's audience with map, staff) get the bus position only while the trip is active, the bus is on route and its position is fresh (less than 2 minutes old), and stop locations.
 - Live trips are visible to their audiences (`trip_instance_audience`) and, if they have a route, to the route's audiences; after `visible_until` to nobody.
 - Membership, audience, staff and trip changes apply within about a second (the database notifies the engine on channel `buspilot_live`), at the latest after `LIVE_RELOAD_SECONDS`. An open stream whose viewer loses access ends with `not_found`.
+- A stop the viewer may not see as a row under RLS (e.g. a live trip's own audience on a pattern of a route they are not a member of) comes as `"stop": null`: its times and state, but no name, ID or location.
 - Never history: only the current state, today's stop times, and the latest position.
 
 ### Response (format `v: 1`)
