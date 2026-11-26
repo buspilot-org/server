@@ -5,7 +5,7 @@
  */
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { Scenario, Track, subscription, type Fix } from './harness.ts';
+import { ROUTE, Scenario, Track, subscription, type Fix } from './harness.ts';
 import { EXAMPLE_M, STOP_M, exampleRoute, exampleRun, germanSchool, loopRoute, normalRun } from './routes.ts';
 
 const DATE = '2026-11-24';
@@ -54,7 +54,7 @@ describe('alerts: "N minutes before"', () => {
     assert.equal(d.trip_instance_id, 'T1');
     assert.equal(d.stop_sequence, '4');
     assert.equal(d.stop_id, 'stop-4');
-    assert.equal(d.route_id, 'route-1');
+    assert.equal(d.route_id, ROUTE);
     assert.equal(d.service_date, DATE);
     assert.ok(d.alert_id);
     assert.ok(Object.values(d).every((v) => typeof v === 'string'));

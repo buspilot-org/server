@@ -5,7 +5,7 @@ Server side of [Buspilot](https://buspilot.org), a bus tracking service for priv
 | Folder | Content |
 |---|---|
 | `supabase/` | Supabase project: `config.toml`, SQL migrations (schema, PostGIS, row-level security), seed data for a demo operator |
-| `engine/` | Service next to Traccar: assigns positions to trips, tracks progress along the route, stop events, ETAs and arrival alerts by push (see [engine/README.md](engine/README.md)) |
+| `engine/` | Service next to Traccar: assigns positions to trips, tracks progress along the route, stop events, ETAs, arrival alerts by push, and the live API for the rider app and public pages (see [engine/README.md](engine/README.md)) |
 
 Positions come from a [Traccar](https://www.traccar.org) server. The engine turns them into trip state; Supabase stores schedules, trip state, access and content.
 
@@ -48,7 +48,8 @@ Migrations in `supabase/migrations/` create the schema (Postgres + PostGIS), row
 - **National holidays** (`national_holiday`, names in ja/en/de) are readable by everyone. Calendars with `skip_national_holidays` do not run on them, unless an `added` exception says so; `service_days(from, to, operator_id)` returns the dates each visible calendar runs.
 - **Rider app RPCs**: `my_routes()` returns only the routes of the device's operators and the routes it follows (embeddable: `rpc/my_routes?select=*,trip_pattern(*)`), `delete_my_device()` deletes the device's anonymous auth user with its memberships and subscriptions.
 - **Branding**: `operator.branding` takes `logo_url`, `cover_url` (https URLs), `color` and `text_color` (`RRGGBB` without `#`); other keys are rejected. Owners upload logo and cover to the public Storage bucket `operator-branding` under `<operator_id>/`, for example `<operator_id>/logo.png` (PNG, JPEG or WebP, at most 2 MiB).
-- **The engine** writes live state (trip progress, stop events, vehicle state, alerts, vehicle events) with the service role.
+- **Slugs**: `route.slug` and `stop.slug` (optional, unique per operator, lower case with hyphens) name public pages: `buspilot.org/r/<operator.slug>/<route.slug>` and `buspilot.org/s/<operator.slug>/<stop.slug>`.
+- **The engine** writes live state (trip progress, stop events, vehicle state every ~30 s, alerts, vehicle events) with the service role, and is notified of access changes on channel `buspilot_live` (statement triggers on memberships, audiences, staff, routes, stops and trips).
 
 `seed.sql` adds a fictional demo school in Kobe with one route (a loop that serves one stop twice), two trips, a vehicle for Traccar device `23273424`, and the invite code `DEMO-KOBE-2026`. To try the admin side locally, sign up a user in Studio and give it a role:
 
@@ -76,7 +77,7 @@ The script replaces the listed years and stops on a holiday name it has no Engli
 
 ## Engine
 
-The engine (`engine/`, TypeScript on Node.js 26 LTS) receives positions from Traccar's JSON forwarding, matches them to the running trip and writes trip progress, stop events, ETAs and the vehicle state to Postgres. It also creates each day's trip instances from the calendars and sends arrival alerts through Firebase Cloud Messaging (set `FCM_SERVICE_ACCOUNT_FILE` to the Firebase service account key; without it, alerts are off).
+The engine (`engine/`, TypeScript on Node.js 26 LTS) receives positions from Traccar's JSON forwarding, matches them to the running trip and writes trip progress, stop events, ETAs and the vehicle state to Postgres. It also creates each day's trip instances from the calendars, sends arrival alerts through Firebase Cloud Messaging (set `FCM_SERVICE_ACCOUNT_FILE` to the Firebase service account key; without it, alerts are off), and serves live positions and ETAs to the rider app and the public pages (`/v1/live/…` with the Supabase access token, `/v1/public/…` for public routes; set `SUPABASE_URL`). Riders never get positions from Supabase or Traccar.
 
 ```bash
 cd engine
