@@ -106,7 +106,8 @@ describe('live trips against the seeded database', () => {
     const inst = cache.instances.get(L_TOUR)?.instance;
     assert.ok(inst?.itinerary);
     assert.equal(inst.itinerary.stops.length, 3);
-    assert.equal(inst.timed, true);
+    assert.equal(inst.timedStart, true);
+    assert.equal(inst.timedEnd, true);
     assert.equal(inst.startAt.toISOString(), '2027-03-05T00:00:00.000Z');
     assert.equal(cache.instances.get(L_PATTERN)?.instance.pattern?.id, PATTERN);
   });

@@ -24,7 +24,7 @@ const pattern = {
 function trip(id: string, over: Partial<TripInstance>, progress: Partial<TripProgress> = {}): TripRuntime {
   const instance: TripInstance = {
     id, operatorId: 'op', serviceDate: '2026-11-24', kind: 'scheduled', tripId: `trip-${id}`, routeId: 'r', pattern, itinerary: null,
-    title: null, visibleUntil: null, startAt: min(0), endAt: min(10), timed: true, ...over,
+    title: null, visibleUntil: null, startAt: min(0), endAt: min(10), timedStart: true, timedEnd: true, ...over,
   };
   const base = progressFromRow({
     id, operatorId: 'op', serviceDate: '2026-11-24', kind: instance.kind, tripId: instance.tripId, patternId: 'p', routeId: 'r',
@@ -49,7 +49,7 @@ describe('trip windows', () => {
   });
 
   it('live without planned times: from when it was saved to the end of the day; on a pattern, once started, its running time', () => {
-    const tr = trip('L', { kind: 'live', tripId: null, startAt: min(5), endAt: min(24 * 60), timed: false });
+    const tr = trip('L', { kind: 'live', tripId: null, startAt: min(5), endAt: min(24 * 60), timedStart: false, timedEnd: false });
     assert.deepEqual(Object.values(tripWindow(tr, t)), [min(5), min(24 * 60 + 30)]);
     tr.progress = { ...tr.progress, status: 'active', startedAt: min(100) };
     assert.deepEqual(Object.values(tripWindow(tr, t)), [min(5), min(100 + 10 + 30)]);
@@ -59,8 +59,8 @@ describe('trip windows', () => {
 
 describe('precedence', () => {
   it('a live trip of the vehicle is a live start candidate, never a scheduled one; without a vehicle it is neither', () => {
-    const live = trip('L', { kind: 'live', tripId: null, timed: false, startAt: min(0) }, { vehicleId: 'v1' });
-    const anyVehicle = trip('L2', { kind: 'live', tripId: null, timed: false, startAt: min(0) });
+    const live = trip('L', { kind: 'live', tripId: null, timedStart: false, timedEnd: false, startAt: min(0) }, { vehicleId: 'v1' });
+    const anyVehicle = trip('L2', { kind: 'live', tripId: null, timedStart: false, timedEnd: false, startAt: min(0) });
     const sched = trip('S', {});
     const all = [live, anyVehicle, sched];
     assert.deepEqual(liveStartCandidates(all, vehicle, min(1), t).map((x) => x.instance.id), ['L']);
@@ -69,7 +69,7 @@ describe('precedence', () => {
 
   it('several active trips on one vehicle (only through database changes): the live trip wins', () => {
     const sched = trip('S', {}, { status: 'active', vehicleId: 'v1', startedAt: min(0) });
-    const live = trip('L', { kind: 'live', tripId: null, timed: false }, { status: 'active', vehicleId: 'v1', startedAt: min(5) });
+    const live = trip('L', { kind: 'live', tripId: null, timedStart: false, timedEnd: false }, { status: 'active', vehicleId: 'v1', startedAt: min(5) });
     assert.equal(activeTrip([sched, live], 'v1')?.instance.id, 'L');
     assert.equal(activeTrip([sched], 'v1')?.instance.id, 'S');
   });

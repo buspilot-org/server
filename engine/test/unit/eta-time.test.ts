@@ -34,7 +34,7 @@ describe('ETA v1', () => {
   const startAt = new Date('2026-11-23T22:30:00Z');
   const inst: TripInstance = {
     id: 'i', operatorId: 'o', serviceDate: '2026-11-24', kind: 'scheduled', tripId: 't', routeId: 'r', itinerary: null, title: null,
-    visibleUntil: null, timed: true, startAt, endAt: new Date(startAt.getTime() + 600_000),
+    visibleUntil: null, timedStart: true, timedEnd: true, startAt, endAt: new Date(startAt.getTime() + 600_000),
     pattern: { id: 'p', operatorId: 'o', routeId: 'r', shape: new Polyline([{ x: 0, y: 0 }, { x: 2000, y: 0 }]), stops },
   };
   const progress = (s1: StopProgress['state']): StopProgress[] => [

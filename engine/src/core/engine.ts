@@ -156,6 +156,7 @@ export class Engine {
         this.#trips.set(instance.id, { instance, scheduledVehicleId, progress });
         continue;
       }
+      const before = existing.instance;
       existing.instance = instance;
       existing.scheduledVehicleId = scheduledVehicleId;
       const mem = existing.progress;
@@ -163,7 +164,7 @@ export class Engine {
         // Take the row only if it changed, so a trip start being written
         // right now is not discarded by a stale copy.
         if (row.status !== mem.status || row.vehicleId !== mem.vehicleId) existing.progress = progressFromRow(row, instance);
-        else existing.progress = alignStops(mem, row, instance);
+        else existing.progress = alignStops(mem, row, instance, before);
       } else if (mem.status === 'active' && (row.status === 'cancelled' || row.status === 'completed')) {
         existing.progress = { ...existing.progress, status: row.status, endedAt: row.endedAt ?? existing.progress.endedAt };
         this.#log.info('trip ended in the database', { tripInstanceId: instance.id, status: row.status });
@@ -177,9 +178,14 @@ export class Engine {
         // or driver start elsewhere, or a lost race): the database wins.
         existing.progress = progressFromRow(row, instance);
         this.#log.warn('trip taken over from the database', { tripInstanceId: instance.id, status: row.status });
+      } else if (mem.status === 'active' && instance.kind === 'live' && row.vehicleId === null && row.status === 'active') {
+        // Staff took the vehicle off a running live trip (save_live_trip
+        // with "any vehicle"): the trip is released; the vehicle is free.
+        existing.progress = progressFromRow(row, instance);
+        this.#log.warn('live trip released by staff', { tripInstanceId: instance.id });
       } else if (mem.status === 'active') {
         // A live trip's planned stops can change while it runs.
-        existing.progress = alignStops(mem, row, instance);
+        existing.progress = alignStops(mem, row, instance, before);
       }
     }
     // Drop instances that left the snapshot (past service dates, inactive
@@ -493,8 +499,8 @@ export class Engine {
         if (ev.streak) streaks.set(cand.instance.id, ev.streak);
         if (ev.startM !== null) options.push({ trip: cand, startM: ev.startM, streak: ev.streak });
       }
-      // Live trips without a pattern: the earliest; else the best fit to the schedule.
-      return options.find((o) => o.trip.instance.pattern === null) ?? chooseStart(options, at);
+      // Live trips: the earliest due (candidates come sorted); scheduled: the best fit to the schedule.
+      return options[0]?.trip.instance.kind === 'live' ? options[0] : chooseStart(options, at);
     };
     const chosen = evaluate(liveStartCandidates(this.#trips.values(), vehicle, at, t))
       ?? evaluate(startCandidates(this.#trips.values(), vehicle, at, t));
@@ -600,7 +606,7 @@ export class Engine {
     if (itin === null) throw new Error('followItinerary needs planned stops');
     const r = updateItinerary(itin, {
       stops: start.stops,
-      itinerary: start.itinerary ?? { touchedSeq: null, dwell: null },
+      itinerary: start.itinerary ?? { touchedSeq: null, touchedAt: null, dwell: null },
       leaveCount: start.finalLeaveCount,
       progressM: start.progressM,
     }, { xy, at, speedKmh: p.speedKmh }, this.#t);

@@ -44,7 +44,10 @@ export interface Cache {
 }
 
 export function buildCache(rows: SnapshotRows): Cache {
-  // One plane per operator, around all its shapes and planned stops.
+  // One plane per operator, around all its shapes (an operator without
+  // shapes: around its live trips' planned stops). Planned stops do not move
+  // the plane of an operator with shapes: a far away game must not change
+  // how its scheduled trips are matched.
   const pointsByOperator = new Map<string, LonLat[]>();
   const addPoint = (operatorId: string, p: LonLat): void => {
     const list = pointsByOperator.get(operatorId) ?? [];
@@ -54,7 +57,9 @@ export function buildCache(rows: SnapshotRows): Cache {
   for (const s of rows.shapes) {
     for (const [lon, lat] of s.coordinates) addPoint(s.operatorId, { lon, lat });
   }
+  const withShapes = new Set(pointsByOperator.keys());
   for (const i of rows.instances) {
+    if (withShapes.has(i.operatorId)) continue;
     for (const p of i.plannedStops) addPoint(i.operatorId, { lon: p.lon, lat: p.lat });
   }
   const operators = new Map<string, Operator>();
@@ -130,7 +135,7 @@ function scheduledInstance(r: InstanceRow, op: Operator, patterns: ReadonlyMap<s
   return {
     id: r.id, operatorId: r.operatorId, serviceDate: r.serviceDate, kind: 'scheduled', tripId: r.tripId,
     routeId: pattern.routeId, pattern, itinerary: null, title: null, visibleUntil: null,
-    startAt, endAt: new Date(startAt.getTime() + lastOffset * 1000), timed: true,
+    startAt, endAt: new Date(startAt.getTime() + lastOffset * 1000), timedStart: true, timedEnd: true,
   };
 }
 
@@ -148,19 +153,20 @@ function liveInstance(r: InstanceRow, op: Operator, patterns: ReadonlyMap<string
     if (pattern === null) return null;
   }
   const itinerary = pattern === null && r.plannedStops.length > 0 ? buildItinerary(r, op) : null;
-  const times = r.plannedStops.flatMap((p) => [p.plannedArrival, p.plannedDeparture]).filter((d): d is Date => d !== null);
+  // The first stop's time opens the window, the last stop's closes it; a
+  // plan timed only in between (or not at all) uses the day instead.
+  const stops = itinerary?.stops ?? [];
+  const first = stops[0];
+  const last = stops[stops.length - 1];
+  const firstTime = first?.plannedDeparture ?? first?.plannedArrival ?? null;
+  const lastTime = last?.plannedArrival ?? last?.plannedDeparture ?? null;
   const dayStart = serviceDayStart(r.serviceDate, op.timezone);
-  const timed = itinerary !== null && times.length > 0;
-  const startAt = timed
-    ? new Date(Math.min(...times.map((d) => d.getTime())))
-    : new Date(Math.max(dayStart.getTime(), r.createdAt.getTime()));
-  const endAt = timed
-    ? new Date(Math.max(...times.map((d) => d.getTime())))
-    : serviceTime(r.serviceDate, 24 * 3600, op.timezone);
+  const startAt = firstTime ?? new Date(Math.max(dayStart.getTime(), r.createdAt.getTime()));
+  const endAt = lastTime ?? serviceTime(r.serviceDate, 24 * 3600, op.timezone);
   return {
     id: r.id, operatorId: r.operatorId, serviceDate: r.serviceDate, kind: 'live', tripId: null,
     routeId: pattern?.routeId ?? r.routeId, pattern, itinerary, title: r.title, visibleUntil: r.visibleUntil,
-    startAt, endAt, timed,
+    startAt, endAt, timedStart: firstTime !== null, timedEnd: lastTime !== null,
   };
 }
 
@@ -218,26 +224,36 @@ export function progressFromRow(row: InstanceRow, instance: TripInstance): TripP
         eta: e?.eta ?? null,
       };
     }),
-    itinerary: instance.itinerary === null ? null : { touchedSeq: null, dwell: null },
+    itinerary: instance.itinerary === null ? null : { touchedSeq: null, touchedAt: null, dwell: null },
   };
 }
 
 /**
- * After a reload of a running trip whose stops changed (staff edited a live
- * trip's planned stops): keeps the memory state of stops still planned,
- * takes the database's state for new ones and drops removed ones.
+ * After a reload of a trip whose stops changed (staff edited a live trip's
+ * planned stops): keeps the memory state of stops still planned at the same
+ * place, takes the database's state for new or moved ones and drops
+ * removed ones. A stop inserted before the one the bus has reached is
+ * closed by the matcher with the next arrival or departure (itinerary.ts).
  */
-export function alignStops(progress: TripProgress, row: InstanceRow, instance: TripInstance): TripProgress {
+export function alignStops(progress: TripProgress, row: InstanceRow, instance: TripInstance, before: TripInstance): TripProgress {
   const sequences = stopSequences(instance);
-  const same = sequences.length === progress.stops.length && sequences.every((q, i) => progress.stops[i]?.sequence === q);
+  const pointOf = (inst: TripInstance, q: number): XY | undefined => inst.itinerary?.stops.find((s) => s.sequence === q)?.point;
+  const moved = (q: number): boolean => {
+    const a = pointOf(before, q);
+    const b = pointOf(instance, q);
+    return a !== undefined && b !== undefined && distance(a, b) > 1;
+  };
+  const same = sequences.length === progress.stops.length && sequences.every((q, i) => progress.stops[i]?.sequence === q && !moved(q));
   if (same && (instance.itinerary === null) === (progress.itinerary === null)) return progress;
   const fromRow = progressFromRow(row, instance);
   const mem = new Map(progress.stops.map((s) => [s.sequence, s]));
-  const stops = fromRow.stops.map((s) => mem.get(s.sequence) ?? s);
-  const keep = (q: number | null | undefined): boolean => q !== null && q !== undefined && sequences.includes(q);
+  const stops = fromRow.stops.map((s) => (moved(s.sequence) ? s : mem.get(s.sequence) ?? s));
+  const keep = (q: number | null | undefined): q is number => q !== null && q !== undefined && sequences.includes(q) && !moved(q);
+  const it = progress.itinerary;
   const itinerary = instance.itinerary === null ? null : {
-    touchedSeq: keep(progress.itinerary?.touchedSeq) ? progress.itinerary?.touchedSeq ?? null : null,
-    dwell: keep(progress.itinerary?.dwell?.sequence) ? progress.itinerary?.dwell ?? null : null,
+    touchedSeq: keep(it?.touchedSeq) ? it.touchedSeq : null,
+    touchedAt: keep(it?.touchedSeq) ? it.touchedAt : null,
+    dwell: keep(it?.dwell?.sequence) ? it.dwell : null,
   };
   return { ...progress, stops, itinerary };
 }

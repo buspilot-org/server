@@ -27,20 +27,20 @@ import type { TripInstance, TripRuntime, Vehicle } from './types.ts';
  * is completed once the window has closed.
  * - Scheduled: tripWindowBeforeS before the scheduled start to
  *   tripWindowAfterS after the scheduled end.
- * - Live with planned times: the same around the first and last planned time.
- * - Live without planned times: from when it was saved (startAt) to the end
- *   of its service day plus tripWindowAfterS; a live trip on a pattern, once
- *   started, until its start plus the pattern's running time plus
- *   tripWindowAfterS.
+ * - Live: from tripWindowBeforeS before the first planned stop's time, or
+ *   without one from when it was saved (startAt); to tripWindowAfterS after
+ *   the last planned stop's time, or without one after the end of its
+ *   service day; a live trip on a pattern, once started, until its start
+ *   plus the pattern's running time plus tripWindowAfterS.
  * - Live: never after visible_until (riders no longer see the trip).
  */
 export function tripWindow(tr: TripRuntime, t: Thresholds): { from: Date; to: Date } {
   const i = tr.instance;
   if (i.kind === 'scheduled') return { from: addSeconds(i.startAt, -t.tripWindowBeforeS), to: addSeconds(i.endAt, t.tripWindowAfterS) };
-  const from = i.timed ? addSeconds(i.startAt, -t.tripWindowBeforeS) : i.startAt;
+  const from = i.timedStart ? addSeconds(i.startAt, -t.tripWindowBeforeS) : i.startAt;
   let to = addSeconds(i.endAt, t.tripWindowAfterS);
   const started = tr.progress.startedAt;
-  if (!i.timed && i.pattern !== null && started !== null) {
+  if (!i.timedEnd && i.pattern !== null && started !== null) {
     to = addSeconds(started, (i.pattern.stops[i.pattern.stops.length - 1]?.arrivalOffsetS ?? 0) + t.tripWindowAfterS);
   }
   if (i.visibleUntil !== null && i.visibleUntil < to) to = i.visibleUntil;

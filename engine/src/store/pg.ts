@@ -224,6 +224,11 @@ export class PgStore implements Store, AlertStore, LiveStore {
           select ti.operator_id, ti.id, ${e.sequence}, ${e.state}::public.stop_event_state,
                  ${e.arrivedAt}::timestamptz, ${e.departedAt}::timestamptz, ${e.passedAt}::timestamptz
             from public.trip_instance ti where ti.id = ${e.tripInstanceId} and ${runs(e.tripInstanceId)}
+             -- A trip without a pattern has stop events only for its planned
+             -- stops: none for a planned stop staff removed meanwhile.
+             and (ti.pattern_id is not null
+                  or exists (select 1 from public.trip_instance_stop tis
+                              where tis.trip_instance_id = ti.id and tis.stop_sequence = ${e.sequence}))
           on conflict (trip_instance_id, stop_sequence) do update set
             state = excluded.state,
             arrived_at = coalesce(public.stop_event.arrived_at, excluded.arrived_at),

@@ -44,7 +44,7 @@ class Run {
     this.pos = pos;
     this.state = {
       stops: itin.stops.map((s): StopProgress => ({ sequence: s.sequence, state: 'upcoming', arrivedAt: null, departedAt: null, passedAt: null, eta: null })),
-      itinerary: { touchedSeq: null, dwell: null },
+      itinerary: { touchedSeq: null, touchedAt: null, dwell: null },
       leaveCount: 0,
       progressM: 0,
     };
@@ -161,15 +161,78 @@ describe('itinerary: order-aware stops without a shape', () => {
     assert.equal(r.stateOf(3), 'upcoming');
   });
 
-  it('driving past the next stop without stopping: passed once the bus arrives at the stop after it', () => {
+  it('driving past the next stop without stopping: passed when the bus has left it, at the time it was there', () => {
     const A = { x: 0, y: 0 };
     const B = { x: 1000, y: 0 };
     const C = { x: 2000, y: 0 };
     const plan = itinerary([{ sequence: 1, at: A }, { sequence: 2, at: B }, { sequence: 3, at: C }]);
-    const r = new Run(plan, T0, A).stand(30).drive(C, 30);
-    assert.equal(r.stateOf(2), 'upcoming', 'not passed by time or distance alone');
-    r.stand(20);
+    const r = new Run(plan, T0, A).stand(30).drive({ x: 1000, y: 0 }, 30);
+    const atB = r.time;
+    assert.equal(r.stateOf(2), 'upcoming', 'not passed while the bus is there');
+    r.drive({ x: 1100, y: 0 }, 30);
+    assert.equal(r.stateOf(2), 'upcoming', 'not passed within itineraryLeaveM');
+    r.drive({ x: 1600, y: 0 }, 30);
+    assert.equal(r.stateOf(2), 'passed');
+    const passedAt = r.state.stops[1]?.passedAt?.getTime() ?? 0;
+    assert.ok(passedAt >= atB.getTime() && passedAt < atB.getTime() + 15_000, 'passed_at: when the bus was last near the stop');
+    r.drive(C, 30).stand(20);
     assert.deepEqual(r.log, ['1:arrived', '1:departed', '2:passed', '3:arrived']);
+  });
+
+  it('several stops driven past in a row, then standing at the next ones: each passed in turn, then arrived (no deadlock)', () => {
+    const plan = itinerary([0, 1, 2, 3, 4, 5].map((k) => ({ sequence: k + 1, at: { x: k * 1000, y: 0 } })));
+    const r = new Run(plan, T0, { x: 0, y: 0 });
+    r.fix({ x: 0, y: 0 }, 30).drive({ x: 3000, y: 0 }, 30).stand(600).drive({ x: 4000, y: 0 }, 30).stand(600).drive({ x: 5000, y: 0 }, 30).stand(600);
+    assert.deepEqual(r.log, ['1:passed', '2:passed', '3:passed', '4:arrived', '4:departed', '5:arrived', '5:departed', '6:arrived']);
+    assert.equal(Math.round(r.state.progressM), 5000);
+  });
+
+  it('stops closer together than itineraryLeaveM: driving past the first, the second takes over once the bus is nearer to it', () => {
+    const plan = itinerary([{ sequence: 1, at: { x: 0, y: 0 } }, { sequence: 2, at: { x: 1000, y: 0 } }, { sequence: 3, at: { x: 1100, y: 0 } }]);
+    const r = new Run(plan, T0, { x: 0, y: 0 }).stand(20).drive({ x: 1100, y: 0 }, 20).stand(20);
+    assert.deepEqual(r.log, ['1:arrived', '1:departed', '2:passed', '3:arrived']);
+  });
+
+  it('a stop staff insert before the stop the bus is at: no error; closed (passed) when the bus leaves', () => {
+    const plan = itinerary([{ sequence: 10, at: { x: 0, y: 0 } }, { sequence: 20, at: { x: 1000, y: 0 } }, { sequence: 30, at: { x: 2000, y: 0 } }]);
+    const r = new Run(plan, T0, { x: 0, y: 0 }).stand(20).drive({ x: 1000, y: 0 }, 30).stand(60);
+    assert.equal(r.stateOf(20), 'arrived');
+    // Stop 15 inserted between 10 and 20 (alignStops adds it as upcoming).
+    const withInsert = itinerary([
+      { sequence: 10, at: { x: 0, y: 0 } }, { sequence: 15, at: { x: 500, y: 300 } }, { sequence: 20, at: { x: 1000, y: 0 } }, { sequence: 30, at: { x: 2000, y: 0 } },
+    ]);
+    const [s10, s20, s30] = r.state.stops;
+    assert.ok(s10 && s20 && s30);
+    const r2 = new Run(withInsert, r.time, r.pos);
+    r2.state = { ...r.state, stops: [s10, { sequence: 15, state: 'upcoming', arrivedAt: null, departedAt: null, passedAt: null, eta: null }, s20, s30] };
+    r2.stand(600);
+    assert.equal(r2.stateOf(20), 'arrived');
+    assert.equal(r2.stateOf(15), 'upcoming');
+    r2.drive({ x: 2000, y: 0 }, 30).stand(20);
+    assert.deepEqual(r2.log, ['15:passed', '20:departed', '30:arrived']);
+  });
+
+  it('a pick-up planned at the drop-off place: arrived there once its planned time has come', () => {
+    const plan = itinerary([
+      { sequence: 1, at: HOTEL, dep: at(0) },
+      { sequence: 2, at: TEMPLE, arr: at(30), dep: at(30) }, // Drop-off.
+      { sequence: 3, at: { x: 3010, y: 0 }, arr: at(120) }, // Pick-up, 10 m away.
+      { sequence: 4, at: HOTEL, arr: at(150) },
+    ]);
+    const r = new Run(plan, at(-1), HOTEL).stand(30).drive(TEMPLE, 40).stand(60);
+    assert.equal(r.stateOf(2), 'arrived');
+    r.waitUntil(at(60)).stand(65 * 60, 20, 30);
+    assert.equal(r.stateOf(3), 'arrived');
+    assert.equal(r.stateOf(2), 'departed');
+    const pickUp = r.state.stops[2]?.arrivedAt?.getTime() ?? 0;
+    assert.ok(pickUp >= at(120).getTime() && pickUp < at(121).getTime());
+  });
+
+  it('a timed stop far ahead can be skipped to after a GPS gap (standing there, close to its planned time)', () => {
+    const plan = itinerary([0, 1, 2, 3, 4].map((k) => ({ sequence: k + 1, at: { x: k * 1000, y: k === 0 ? 0 : 800 }, arr: at(k * 10) })));
+    const r = new Run(plan, at(-1), { x: 0, y: 0 }).stand(20);
+    r.waitUntil(at(38)).fix({ x: 4000, y: 800 }, 0).stand(200);
+    assert.deepEqual(r.log, ['1:arrived', '1:departed', '2:passed', '3:passed', '4:passed', '5:arrived']);
   });
 
   it('skipping a stop the bus never came near: only after standing at the later one itinerarySkipDwellS', () => {
@@ -188,7 +251,7 @@ describe('itinerary: order-aware stops without a shape', () => {
   });
 
   it('a stop more than itinerarySkipStops after the next open stop is never skipped to', () => {
-    const p = (x: number): XY => ({ x, y: 1000 * (x % 2000 === 0 ? 1 : 0) });
+    const p = (x: number): XY => ({ x, y: 1000 }); // Off the road.
     const plan = itinerary([
       { sequence: 1, at: { x: 0, y: 0 } }, { sequence: 2, at: p(1000) }, { sequence: 3, at: p(2000) },
       { sequence: 4, at: p(3000) }, { sequence: 5, at: { x: 5000, y: 0 } },

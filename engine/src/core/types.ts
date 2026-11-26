@@ -94,17 +94,20 @@ export interface TripInstance {
   visibleUntil: Date | null;
   /**
    * Scheduled trips: the scheduled start. Live trips: when the trip may
-   * start: the first planned time if any (`timed`), else when it was saved
-   * (not before its service day).
+   * start: the first planned stop's time if it has one (`timedStart`), else
+   * when it was saved (not before its service day).
    */
   startAt: Date;
   /**
    * Scheduled trips: the scheduled arrival at the last stop. Live trips: the
-   * last planned time if any (`timed`), else the end of the service day.
+   * last planned stop's time if it has one (`timedEnd`), else the end of the
+   * service day.
    */
   endAt: Date;
-  /** Live trips: startAt/endAt come from planned times. */
-  timed: boolean;
+  /** Live trips: startAt is the first planned stop's time. */
+  timedStart: boolean;
+  /** Live trips: endAt is the last planned stop's time. */
+  timedEnd: boolean;
 }
 
 export interface StopProgress {
@@ -171,11 +174,10 @@ export interface TripProgress {
 
 /** Order-aware matching state of a trip that follows planned stops (no shape). */
 export interface ItineraryProgress {
-  /**
-   * The furthest stop (sequence) the bus has come near, counting only stops
-   * reached in plan order from the next open stop on; null: none.
-   */
+  /** The next stop (sequence) the bus has come near without stopping; null: none. */
   touchedSeq: number | null;
+  /** When the bus was last near that stop (its `passed_at` if it drives on). */
+  touchedAt: Date | null;
   /** The bus has been slow near this later stop since `since` (a skip being confirmed). */
   dwell: { sequence: number; since: Date } | null;
 }
