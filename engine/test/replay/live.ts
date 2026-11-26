@@ -88,6 +88,8 @@ export class MemoryLiveStore implements LiveStore {
   failNext = 0;
   /** Make every load fail (e.g. a missing migration). */
   failAlways = false;
+  /** Make loads that include this part fail (e.g. one broken query). */
+  failPart: LivePart | null = null;
   #notify: ((table: string) => void) | null = null;
 
   constructor(s: Scenario, extras: Partial<LiveExtras> = {}) {
@@ -104,7 +106,9 @@ export class MemoryLiveStore implements LiveStore {
   loadLiveSnapshot(parts: readonly LivePart[] = LIVE_PARTS): Promise<LiveSnapshot> {
     this.loads++;
     this.partsLoaded.push([...parts]);
-    if (this.failAlways) return Promise.reject(new Error('relation "public.route" has no column "slug"'));
+    if (this.failAlways || (this.failPart !== null && parts.includes(this.failPart))) {
+      return Promise.reject(new Error('relation "public.route" has no column "slug"'));
+    }
     if (this.failNext > 0) {
       this.failNext--;
       return Promise.reject(new Error('simulated database failure'));

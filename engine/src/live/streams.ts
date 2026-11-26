@@ -72,7 +72,8 @@ export class StreamRegistry {
   }
 
   /** Reserves a slot for a user (and client IP, if known), or null when a limit is reached (or the engine is shutting down). */
-  reserve(user: string, ip: string | null = null): { release(): void; register(s: Omit<Slot, 'user'>): void } | null {
+  reserve(user: string, clientIp: string | null = null): { release(): void; register(s: Omit<Slot, 'user'>): void } | null {
+    const ip = clientIp === null ? null : ipKey(clientIp);
     if (
       this.#closing || this.#open.size >= this.limits.maxTotal
       || (this.#perUser.get(user) ?? 0) >= this.limits.maxPerUser
@@ -117,6 +118,16 @@ export class StreamRegistry {
   }
 }
 
+/** IPv6 addresses count per /64 (one client usually has a whole /64); IPv4 as is. */
+export function ipKey(ip: string): string {
+  if (!ip.includes(':')) return ip;
+  const [head = '', tail = ''] = ip.toLowerCase().split('::');
+  const h = head === '' ? [] : head.split(':');
+  const t = tail === '' ? [] : tail.split(':');
+  const groups = [...h, ...Array<string>(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
+  return `${groups.slice(0, 4).map((g) => g.replace(/^0+(?=.)/, '')).join(':')}::/64`;
+}
+
 function decrement(m: Map<string, number>, key: string): void {
   const n = (m.get(key) ?? 1) - 1;
   if (n <= 0) m.delete(key);
@@ -128,6 +139,8 @@ export interface StreamSpec {
   event: string;
   /** Builds the current content; null = no longer visible. */
   build(): object | null;
+  /** False while the data may not be used (stale directory): checked with every heartbeat too. */
+  isLive?(): boolean;
   /** Why build() returned null (not_found: access lost or gone; unavailable; trip_ended). */
   goneReason?(): EndReason;
   /** Whether a change concerns this stream. */
@@ -257,7 +270,13 @@ export async function runStream(
   // Timers before the first write: finish() (abort, shutdown, slow client)
   // can run during it and must find them to clear them.
   timers.push(setInterval(() => {
-    if (!writing && !finished) void write(': ping\n\n');
+    if (finished) return;
+    // An idle stream (a parked bus) must end too when the data goes stale.
+    if (spec.isLive && !spec.isLive()) {
+      void finish('unavailable');
+      return;
+    }
+    if (!writing) void write(': ping\n\n');
   }, limits.heartbeatS * 1000));
   const untilExpiry = Math.min(spec.expiresAt - Date.now(), 2 ** 31 - 1);
   timers.push(setTimeout(() => { void finish('token_expired'); }, Math.max(0, untilExpiry)));

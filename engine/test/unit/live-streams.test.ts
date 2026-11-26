@@ -62,3 +62,13 @@ describe('live streams', () => {
     assert.equal(registry.size, 0);
   });
 });
+
+describe('per-IP keys', () => {
+  it('counts IPv6 per /64 and IPv4 per address', async () => {
+    const { ipKey } = await import('../../src/live/streams.ts');
+    assert.equal(ipKey('2001:db8:1:2:aaaa::1'), '2001:db8:1:2::/64');
+    assert.equal(ipKey('2001:DB8:1:2:bbbb:cccc:dddd:eeee'), '2001:db8:1:2::/64');
+    assert.equal(ipKey('2001:db8::1'), '2001:db8:0:0::/64');
+    assert.equal(ipKey('203.0.113.7'), '203.0.113.7');
+  });
+});

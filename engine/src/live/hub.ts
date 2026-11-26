@@ -10,7 +10,7 @@
  * at most every `minReloadIntervalMs`; everything is reloaded every
  * `LIVE_RELOAD_SECONDS` as a safety net.
  *
- * Fails closed: if access data could not be loaded for `maxAgeS` (Supabase
+ * Fails closed: if any part could not be loaded for `maxAgeS` (Supabase
  * outage, broken query), `fresh` turns false and member endpoints answer 503
  * rather than serve memberships that may have been revoked meanwhile.
  *
@@ -58,8 +58,8 @@ export class LiveHub implements TripObserver {
   #lastReloadStart = 0;
   #snapshot: LiveSnapshot | null = null;
   #dir: Directory | null = null;
-  /** When the access part was last loaded (clock time). */
-  #accessLoadedAt: Date | null = null;
+  /** When each part was last loaded (clock time at the start of the load: the data is as of then). */
+  readonly #partLoadedAt = new Map<LivePart, Date>();
   readonly #fixes = new Map<string, VehicleFix>();
   readonly #listeners = new Set<ChangeListener>();
   #reloading: Promise<void> | null = null;
@@ -84,12 +84,18 @@ export class LiveHub implements TripObserver {
     return this.#dir !== null;
   }
 
-  /** Age of the access data (s), or null before the first load. */
+  /**
+   * Age of the oldest part (s), or null before the first load. Every part
+   * feeds the access rules (route visibility, trip visibility, followed
+   * stops), so one part that keeps failing makes the whole directory stale.
+   */
   get ageS(): number | null {
-    return this.#accessLoadedAt === null ? null : Math.max(0, (this.#clock.now().getTime() - this.#accessLoadedAt.getTime()) / 1000);
+    if (this.#partLoadedAt.size < LIVE_PARTS.length) return null;
+    const oldest = Math.min(...[...this.#partLoadedAt.values()].map((d) => d.getTime()));
+    return Math.max(0, (this.#clock.now().getTime() - oldest) / 1000);
   }
 
-  /** Loaded, and the access data is recent enough to answer members. */
+  /** Loaded, and every part is recent enough to answer members. */
   get fresh(): boolean {
     const age = this.ageS;
     return age !== null && age <= this.#maxAgeS;
@@ -138,12 +144,13 @@ export class LiveHub implements TripObserver {
         const take = this.#snapshot === null ? [...LIVE_PARTS] : [...this.#queued];
         this.#queued.clear();
         this.#lastReloadStart = Date.now();
+        const startedAt = this.#clock.now();
         try {
           const loaded = await this.#store.loadLiveSnapshot(take);
           const merged = { ...(this.#snapshot ?? {}), ...loaded } as LiveSnapshot;
           this.#dir = new Directory(merged);
           this.#snapshot = merged;
-          if (take.includes('access')) this.#accessLoadedAt = this.#clock.now();
+          for (const p of take) this.#partLoadedAt.set(p, startedAt);
           this.metrics.reloads++;
           this.metrics.lastReloadAt = this.#clock.now().toISOString();
           this.#emit({ all: true });

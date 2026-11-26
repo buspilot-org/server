@@ -146,6 +146,8 @@ export const PART_OF_TABLE: Readonly<Record<string, LivePart>> = {
   operator: 'schedule', route: 'schedule', stop: 'schedule', trip_pattern: 'schedule', pattern_stop: 'schedule', trip: 'schedule',
   staff_role: 'access', driver_vehicle: 'access', membership: 'access', audience_route: 'access', trip_instance_audience: 'access',
   trip_instance: 'trips', trip_instance_stop: 'trips',
+  // Not notified by the current migration; mapped in case an older trigger exists.
+  subscription: 'follows', followed_stop_log: 'follows',
 };
 
 /** A loaded snapshot part: `loadedAt` plus the fields of the parts asked for. */

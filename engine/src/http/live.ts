@@ -168,8 +168,10 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
     const first = build(ctx, viewer);
     if (first === null) return notFound(c, NO_STORE);
     const claims = c.get('claims');
-    // Only from a trusted proxy's header (first address if it is a list).
-    const ip = deps.clientIpHeader ? c.req.header(deps.clientIpHeader)?.split(',')[0]?.trim() || null : null;
+    // Only from a trusted proxy's header. In a list (X-Forwarded-For) the
+    // client controls the left entries; the proxy appended the last one. A
+    // missing header counts under one shared key, so it cannot skip the limit.
+    const ip = deps.clientIpHeader ? c.req.header(deps.clientIpHeader)?.split(',').at(-1)?.trim() || 'unknown' : null;
     const slot = streams.reserve(claims.sub, ip);
     if (!slot) {
       c.header('Cache-Control', NO_STORE);
@@ -188,6 +190,7 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
             return now && hub.fresh ? build(now, viewer) : null;
           },
           relevant,
+          isLive: () => hub.fresh,
           goneReason: () => {
             const now = hub.context();
             if (!now || !hub.fresh) return 'unavailable';

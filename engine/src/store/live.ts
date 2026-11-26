@@ -168,6 +168,8 @@ const LOADERS: Record<LivePart, (tx: Tx) => Promise<Partial<LiveSnapshotPart>>> 
 /** Loads the given parts (default: all) in one repeatable-read transaction, so they are from the same moment. */
 export async function loadLiveSnapshot(sql: postgres.Sql, parts: readonly LivePart[] = LIVE_PARTS): Promise<LiveSnapshotPart> {
   return sql.begin('isolation level repeatable read read only', async (tx) => {
+    // A hung load must not block every later reload.
+    await tx`set local statement_timeout = '30s'`;
     const [clock] = await tx<{ now: Date }[]>`select now() as now`;
     const loaded = await Promise.all([...new Set(parts)].map((p) => LOADERS[p](tx)));
     return Object.assign({ loadedAt: clock?.now ?? new Date() }, ...loaded) as LiveSnapshotPart;

@@ -195,6 +195,23 @@ describe('live API: members polling a route', () => {
     assert.equal((await t.get(`/v1/live/routes/${ROUTE}`)).status, 200, 'back after a good reload');
   });
 
+  it('one part that keeps failing makes the directory stale, even if other parts reload', async () => {
+    const t = await setup({ maxAgeS: 300 });
+    t.s.clock.set(new Date(t.s.clock.now().getTime() + 400_000));
+    // Only memberships reloaded (notifications); the other parts are old.
+    await t.hub.reload(['access']);
+    assert.equal(t.hub.fresh, false);
+    assert.equal((await t.get(`/v1/live/routes/${ROUTE}`)).status, 503);
+    // A failing part is retried with every later reload, so it cannot be skipped.
+    t.live.failPart = 'follows';
+    await assert.rejects(t.hub.reload());
+    await assert.rejects(t.hub.reload(['access']));
+    assert.deepEqual(t.live.partsLoaded.at(-1), ['schedule', 'access', 'trips', 'follows']);
+    t.live.failPart = null;
+    await t.hub.reload([]);
+    assert.equal(t.hub.fresh, true);
+  });
+
   it('a notification reloads only the part of its table', async () => {
     const t = await setup();
     t.live.partsLoaded = [];
