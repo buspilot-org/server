@@ -4,7 +4,7 @@
  * fed through Engine.handlePosition exactly as the HTTP endpoint does.
  */
 import { AlertDispatcher, defaultAlertConfig, type AlertConfig } from '../../src/alerts/dispatcher.ts';
-import type { AlertStore, DeliveryClaim, PushMessage, PushSender, SendResult, Subscription } from '../../src/alerts/types.ts';
+import type { AlertStore, DeliveryClaim, PushMessage, PushSender, SendResult, Subscription, TripObserver } from '../../src/alerts/types.ts';
 import { defaultThresholds, type Thresholds } from '../../src/config.ts';
 import { Engine, type Clock, type PositionOutcome } from '../../src/core/engine.ts';
 import { serviceTime } from '../../src/core/time.ts';
@@ -20,7 +20,8 @@ export const VEHICLE = 'veh-1';
 export const DEVICE = '23273424';
 export const VEHICLE_2 = 'veh-2';
 export const DEVICE_2 = 'device-2';
-export const ROUTE = 'route-1';
+/** A UUID: the live API's member endpoints take UUIDs only. */
+export const ROUTE = '00000000-0000-4000-8000-0000000000a1';
 export const PATTERN = 'pattern-1';
 /** Origin of the test plane: Kobe. */
 export const ORIGIN = { lon: 135.19, lat: 34.69 };
@@ -59,6 +60,8 @@ export class MemoryStore implements Store, AlertStore {
   clearedTokens: string[] = [];
   failClaims = 0;
   vehicleState = new Map<string, NonNullable<Writes['vehicleState']>>();
+  /** Fix times of all vehicle_state writes, in order. */
+  vehicleStateWrites: Date[] = [];
   transitions: StopTransition[] = [];
   etaWrites = 0;
   persistCalls = 0;
@@ -91,6 +94,7 @@ export class MemoryStore implements Store, AlertStore {
       return row.vehicleId === v && (row.status === 'planned' || row.status === 'active');
     };
     if (w.vehicleState) {
+      this.vehicleStateWrites.push(w.vehicleState.recordedAt);
       const vs = w.vehicleState;
       const prev = this.vehicleState.get(vs.vehicleId);
       const tripInstanceId = vs.tripInstanceId !== null && runs(vs.tripInstanceId) ? vs.tripInstanceId : null;
@@ -276,6 +280,8 @@ export class Scenario {
   readonly sleeps: number[] = [];
   alerts: AlertDispatcher;
   engine: Engine;
+  /** More observers of the engine (e.g. the live hub); take effect at the next restart(). */
+  readonly observers: TripObserver[] = [];
   #positionId = 1000;
 
   private constructor(def: RouteDef, thresholds: Thresholds, alertConfig: Partial<AlertConfig>) {
@@ -341,7 +347,7 @@ export class Scenario {
   }
 
   #newEngine(): Engine {
-    return new Engine({ store: this.store, thresholds: this.thresholds, clock: this.clock, log: silentLogger, observer: this.alerts });
+    return new Engine({ store: this.store, thresholds: this.thresholds, clock: this.clock, log: silentLogger, observers: [this.alerts, ...this.observers] });
   }
 
   /** Simulates an engine restart: a new engine (and dispatcher) that only knows what is in the store. */

@@ -5,6 +5,7 @@
  *   is in the path because Traccar only sends `forward.header` with the
  *   global URL (engine.md, "Forwarding only Buspilot devices").
  * - `GET /healthz`
+ * - the live API (`/v1/live/…`, `/v1/public/…`, see live.ts)
  *
  * Answers: 2xx once a position is processed and written, or dropped on
  * purpose (unknown device, duplicate, invalid); 401 for a wrong secret; 400
@@ -19,6 +20,8 @@ import type { Engine } from '../core/engine.ts';
 import type { Logger } from '../log.ts';
 import { errorMessage } from '../log.ts';
 import { PayloadError, parseTraccarPosition, traccarDeviceId } from '../traccar.ts';
+import type { LiveDeps } from './live.ts';
+import { registerLiveRoutes } from './live.ts';
 
 /** Constant-time comparison (hashing first makes the lengths equal). */
 export function secretMatches(given: string, expected: string): boolean {
@@ -35,6 +38,8 @@ export interface AppDeps {
   checkDatabase?: () => Promise<void>;
   /** Alert counters for /healthz (absent when push is not configured). */
   alertMetrics?: () => AlertMetrics;
+  /** The live API (absent: no /v1/live and /v1/public routes). */
+  live?: LiveDeps;
 }
 
 /** Health counters only (no subscription count: not public). */
@@ -111,8 +116,20 @@ export function createApp(deps: AppDeps): Hono {
       },
       // null: no FCM service account configured, alerts are off.
       alerts: deps.alertMetrics ? alertCounters(deps.alertMetrics()) : null,
+      live: deps.live ? {
+        loaded: deps.live.hub.loaded,
+        fresh: deps.live.hub.fresh,
+        ageS: deps.live.hub.ageS === null ? null : Math.round(deps.live.hub.ageS),
+        listening: deps.live.hub.listening,
+        membersEnabled: deps.live.verifier !== null,
+        lastReloadAt: deps.live.hub.metrics.lastReloadAt,
+        reloadFailures: deps.live.hub.metrics.reloadFailures,
+        streams: deps.live.streams.size,
+      } : null,
     }, ok ? 200 : 503);
   });
+
+  if (deps.live) registerLiveRoutes(app, deps.live);
 
   app.notFound((c) => c.json({ error: 'not found' }, 404));
   app.onError((err, c) => {

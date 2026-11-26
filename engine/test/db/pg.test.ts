@@ -171,7 +171,9 @@ describe('PgStore and engine against the seeded database', () => {
     const [vs] = await sql<{ trip_instance_id: string | null; recorded_at: Date }[]>`
       select trip_instance_id, recorded_at from public.vehicle_state where vehicle_id = ${VEHICLE}`;
     assert.ok(vs);
-    assert.equal(vs.recorded_at.getTime(), fixes[fixes.length - 1]?.t.getTime());
+    // Throttled (vehicleStateIntervalS): at most 30 s behind the last fix.
+    const lastFix = fixes[fixes.length - 1]?.t.getTime() ?? 0;
+    assert.ok(vs.recorded_at.getTime() <= lastFix && lastFix - vs.recorded_at.getTime() <= 30_000, 'vehicle_state recent');
     assert.equal(vs.trip_instance_id, null, 'no active trip after the end');
   });
 

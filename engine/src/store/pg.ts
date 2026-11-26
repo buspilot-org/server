@@ -15,18 +15,22 @@
 import postgres from 'postgres';
 import type { AlertStore, DeliveryClaim, I18nText, Subscription } from '../alerts/types.ts';
 import type { StopState, TripStatus, Writes } from '../core/types.ts';
+import type { LivePart, LiveSnapshotPart, LiveStore } from '../live/types.ts';
+import { listenLiveChanges, loadLiveSnapshot } from './live.ts';
 import type { InstanceRow, PersistResult, SnapshotRows, Store } from './store.ts';
 
 type Sql = postgres.Sql;
 
-export class PgStore implements Store, AlertStore {
+export class PgStore implements Store, AlertStore, LiveStore {
   readonly sql: Sql;
 
   constructor(databaseUrl: string, options: { max?: number } = {}) {
     this.sql = postgres(databaseUrl, {
       max: options.max ?? 5,
       onnotice: () => undefined,
-      connection: { application_name: 'buspilot-engine' },
+      // UTC like Supabase's default: the live API's access rules use
+      // current_date in UTC (private.stop_access), as the snapshot query does.
+      connection: { application_name: 'buspilot-engine', TimeZone: 'UTC' },
     });
   }
 
@@ -36,6 +40,14 @@ export class PgStore implements Store, AlertStore {
 
   async close(): Promise<void> {
     await this.sql.end({ timeout: 5 });
+  }
+
+  loadLiveSnapshot(parts?: readonly LivePart[]): Promise<LiveSnapshotPart> {
+    return loadLiveSnapshot(this.sql, parts);
+  }
+
+  listenLiveChanges(onChange: (table: string) => void, onConnect: () => void): Promise<() => Promise<void>> {
+    return listenLiveChanges(this.sql, onChange, onConnect);
   }
 
   async loadSnapshot(now: Date): Promise<SnapshotRows> {

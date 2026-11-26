@@ -3,6 +3,7 @@
  * arrival-alerts.md, "Decisions (2026-11-26)").
  */
 import type { TripInstance, TripProgress, TripRuntime } from '../core/types.ts';
+import type { VehicleFix } from '../live/types.ts';
 
 /** `alert_kind` in the database: part of the exactly-once key. */
 export type AlertKind = 'approaching' | 'passed' | 'delayed' | 'cancelled';
@@ -63,6 +64,8 @@ export interface TripUpdate {
 export interface TripObserver {
   tripUpdated(u: TripUpdate): void;
   tripsReloaded(trips: Iterable<TripRuntime>): void;
+  /** A position of a Buspilot vehicle was processed (and its changes written). Optional. */
+  vehicleUpdated?(fix: VehicleFix): void;
 }
 
 export interface DeliveryClaim {

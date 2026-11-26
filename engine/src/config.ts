@@ -2,6 +2,8 @@ import type { AlertConfig } from './alerts/dispatcher.ts';
 import { defaultAlertConfig } from './alerts/dispatcher.ts';
 import type { ServiceAccount } from './alerts/fcm.ts';
 import { loadServiceAccount } from './alerts/fcm.ts';
+import type { StreamLimits } from './live/streams.ts';
+import { defaultStreamLimits } from './live/streams.ts';
 
 /**
  * Engine configuration. Thresholds come from internal/concept/engine.md and
@@ -76,6 +78,12 @@ export interface Thresholds {
 
   /** No position for longer than this during a trip → stale (s). */
   staleAfterS: number;
+  /**
+   * vehicle_state (for the admin console) is written at most this often per
+   * vehicle (s); at once when the trip, the off-route state or staleness
+   * changes. Riders get positions from the live API, not from Supabase.
+   */
+  vehicleStateIntervalS: number;
 
   /** ETA lower bound: the remaining distance at this speed (km/h). */
   etaMaxSpeedKmh: number;
@@ -114,6 +122,7 @@ export const defaultThresholds: Thresholds = {
   finalLeaveM: 50,
   finalLeaveFixes: 2,
   staleAfterS: 120,
+  vehicleStateIntervalS: 30,
   etaMaxSpeedKmh: 60,
   etaWriteThresholdS: 30,
   maxFutureFixS: 300,
@@ -133,6 +142,19 @@ export interface AppConfig {
   push: { serviceAccount: ServiceAccount; projectId: string; targetField: 'fid' | 'token' } | null;
   alerts: AlertConfig;
   subscriptionReloadS: number;
+  live: {
+    /** Supabase project URL for the signing keys (JWKS); null: member endpoints are off (503). */
+    supabaseUrl: string | null;
+    /** Expected `iss` of access tokens; default `<supabaseUrl>/auth/v1`. */
+    jwtIssuer: string | null;
+    /** Safety-net reload of the live directory (s); changes are also picked up by LISTEN. */
+    reloadS: number;
+    /** Members get 503 when access data could not be reloaded for this long (s). */
+    maxAgeS: number;
+    /** Header with the client IP set by a trusted proxy (e.g. CF-Connecting-IP); null: no per-IP stream limit. */
+    clientIpHeader: string | null;
+    streams: StreamLimits;
+  };
 }
 
 const MIN_SECRET_LENGTH = 32;
@@ -143,6 +165,13 @@ function int(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
   return value;
+}
+
+function clientIpHeader(env: NodeJS.ProcessEnv): string | null {
+  const h = (env.LIVE_CLIENT_IP_HEADER ?? '').trim();
+  if (h === '') return null;
+  if (!/^[A-Za-z0-9-]+$/.test(h)) throw new Error('LIVE_CLIENT_IP_HEADER must be a header name, e.g. CF-Connecting-IP');
+  return h.toLowerCase();
 }
 
 /** Reads the configuration from the environment. Throws on missing or invalid values. */
@@ -160,7 +189,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (logLevel !== 'debug' && logLevel !== 'info' && logLevel !== 'warn' && logLevel !== 'error') {
     throw new Error('LOG_LEVEL must be debug, info, warn or error');
   }
-  const thresholds = { ...defaultThresholds };
+  const thresholds = { ...defaultThresholds, vehicleStateIntervalS: int(env, 'VEHICLE_STATE_INTERVAL_SECONDS', defaultThresholds.vehicleStateIntervalS) };
+  const supabaseUrl = (env.SUPABASE_URL ?? '').replace(/\/+$/, '') || null;
+  if (supabaseUrl !== null && !/^https?:\/\/[^/\s]+$/.test(supabaseUrl)) throw new Error('SUPABASE_URL must be the project URL, e.g. https://<ref>.supabase.co');
   const serviceAccount = loadServiceAccount(env);
   const target = env.FCM_TARGET ?? 'fid';
   if (target !== 'fid' && target !== 'token') throw new Error('FCM_TARGET must be fid or token');
@@ -184,5 +215,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     },
     alerts: { ...defaultAlertConfig, staleAfterS: thresholds.staleAfterS, delayThresholdS: delayMinutes * 60 },
     subscriptionReloadS: int(env, 'SUBSCRIPTION_RELOAD_SECONDS', 60),
+    live: {
+      supabaseUrl,
+      jwtIssuer: env.SUPABASE_JWT_ISSUER || null,
+      reloadS: int(env, 'LIVE_RELOAD_SECONDS', 60),
+      maxAgeS: int(env, 'LIVE_MAX_AGE_SECONDS', 300),
+      clientIpHeader: clientIpHeader(env),
+      streams: {
+        ...defaultStreamLimits,
+        maxTotal: int(env, 'LIVE_STREAMS_MAX', defaultStreamLimits.maxTotal),
+        maxPerUser: int(env, 'LIVE_STREAMS_PER_USER', defaultStreamLimits.maxPerUser),
+        maxPerIp: int(env, 'LIVE_STREAMS_PER_IP', defaultStreamLimits.maxPerIp),
+        heartbeatS: int(env, 'LIVE_HEARTBEAT_SECONDS', defaultStreamLimits.heartbeatS),
+      },
+    },
   };
 }

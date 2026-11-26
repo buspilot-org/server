@@ -21,7 +21,7 @@ docker run --env-file .env -p 8080:8080 buspilot-engine
 
 | Variable | Default | |
 |---|---|---|
-| `DATABASE_URL` | – | Direct Postgres connection with a role that bypasses RLS (as the service role does). Local: `postgres://postgres:postgres@127.0.0.1:55322/postgres` |
+| `DATABASE_URL` | – | Direct Postgres connection, or Supavisor in session mode; **not** transaction mode (port 6543), where `LISTEN` silently receives nothing. A role that bypasses RLS (as the service role does). The engine sets its session time zone to UTC (like Supabase), which the live API's access rules rely on (`current_date`). Local: `postgres://postgres:postgres@127.0.0.1:55322/postgres` |
 | `TRACCAR_FORWARD_SECRET` | – | At least 32 URL-safe characters (`openssl rand -hex 32`) |
 | `PORT`, `HOST` | `8080`, `0.0.0.0` | |
 | `CACHE_RELOAD_SECONDS` | `300` | Safety-net reload of vehicles, shapes, patterns and trip instances |
@@ -34,6 +34,15 @@ docker run --env-file .env -p 8080:8080 buspilot-engine
 | `FCM_TARGET` | `fid` | What `device.push_token` holds: `fid` (Firebase Installation ID, as the rider app registers it) or `token` (legacy registration token) |
 | `ALERT_DELAY_MINUTES` | `10` | "Running late" alert threshold; `0` turns it off |
 | `SUBSCRIPTION_RELOAD_SECONDS` | `60` | Reload of subscriptions, push targets and access |
+| `SUPABASE_URL` | – | Project URL (local: `http://127.0.0.1:55321`). The live API reads the signing keys from `<SUPABASE_URL>/auth/v1/.well-known/jwks.json` to verify members' access tokens. Without it, `/v1/live/…` answers `503`; the public endpoints work |
+| `SUPABASE_JWT_ISSUER` | `<SUPABASE_URL>/auth/v1` | Expected `iss` of access tokens, if the engine reaches Supabase under another URL than the apps do |
+| `LIVE_RELOAD_SECONDS` | `60` | Full reload of the live API's names, trips and access (changes come in sooner through `LISTEN buspilot_live`, per table) |
+| `LIVE_MAX_AGE_SECONDS` | `300` | If access data could not be reloaded for this long, member endpoints answer `503` (fail closed: a revoked membership must not keep working); public endpoints stay up |
+| `LIVE_STREAMS_MAX`, `LIVE_STREAMS_PER_USER` | `2000`, `4` | Open Server-Sent Event streams in all and per user; more answer `429` |
+| `LIVE_CLIENT_IP_HEADER` | – | Header with the client IP set by the proxy in front of the engine, e.g. `CF-Connecting-IP` behind Cloudflare. Only set it if every request comes through that proxy (otherwise clients can forge it). Enables the per-IP stream limit |
+| `LIVE_STREAMS_PER_IP` | `20` | Open streams per client IP (only with `LIVE_CLIENT_IP_HEADER`). Anonymous accounts cost nothing, so the per-user limit alone does not keep one client from taking every slot |
+| `LIVE_HEARTBEAT_SECONDS` | `20` | Comment line on open streams |
+| `VEHICLE_STATE_INTERVAL_SECONDS` | `30` | `vehicle_state` (admin console) is written at most this often per vehicle |
 
 Matching thresholds (distances, windows, speeds) are in `src/config.ts` (`defaultThresholds`) with a comment for each; they are global for now.
 
@@ -48,7 +57,8 @@ Matching thresholds (distances, windows, speeds) are in `src/config.ts` (`defaul
 | | |
 |---|---|
 | `POST /v1/traccar/positions/:secret` | Traccar JSON position forwarding (`PositionData`: `{position, device}`). `200` processed / duplicate / invalid, `202` device is not a Buspilot vehicle (dropped), `400` malformed, `401` wrong secret, `503` not ready or the database write failed (Traccar retries) |
-| `GET /healthz` | `200 {"status": "ok", …}` or `503 {"status": "degraded", …}` with database reachability, stale trips and counters about Buspilot vehicles (nothing about other devices on the Traccar server), and alert counters (`alerts`: sent, failed, expired, push tokens cleared; `null` when push is off) |
+| `GET /healthz` | `200 {"status": "ok", …}` or `503 {"status": "degraded", …}` with database reachability, stale trips and counters about Buspilot vehicles (nothing about other devices on the Traccar server), alert counters (`alerts`: sent, failed, expired, push tokens cleared; `null` when push is off) and the live API (`live`: loaded, fresh, age of the access data in seconds, LISTEN active, members enabled, last reload, reload failures, open streams) |
+| `GET /v1/live/…`, `GET /v1/public/…` | Live API for the rider app and public pages, see [Live API](#live-api) |
 
 ## Traccar setup
 
@@ -65,7 +75,7 @@ The secret is part of the URL path: make sure a reverse proxy, tunnel or load ba
 ## How a position is processed
 
 1. **Accept or drop**: unknown device → `202`, counted, nothing else. Positions of one vehicle are processed one at a time, in order.
-2. **Deduplicate**: same Traccar position ID, or a fix time not newer than the last one (also after a restart: `vehicle_state.recorded_at`). Invalid fixes and fixes far in the future are dropped.
+2. **Deduplicate**: same Traccar position ID, or a fix time not newer than the last one (also after a restart: `vehicle_state.recorded_at` or the active trip's `progress_at`, whichever is newer). Invalid fixes and fixes far in the future are dropped.
 3. **Trip assigner**: the vehicle's active trip instance, or a planned one whose window is open (scheduled start − 15 min … scheduled end + 30 min) for this vehicle: `trip_instance.vehicle_id` if staff set one for the day, else the trip's default `trip.vehicle_id`, else any vehicle of the operator. A trip starts when the bus moves in route direction on the first kilometre of the route (two fixes, at least 30 m, currently moving). A bus parked at the first stop does not start a trip (holidays); once it pulls away, the first stop counts as arrived (at the time the bus was first seen standing there inside the trip window). If several trips could start, the one whose schedule fits the position best wins. **No trip → no stop events.** A cancellation, a driver start or a vehicle change made in the database is picked up at the next cache reload.
 4. **Route matcher**: shapes are projected once to metres (a local plane per operator; distances scaled to the PostGIS geodesic length). Each fix is matched only inside a window from progress − 30 m to + 1.5 km (more after a gap); progress only increases. Where the route passes the same place twice:
    - passes are told apart geometrically: two points of the route belong to the same pass only if the route between them is no longer than the way through the fix (plus 10 m), so the two sides of a tight turn are two passes;
@@ -80,8 +90,9 @@ The secret is part of the URL path: make sure a reverse proxy, tunnel or load ba
    More than 100 m from the route for more than 60 s → off route: progress kept, ETAs held, three fixes on the route to come back. Between 50 m and 100 m from the route the engine holds (neither on route nor off route).
 5. **Stop state machine**: `arrived` within 30 m of the stop along the route and below 5 km/h (the nearest stop only); `departed` when the bus is beyond the stop + 20 m; `passed` beyond the stop + 50 m without having arrived. Arriving at a stop closes all earlier stops. The final stop is departed when the bus is 50 m away from it for two fixes. States only move forward; when all stops are final, the trip is completed. `approaching` is per subscriber and left to the alert dispatcher.
 6. **ETA v1**: scheduled arrival + current delay (delay at the current progress, interpolated between stops), never earlier than the remaining distance at 60 km/h. While the bus stands at a stop, waiting until the scheduled departure is no delay, and an early bus does not make ETAs early. Written when an ETA moves by 30 s or more.
-7. **Persist** trip progress, stop events, ETAs and the vehicle state in one transaction. Writes are idempotent and forward-only, so a retried position or a replay changes nothing. The in-memory state is only updated after the write succeeded; a failed write answers `503` and Traccar retries.
+7. **Persist** trip progress, stop events, ETAs and the vehicle state in one transaction. The vehicle state (for the admin console) only every 30 s per vehicle, and at once when the trip starts or ends, the bus goes off route or comes back, after more than 2 minutes without a position, and with every stop event; riders get positions from the live API, not from Supabase. A position that changes nothing else is not written at all. Writes are idempotent and forward-only, so a retried position or a replay changes nothing. The in-memory state is only updated after the write succeeded; a failed write answers `503` and Traccar retries.
 8. **Alerts** (below) are evaluated on the written state, in the background: they never delay or fail a position.
+9. **Live API** (below): the state just written and the position are published to open streams.
 
 On start (and every few minutes) the engine loads vehicles, shapes, patterns and the planned/active trip instances around today. A restarted engine continues active trips from the database.
 
@@ -162,6 +173,106 @@ One FCM HTTP v1 message per alert, addressed with `message.fid` (`FCM_TARGET=tok
 5. Ignore unknown `kind` values and `v` other than `1` (later additions).
 6. iOS later: APNs key in Firebase, `apns` block is already sent.
 
+## Live API
+
+Live positions and ETAs for the rider app and the public web pages, served by the engine from memory (engine.md, "Live API"): no Supabase Realtime connection and no database read per viewer, and not Traccar (no trips, no visibility rules, and its share links expose position history). Code in `src/live/` and `src/http/live.ts`.
+
+### Endpoints
+
+| Endpoint | Who | Returns |
+|---|---|---|
+| `GET /v1/live/routes/:routeId` | Members | The route with today's trips (operator time zone) and active ones: status, stops with state and ETA, the bus position where allowed |
+| `GET /v1/live/routes/:routeId/stream` | Members | The same as Server-Sent Events while the route or map screen is open |
+| `GET /v1/live/trips/:tripInstanceId` | Members | One of today's, an active or a future trip, e.g. a live trip without a route (a tour) for its audiences; older trips answer `404` (no history) |
+| `GET /v1/live/trips/:tripInstanceId/stream` | Members | The same as Server-Sent Events |
+| `GET /v1/live/stops/:stopId` | Members | Today's arrivals at a stop (home cards): the latest served visits and what comes next, at most 50 |
+| `GET /v1/public/routes/:operatorSlug/:routeSlug` | Anyone | A `public` route (`buspilot.org/r/<operator>/<route>`) |
+| `GET /v1/public/stops/:operatorSlug/:stopSlug` | Anyone | A stop of `public` routes (`buspilot.org/s/<operator>/<stop>`); only arrivals of public routes |
+
+**Members** send the Supabase access token of the signed-in session (anonymous rider device or staff) as `Authorization: Bearer <access_token>`. The engine verifies it with the project's signing keys (JWKS, cached; ES256/RS256/EdDSA, not the legacy HS256 secret) and needs `role = authenticated`. Refresh the session as `supabase_flutter` does and send the current token; an expired one answers `401`. Never put the token in the URL.
+
+**Who sees what** is decided exactly as the database's row-level security decides it (`private.route_access`, `private.trip_instance_access`, `private.stop_access`, `public.stop_location`; a parity test checks this against Postgres):
+
+- A route a user may not see, an unknown ID and a malformed ID all answer `404` (never `403`), so a private route's existence is not revealed. Public endpoints only know `public`, active routes.
+- **Arrival-time-only** viewers (`access: "eta"`) get stop states and ETAs, never the bus position, and stop locations only for the first two stops they follow per operator (the mini map), like `stop_location`.
+- **Map** viewers (`access: "map"`: public routes, `invited_map` with `can_see_map`, a live trip's audience with map, staff) get the bus position only while the trip is active, the bus is on route and its position is fresh (less than 2 minutes old), and stop locations.
+- Live trips are visible to their audiences (`trip_instance_audience`) and, if they have a route, to the route's audiences; after `visible_until` to nobody.
+- Membership, audience, staff, schedule and trip changes apply within about two seconds: the database notifies the engine on channel `buspilot_live` with the table name, and the engine reloads only that part (at most every 2 s). Everything is reloaded every `LIVE_RELOAD_SECONDS`; subscriptions (which followed stops get a mini-map location) only then, as they change often. An open stream whose viewer loses access ends with `not_found`.
+- If the engine cannot reload access data for `LIVE_MAX_AGE_SECONDS` (database unreachable), member endpoints answer `503` and open streams end with `unavailable`; public endpoints keep working. The live API loads on its own after start: until then (or if its snapshot fails, e.g. before the migration is applied) it answers `503` while positions, trips and alerts work as usual.
+- A live trip reached only through its own audiences, on a pattern of a route the viewer cannot see, comes with `"stop": null` for every stop (as RLS hides that pattern's stops), and the stop endpoint does not list it.
+- A stop the viewer may not see as a row under RLS (e.g. a live trip's own audience on a pattern of a route they are not a member of) comes as `"stop": null`: its times and state, but no name, ID or location.
+- Never history: only the current state, today's stop times, and the latest position.
+
+### Response (format `v: 1`)
+
+```jsonc
+{
+  "v": 1,
+  "generatedAt": "2026-11-27T22:34:10.000Z",
+  "operator": { "id": "…", "slug": "demo-kobe", "name": { "ja": "北野デモ国際学校", "en": "…" } },
+  "route": { "id": "…", "slug": "morning-a", "name": { "ja": "朝便A", "en": "Morning route A" }, "shortName": "A", "color": "1E6FD9", "textColor": "FFFFFF" },
+  "access": "eta",                        // "eta" or "map": what this viewer may see on the route
+  "trips": [{
+    "id": "…", "kind": "scheduled",       // or "live"
+    "status": "active",                   // planned | active | completed | cancelled
+    "serviceDate": "2026-11-28", "routeId": "…", "access": "eta",
+    "headsign": { "ja": "学校", "en": "School" },   // live trips: their title
+    "scheduledStart": "2026-11-27T22:30:00.000Z", "scheduledEnd": "2026-11-27T22:55:00.000Z",
+    "startedAt": "2026-11-27T22:31:05.000Z", "endedAt": null,
+    "tracked": true,      // the engine follows this trip; false: planned times and stored states only (live trips for now)
+    "stale": false,       // active, but no position for more than 2 min: ETAs uncertain ("position unknown since lastSeenAt")
+    "lastSeenAt": "2026-11-27T22:34:05.000Z",
+    "offRoute": false,    // active and off route: ETAs held, no position
+    "delayS": 120,        // ETA − scheduled arrival at the next stop
+    "vehicle": null,      // map level only: { "lon", "lat", "heading", "speedKmh", "accuracyM", "recordedAt" }
+    "stops": [{
+      "sequence": 2,
+      "stop": { "id": "…", "slug": "kitano-zaka", "name": { "ja": "北野坂", "en": "Kitano-zaka" }, "location": null },  // [lon, lat] where allowed
+      "state": "upcoming",                // upcoming | approaching | arrived | departed | passed
+      "scheduledArrival": "2026-11-27T22:35:00.000Z", "scheduledDeparture": "2026-11-27T22:35:30.000Z",
+      "eta": "2026-11-27T22:37:00.000Z",  // only while the bus has not reached the stop and the trip is active
+      "arrivedAt": null, "departedAt": null, "passedAt": null
+    }]
+  }]
+}
+```
+
+`/v1/live/trips/:id` returns `{ v, generatedAt, operator, route, trip }` (`route` is `null` when the viewer may not see the route, e.g. a tour's audience). Stop endpoints return `{ v, generatedAt, operator, stop, routes, arrivals }`; each arrival has the trip ID, kind, trip status, route ID, headsign, `sequence` (a loop visits a stop twice), state, scheduled and expected times, `tracked`, `stale`, `offRoute` and `delayS`. Translatable texts are objects keyed by language, as in the database. Ignore fields you do not know; a breaking change raises `v`.
+
+### Polling, caching and streams
+
+- **Members' polling** (home cards, route screen without map): `Cache-Control: private, max-age=5`, `Vary: Authorization`, an `ETag` that ignores `generatedAt` (send `If-None-Match`: `304` while nothing changed). Every 10–30 s while visible is plenty.
+- **Public pages** poll every ~10 s while visible (pause in background tabs). Responses are `Cache-Control: public, max-age=5, s-maxage=5` for Cloudflare, so thousands of visitors cost a few engine computations per minute; `404` is cached for 30 s. CORS is open (`*`, no cookies). Public pages need no Supabase call for live data; timetable, stops and shapes come from Supabase (anon key, RLS) and can be cached longer.
+- **Streams** (`…/stream`, members, while the map or route screen is open; close them when it is not): `text/event-stream`, first `retry: 5000`, then an `event: route` (or `trip`) with the same JSON as polling, again whenever it changes (at most once a second, only real changes), and `: ping` every 20 s. A stream ends with `event: end` and `data: {"reason": …}`:
+  - `token_expired`: at the access token's expiry; reconnect with the refreshed token;
+  - `not_found`: access lost or the route is gone; stop streaming;
+  - `trip_ended` (trip streams): the trip is over and no longer today's; stop streaming;
+  - `unavailable`: the engine cannot read the database for too long; reconnect later (with backoff);
+  - `shutdown`: the engine restarts; reconnect after the `retry` delay.
+
+  At most 4 streams per user, 20 per client IP (behind a configured proxy) and 2000 in all (`429` with `Retry-After`). A client that does not read for 30 s is disconnected. EventSource in browsers cannot send headers: web clients use `fetch` streaming (or poll). The rider app (`http` package or `dio` with a streamed response) sends the header.
+- `503` with `Retry-After` while the engine starts (or `SUPABASE_URL` is not set, for member endpoints).
+
+Example (rider app, Dart, simplified):
+
+```dart
+final token = Supabase.instance.client.auth.currentSession!.accessToken;
+final res = await http.get(
+  Uri.parse('$engineUrl/v1/live/routes/$routeId'),
+  headers: {'Authorization': 'Bearer $token'},
+);
+if (res.statusCode == 404) { /* not (or no longer) visible */ }
+final route = jsonDecode(res.body) as Map<String, dynamic>;
+```
+
+Public page (Nuxt, server or browser):
+
+```ts
+const route = await $fetch(`${engineUrl}/v1/public/routes/${operatorSlug}/${routeSlug}`);
+```
+
+Route and stop slugs are `route.slug` and `stop.slug` (unique per operator, optional; migration `20261127100000_live_api.sql`); a route or stop without a slug has no public page.
+
 ## Tests
 
 ```bash
@@ -173,8 +284,11 @@ npm run test:db   # integration test against the local Supabase database
 - `test/unit/`: also the alert due logic (every rule above), push texts, the FCM sender (OAuth JWT, error mapping) and dispatcher retries.
 - `test/replay/alerts.test.ts`: alerts on replayed trips: minutes and stops before, mute, passed without stopping, a GPS gap (stop passed meanwhile; three stops passed in one update), missed approaching → "at your stop", stale positions, off route held and released, the German School loop, a stop served twice, restart and retried positions, a failed claim, the next day, delayed, cancelled, send retries, invalid tokens.
 - `test/replay/` (scenarios): synthetic tracks with a fake clock and an in-memory store: the German School loop (passing near stop N+2 before N+1, also standing with GPS pulled onto the later pass), a stop served twice on a loop (with and without `dist_along_shape`), a skipped stop, excursions outside any trip, a bus parked at the first stop, GPS jumps, detours off the route, a tracker reporting every minute, two trips of the same pattern back to back, two vehicles on a trip any vehicle may run, cancellation and vehicle reassignment in the database, an engine restart mid-trip, a failed database write, and ETAs.
+- `test/unit/live-*.test.ts`: access token verification (JWKS, rotation, outage, rejected algorithms and claims), the access rules case by case, and the serialisation (scheduled times, delay, positions only from the linked trip, followed-stop locations, the stop window).
+- `test/replay/live-api.test.ts`: the live API over HTTP on replayed trips: arrival-time and map members, stale and off route, the trip end, public routes and stops, 401/404, a revoked membership, a failed reload, failing closed after `LIVE_MAX_AGE_SECONDS`, per-table reloads, starting while the live snapshot fails, a loop's stop visited twice, a live trip with planned stops; Server-Sent Events (updates, heartbeat, per-user, per-IP and total limits, access lost, shutdown, token expiry, early abort); the `vehicle_state` throttle. `test/unit/live-streams.test.ts`: clients that stop reading are dropped.
+- `test/db/live-parity.test.ts`: for the seed and a fixture operator (all visibilities, live trips with audiences and planned stops or on a pattern, members, staff, drivers, a revoked membership, followed and released stops), every viewer's route, trip and stop level and stop location equals what RLS returns for the same user, and trip views name a pattern's stops exactly when RLS shows that pattern's stops.
 - `test/db/`: the seed's loop against the real database: trip instance creation, projection compared with PostGIS, a full trip with a restart, idempotent writes; alert subscriptions with access as RLS decides it, and exactly-once claims with two engines on two connections at the same time.
 
 ## Not yet
 
-Alerts for live trips (subscriptions with `trip_instance_id`), alerts to staff, departure reminders, per-operator alert thresholds, the vehicle events endpoint, Realtime broadcast, backfill from Traccar's REST API after downtime, the Supabase outage journal, driver overrides (`trip_start` / `trip_end`), national holidays in calendars (`skip_national_holidays`), per-operator thresholds.
+Following live trips (positions, stop states and ETAs for `kind = 'live'` trips; the live API shows their plan and stored states until then), alerts for live trips (subscriptions with `trip_instance_id`), alerts to staff, departure reminders, per-operator alert thresholds, the vehicle events endpoint, Realtime broadcast, backfill from Traccar's REST API after downtime, the Supabase outage journal, driver overrides (`trip_start` / `trip_end`), national holidays in calendars (`skip_national_holidays`), per-operator thresholds.

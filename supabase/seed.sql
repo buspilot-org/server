@@ -31,21 +31,21 @@ values (
 );
 
 -- Stops. Kitano-zaka is served twice by the loop (stop_sequence 2 and 5).
-insert into public.stop (id, operator_id, gtfs_id, name, location) values
-  ('d0000000-0000-4000-8000-000000000201', 'd0000000-0000-4000-8000-000000000001', 'shin-kobe',
+insert into public.stop (id, operator_id, gtfs_id, slug, name, location) values
+  ('d0000000-0000-4000-8000-000000000201', 'd0000000-0000-4000-8000-000000000001', 'shin-kobe', 'shin-kobe',
    '{"en": "Shin-Kobe Station", "ja": "新神戸駅"}', 'SRID=4326;POINT(135.1953 34.7067)'),
-  ('d0000000-0000-4000-8000-000000000202', 'd0000000-0000-4000-8000-000000000001', 'kitano-zaka',
+  ('d0000000-0000-4000-8000-000000000202', 'd0000000-0000-4000-8000-000000000001', 'kitano-zaka', 'kitano-zaka',
    '{"en": "Kitano-zaka", "ja": "北野坂"}', 'SRID=4326;POINT(135.1915 34.6995)'),
-  ('d0000000-0000-4000-8000-000000000203', 'd0000000-0000-4000-8000-000000000001', 'sannomiya',
+  ('d0000000-0000-4000-8000-000000000203', 'd0000000-0000-4000-8000-000000000001', 'sannomiya', 'sannomiya',
    '{"en": "Sannomiya", "ja": "三宮"}', 'SRID=4326;POINT(135.1956 34.6947)'),
-  ('d0000000-0000-4000-8000-000000000204', 'd0000000-0000-4000-8000-000000000001', 'motomachi',
+  ('d0000000-0000-4000-8000-000000000204', 'd0000000-0000-4000-8000-000000000001', 'motomachi', 'motomachi',
    '{"en": "Motomachi", "ja": "元町"}', 'SRID=4326;POINT(135.1866 34.6897)'),
-  ('d0000000-0000-4000-8000-000000000205', 'd0000000-0000-4000-8000-000000000001', 'school',
+  ('d0000000-0000-4000-8000-000000000205', 'd0000000-0000-4000-8000-000000000001', 'school', 'school',
    '{"en": "School", "ja": "学校"}', 'SRID=4326;POINT(135.1880 34.7020)');
 
-insert into public.route (id, operator_id, gtfs_id, name, short_name, color, text_color)
+insert into public.route (id, operator_id, gtfs_id, slug, name, short_name, color, text_color)
 values (
-  'd0000000-0000-4000-8000-000000000101', 'd0000000-0000-4000-8000-000000000001', 'morning-a',
+  'd0000000-0000-4000-8000-000000000101', 'd0000000-0000-4000-8000-000000000001', 'morning-a', 'morning-a',
   '{"en": "Morning route A", "ja": "朝便A"}', 'A', '1E6FD9', 'FFFFFF'
 );
 

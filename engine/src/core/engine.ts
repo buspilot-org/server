@@ -73,7 +73,7 @@ export class Engine {
   readonly #t: Thresholds;
   readonly #clock: Clock;
   readonly #log: Logger;
-  readonly #observer: TripObserver | null;
+  readonly #observers: TripObserver[];
   #cache: Cache | null = null;
   readonly #trips = new Map<string, TripRuntime>();
   readonly #lastFix = new Map<string, LastFix>();
@@ -82,6 +82,8 @@ export class Engine {
   readonly #queues = new Map<string, Promise<unknown>>();
   /** Trip starts the database refused (another vehicle runs the trip), per vehicle and trip, until the next reload. */
   readonly #refused = new Set<string>();
+  /** The last vehicle_state written per vehicle (throttling). */
+  readonly #stateWritten = new Map<string, { at: Date; tripInstanceId: string | null; offRoute: boolean }>();
   readonly metrics: EngineMetrics = {
     positionsProcessed: 0,
     positionsUnknownDevice: 0,
@@ -93,9 +95,9 @@ export class Engine {
     lastReloadAt: null,
   };
 
-  constructor(opts: { store: Store; thresholds: Thresholds; clock?: Clock; log: Logger; observer?: TripObserver }) {
+  constructor(opts: { store: Store; thresholds: Thresholds; clock?: Clock; log: Logger; observer?: TripObserver; observers?: TripObserver[] }) {
     this.#store = opts.store;
-    this.#observer = opts.observer ?? null;
+    this.#observers = [...(opts.observer ? [opts.observer] : []), ...(opts.observers ?? [])];
     this.#t = opts.thresholds;
     this.#clock = opts.clock ?? systemClock;
     this.#log = opts.log;
@@ -123,9 +125,21 @@ export class Engine {
   async reload(): Promise<void> {
     const rows = await this.#store.loadSnapshot(this.#clock.now());
     const cache = buildCache(rows);
-    for (const v of rows.vehicles) {
-      const known = this.#lastFix.get(v.id);
-      if (v.lastFixAt && (!known || known.at < v.lastFixAt)) this.#lastFix.set(v.id, { at: v.lastFixAt, positionId: null });
+    // The newest fix already processed per vehicle, for deduplication after a
+    // restart: vehicle_state is throttled, so an active trip's progress_at
+    // (also a processed fix) can be newer. Up to vehicleStateIntervalS (30 s)
+    // of fixes that changed nothing written (no progress, no stop event) can
+    // still be processed again after a restart; that changes nothing either
+    // (forward-only writes, exactly-once alert claims).
+    const processed = new Map<string, Date>();
+    for (const v of rows.vehicles) if (v.lastFixAt) processed.set(v.id, v.lastFixAt);
+    for (const r of rows.instances) {
+      const prev = r.vehicleId === null ? undefined : processed.get(r.vehicleId);
+      if (r.status === 'active' && r.vehicleId !== null && r.progressAt && (!prev || prev < r.progressAt)) processed.set(r.vehicleId, r.progressAt);
+    }
+    for (const [vehicleId, at] of processed) {
+      const known = this.#lastFix.get(vehicleId);
+      if (!known || known.at < at) this.#lastFix.set(vehicleId, { at, positionId: null });
     }
     const seen = new Set<string>();
     for (const { instance, row } of cache.instances.values()) {
@@ -173,7 +187,7 @@ export class Engine {
     this.#refused.clear();
     this.#cache = cache;
     this.metrics.lastReloadAt = this.#clock.now().toISOString();
-    this.#notify(() => this.#observer?.tripsReloaded(this.#trips.values()));
+    this.#notify((o) => { o.tripsReloaded(this.#trips.values()); });
     if (cache.stopsWithoutDist > 0) {
       this.#log.warn('pattern stops without dist_along_shape are projected by the engine', { count: cache.stopsWithoutDist });
     }
@@ -254,12 +268,14 @@ export class Engine {
     return out;
   }
 
-  /** Alerts must never fail position processing or a reload. */
-  #notify(call: () => void): void {
-    try {
-      call();
-    } catch (err) {
-      this.#log.error('trip observer failed', { error: errorMessage(err) });
+  /** Observers (alerts, live API) must never fail position processing or a reload. */
+  #notify(call: (o: TripObserver) => void): void {
+    for (const o of this.#observers) {
+      try {
+        call(o);
+      } catch (err) {
+        this.#log.error('trip observer failed', { error: errorMessage(err) });
+      }
     }
   }
 
@@ -442,7 +458,20 @@ export class Engine {
     }
 
     const activeId = trip && progress?.status === 'active' ? trip.instance.id : null;
-    writes.vehicleState = {
+    // vehicle_state is for the admin console: at most every
+    // vehicleStateIntervalS, at once when the trip or the off-route state
+    // changes, or when the vehicle comes back after being stale.
+    const offRoute = activeId !== null && progress?.offRouteSince != null;
+    const written = this.#stateWritten.get(vehicle.id);
+    const stateDue = !written
+      || secondsBetween(written.at, at) >= t.vehicleStateIntervalS
+      || written.tripInstanceId !== activeId
+      || written.offRoute !== offRoute
+      || (last !== undefined && secondsBetween(last.at, at) > t.staleAfterS)
+      // With stop changes it costs nothing extra, and recorded_at then
+      // covers the fix after a restart.
+      || writes.stopEvents.length > 0;
+    if (stateDue) writes.vehicleState = {
       vehicleId: vehicle.id,
       operatorId: vehicle.operatorId,
       tripInstanceId: activeId,
@@ -463,6 +492,11 @@ export class Engine {
         throw err;
       }
     }
+    // The trip the database linked this fix to (vehicle_state.trip_instance_id).
+    const linkedTrip = !tripApplied && writes.trip?.id === activeId ? null : activeId;
+    // The trip compared next time is the one the engine assigned (not what the
+    // database linked), so a refused trip write does not force a write per fix.
+    if (writes.vehicleState) this.#stateWritten.set(vehicle.id, { at, tripInstanceId: activeId, offRoute });
     for (const [tr, u] of updates) {
       if (!tripApplied && writes.trip?.id === tr.instance.id) {
         // Another vehicle runs this trip (or it was cancelled): the database
@@ -477,12 +511,17 @@ export class Engine {
       // Alerts only from a state that was written and kept.
       if (tr === trip && tr.progress === u.next) {
         const progress = tr.progress;
-        this.#notify(() => this.#observer?.tripUpdated({ instance: tr.instance, progress, etas, fixAt: at }));
+        this.#notify((o) => { o.tripUpdated({ instance: tr.instance, progress, etas, fixAt: at }); });
       }
     }
     if (streaks !== null) this.#streaks.set(vehicle.id, streaks);
     else this.#streaks.delete(vehicle.id);
     this.#lastFix.set(vehicle.id, { at, positionId: p.positionId });
+    const fix = {
+      vehicleId: vehicle.id, operatorId: vehicle.operatorId, tripInstanceId: linkedTrip,
+      lon: p.lon, lat: p.lat, speedKmh: p.speedKmh, heading: p.course, accuracyM: p.accuracyM, at,
+    };
+    this.#notify((o) => o.vehicleUpdated?.(fix));
     this.metrics.positionsProcessed++;
     this.metrics.lastPositionAt = at.toISOString();
     for (const [msg, fields] of logs) this.#log.info(msg, fields);
