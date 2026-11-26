@@ -262,6 +262,41 @@ describe('precedence on one vehicle', () => {
     assert.deepEqual(s.transitions('T1'), ALL_SIX, 'the school run is followed');
   });
 
+  it('a release whose write failed after committing, then a reload before any retry: the database wins, the school run is followed', async () => {
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s.addLiveTrip({ id: 'L7', serviceDate: DATE, createdAt: local('06:00') });
+    await s.reload();
+    await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
+    const run = exampleRun(s, 'T1');
+    // The write commits but its acknowledgement is lost.
+    const persist = s.store.persist.bind(s.store);
+    s.store.persist = async (w) => {
+      s.store.persist = persist;
+      await persist(w);
+      throw new Error('connection lost after commit');
+    };
+    await assert.rejects(s.feed(run.fixes.slice(0, 1)));
+    assert.equal(s.store.instance('L7').status, 'planned');
+    assert.equal(s.engine.trips.get('L7')?.progress.status, 'active', 'memory did not see it');
+    await s.reload();
+    assert.equal(s.engine.trips.get('L7')?.progress.status, 'planned');
+    await s.feed(run.fixes.slice(1));
+    assert.deepEqual(s.transitions('T1'), ALL_SIX);
+  });
+
+  it('a release refused because staff moved the live trip to another vehicle: nothing of this run stays with it', async () => {
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s.addLiveTrip({ id: 'L7', serviceDate: DATE, createdAt: local('06:00') });
+    await s.reload();
+    await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
+    s.store.instance('L7').vehicleId = VEHICLE_2; // Not reloaded yet.
+    await s.feed(exampleRun(s, 'T1').fixes.slice(0, 1));
+    const p = s.engine.trips.get('L7')?.progress;
+    assert.equal(p?.vehicleId, VEHICLE_2);
+    assert.equal(p.startedAt, null);
+    assert.equal(s.store.vehicleState.get(VEHICLE)?.tripInstanceId, null);
+  });
+
   it('a position-only live trip started early is taken over too; a timed one never', async () => {
     const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
     s.addLiveTrip({ id: 'L7', serviceDate: DATE, createdAt: local('06:00') });

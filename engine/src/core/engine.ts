@@ -31,6 +31,7 @@ import type { StopChange } from './stops.ts';
 import { allStopsFinal, lastConfirmedStop, updateStops } from './stops.ts';
 import { secondsBetween } from './time.ts';
 import type {
+  TripStatus,
   PositionInput,
   StopEventWrite,
   TripProgress,
@@ -94,6 +95,14 @@ export class Engine {
   readonly #released = new Map<string, Date | null>();
   /** Releases the database refused while the trip still runs on the vehicle: not tried again until the next reload. */
   readonly #releaseRefused = new Set<string>();
+  /**
+   * Trips whose database row is truer than memory: a release whose write
+   * failed (it may have committed), or a release refused because staff moved
+   * the trip. The next reload takes their row as it is.
+   */
+  readonly #trustRow = new Set<string>();
+  /** Terminal states taken from a refused release before any reload saw them: an older snapshot does not revive the trip. */
+  readonly #endedSeen = new Map<string, TripStatus>();
   /** The last vehicle_state written per vehicle (throttling). */
   readonly #stateWritten = new Map<string, { at: Date; tripInstanceId: string | null; offRoute: boolean }>();
   readonly metrics: EngineMetrics = {
@@ -170,6 +179,17 @@ export class Engine {
       existing.instance = instance;
       existing.scheduledVehicleId = scheduledVehicleId;
       const mem = existing.progress;
+      if (this.#trustRow.delete(instance.id)) {
+        existing.progress = progressFromRow(row, instance);
+        this.#released.delete(instance.id);
+        this.#endedSeen.delete(instance.id);
+        continue;
+      }
+      const ended = this.#endedSeen.get(instance.id);
+      if (ended !== undefined) {
+        if (row.status === 'planned' || row.status === 'active') continue; // An older snapshot: memory is newer.
+        this.#endedSeen.delete(instance.id);
+      }
       const releasedFrom = this.#released.get(instance.id);
       if (releasedFrom !== undefined && (row.status !== 'active' || row.startedAt?.getTime() !== releasedFrom?.getTime())) {
         this.#released.delete(instance.id);
@@ -471,6 +491,10 @@ export class Engine {
         releasedRow = res.releasedRow ?? null;
       } catch (err) {
         this.metrics.positionsFailed++;
+        // The release may have committed with only the acknowledgement lost.
+        // A retry of this position finds it released (idempotent); a reload
+        // before any retry takes the row as it is.
+        if (writes.release !== null) this.#trustRow.add(writes.release);
         throw err;
       }
     }
@@ -487,13 +511,25 @@ export class Engine {
       // keeps its state.
       this.#log.warn('live trip release not applied', { tripInstanceId: released.instance.id, vehicleId: vehicle.id });
       const row = releasedRow;
-      if (row && (row.status === 'cancelled' || row.status === 'completed' || row.vehicleId !== vehicle.id)) {
-        released.progress = { ...released.progress, status: row.status, vehicleId: row.vehicleId };
+      const id = released.instance.id;
+      if (row && (row.status === 'cancelled' || row.status === 'completed')) {
+        released.progress = { ...released.progress, status: row.status, endedAt: released.progress.endedAt ?? at };
+        this.#endedSeen.set(id, row.status);
+        this.#trustRow.delete(id);
+      } else if (row && row.vehicleId !== vehicle.id) {
+        // Moved to another vehicle (or to "any vehicle"): nothing of this
+        // vehicle's run stays; the next reload takes the row as it is.
+        released.progress = { ...releasedProgress(released.progress), status: row.status, vehicleId: row.vehicleId };
+        this.#trustRow.add(id);
       } else {
-        this.#releaseRefused.add(released.instance.id);
+        this.#releaseRefused.add(id);
+        this.#trustRow.delete(id);
       }
+      const progress = released.progress;
+      this.#notify((o) => { o.tripUpdated({ instance: released.instance, progress, etas: new Map(), fixAt: at }); });
     } else if (released && releaseApplied) {
       this.#released.set(released.instance.id, released.progress.startedAt);
+      this.#trustRow.delete(released.instance.id);
     }
     for (const [tr, u] of updates) {
       // A refused release keeps nothing of this position's trip changes.

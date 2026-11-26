@@ -210,7 +210,10 @@ export class PgStore implements Store, AlertStore, LiveStore {
             // Not released (cancelled, moved to another vehicle, or it reached
             // a stop): no trip start in this write either, only the vehicle state.
             releasedRow = row ? { status: row.status, vehicleId: row.vehicle_id } : null;
-            w = { ...w, trip: null, stopEvents: [], etas: [] };
+            w = {
+              ...w, trip: null, stopEvents: [], etas: [],
+              vehicleState: w.vehicleState === null ? null : { ...w.vehicleState, tripInstanceId: null },
+            };
           }
         }
       }

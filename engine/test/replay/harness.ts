@@ -102,7 +102,7 @@ export class MemoryStore implements Store, AlertStore {
         releaseApplied = true;
       } else {
         releasedRow = { status: row.status, vehicleId: row.vehicleId };
-        w = { ...w, trip: null, stopEvents: [], etas: [] };
+        w = { ...w, trip: null, stopEvents: [], etas: [], vehicleState: w.vehicleState === null ? null : { ...w.vehicleState, tripInstanceId: null } };
       }
     }
     if (w.trip && w.trip.status !== 'planned') {
