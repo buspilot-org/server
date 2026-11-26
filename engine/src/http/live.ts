@@ -13,11 +13,11 @@
  * Unknown, not visible and invalid IDs all answer 404, so the existence of
  * a private route is not revealed.
  */
+import { createHash } from 'node:crypto';
 import type { ServerResponse } from 'node:http';
 import type { Context, Next } from 'hono';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { etag } from 'hono/etag';
 import { streamSSE } from 'hono/streaming';
 import type { Logger } from '../log.ts';
 import { errorMessage } from '../log.ts';
@@ -35,6 +35,12 @@ export interface LiveDeps {
   verifier: TokenVerifier | null;
   streams: StreamRegistry;
   log: Logger;
+  /**
+   * Lower-case name of the header with the client IP set by a trusted proxy
+   * (e.g. cf-connecting-ip behind Cloudflare), for the per-IP stream limit;
+   * null: no per-IP limit (the header could be forged).
+   */
+  clientIpHeader?: string | null;
 }
 
 type Env = { Variables: { claims: Claims } };
@@ -93,6 +99,13 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
       c.header('WWW-Authenticate', 'Bearer error="invalid_token"');
       return c.json({ error: 'unauthorized' }, 401);
     }
+    // Fail closed: memberships revoked since the last good reload must not
+    // keep working while the database cannot be read.
+    if (hub.loaded && !hub.fresh) {
+      c.header('Cache-Control', NO_STORE);
+      c.header('Retry-After', '30');
+      return c.json({ error: 'temporarily unavailable' }, 503);
+    }
     return next();
   });
 
@@ -107,7 +120,14 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
       c.header('Cache-Control', missCache);
       return c.json({ error: 'not found' }, 404);
     }
+    // The ETag ignores generatedAt, so an unchanged state answers 304.
+    const rest: Record<string, unknown> = { ...body };
+    delete rest.generatedAt;
+    const tag = `"${createHash('sha1').update(JSON.stringify(rest)).digest('base64url')}"`;
     c.header('Cache-Control', cache);
+    c.header('ETag', tag);
+    const match = c.req.header('If-None-Match');
+    if (match && match.split(',').some((t) => t.trim().replace(/^W\//, '') === tag)) return c.body(null, 304);
     return c.json(body, 200);
   };
 
@@ -118,19 +138,19 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
 
   // --- Members: polling -------------------------------------------------
 
-  live.get('/v1/live/routes/:routeId', etag(), (c) => {
+  live.get('/v1/live/routes/:routeId', (c) => {
     const id = c.req.param('routeId').toLowerCase();
     if (!isUuid(id)) return notFound(c, NO_STORE);
     return answer(c, CACHE_MEMBER, NO_STORE, (ctx) => routeView(ctx, viewerOf(c), id));
   });
 
-  live.get('/v1/live/trips/:tripInstanceId', etag(), (c) => {
+  live.get('/v1/live/trips/:tripInstanceId', (c) => {
     const id = c.req.param('tripInstanceId').toLowerCase();
     if (!isUuid(id)) return notFound(c, NO_STORE);
     return answer(c, CACHE_MEMBER, NO_STORE, (ctx) => tripOnlyView(ctx, viewerOf(c), id));
   });
 
-  live.get('/v1/live/stops/:stopId', etag(), (c) => {
+  live.get('/v1/live/stops/:stopId', (c) => {
     const id = c.req.param('stopId').toLowerCase();
     if (!isUuid(id)) return notFound(c, NO_STORE);
     return answer(c, CACHE_MEMBER, NO_STORE, (ctx) => stopView(ctx, viewerOf(c), id));
@@ -148,7 +168,9 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
     const first = build(ctx, viewer);
     if (first === null) return notFound(c, NO_STORE);
     const claims = c.get('claims');
-    const slot = streams.reserve(claims.sub);
+    // Only from a trusted proxy's header (first address if it is a list).
+    const ip = deps.clientIpHeader ? c.req.header(deps.clientIpHeader)?.split(',')[0]?.trim() || null : null;
+    const slot = streams.reserve(claims.sub, ip);
     if (!slot) {
       c.header('Cache-Control', NO_STORE);
       c.header('Retry-After', '30');
@@ -163,10 +185,14 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
           event,
           build: () => {
             const now = hub.context();
-            return now ? build(now, viewer) : null;
+            return now && hub.fresh ? build(now, viewer) : null;
           },
           relevant,
-          ...(goneReason ? { goneReason: () => { const now = hub.context(); return now ? goneReason(now, viewer) : 'not_found'; } } : {}),
+          goneReason: () => {
+            const now = hub.context();
+            if (!now || !hub.fresh) return 'unavailable';
+            return goneReason ? goneReason(now, viewer) : 'not_found';
+          },
           expiresAt: claims.exp * 1000,
           drop: () => { outgoing?.destroy(); },
         }, first, hub, slot, streams.limits, log);
@@ -197,7 +223,7 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
 
   const visitor: Viewer = { uid: null };
 
-  live.get('/v1/public/routes/:operatorSlug/:routeSlug', etag(), (c) => {
+  live.get('/v1/public/routes/:operatorSlug/:routeSlug', (c) => {
     const op = c.req.param('operatorSlug');
     const slug = c.req.param('routeSlug');
     if (!isSlug(op) || !isSlug(slug)) return notFound(c, CACHE_PUBLIC_MISS);
@@ -207,7 +233,7 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
     });
   });
 
-  live.get('/v1/public/stops/:operatorSlug/:stopSlug', etag(), (c) => {
+  live.get('/v1/public/stops/:operatorSlug/:stopSlug', (c) => {
     const op = c.req.param('operatorSlug');
     const slug = c.req.param('stopSlug');
     if (!isSlug(op) || !isSlug(slug)) return notFound(c, CACHE_PUBLIC_MISS);

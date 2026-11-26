@@ -36,6 +36,7 @@ const liveHub = new LiveHub({
   log,
   trips: () => engineRef?.trips ?? new Map(),
   staleAfterS: config.thresholds.staleAfterS,
+  maxAgeS: config.live.maxAgeS,
 });
 const verifier = config.live.supabaseUrl === null ? null : new TokenVerifier({
   supabaseUrl: config.live.supabaseUrl,
@@ -72,7 +73,6 @@ async function start(): Promise<void> {
       // Subscriptions first, so the first reload can already send cancellations.
       await alerts?.reloadSubscriptions();
       await engine.reload();
-      await liveHub.reload();
       break;
     } catch (err) {
       log.error('startup failed, retrying in 10 s', { error: errorMessage(err) });
@@ -83,25 +83,32 @@ async function start(): Promise<void> {
 
 const app = createApp({
   engine, traccarSecret: config.traccarSecret, log, checkDatabase: () => store.ping(), ...(alerts ? { alertMetrics: () => alerts.metrics } : {}),
-  live: { hub: liveHub, verifier, streams, log },
+  live: { hub: liveHub, verifier, streams, log, clientIpHeader: config.live.clientIpHeader },
 });
 const server = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, (info) => {
   log.info('listening', { port: info.port });
 });
 
 const timers: NodeJS.Timeout[] = [];
+let stopping = false;
 void verifier?.refresh().catch((err: unknown) => { log.warn('signing keys (JWKS) not loaded yet', { error: errorMessage(err) }); });
-void start().then(async () => {
-  try {
-    await liveHub.listen();
-  } catch (err) {
+// The live API loads on its own, retried in the background: a broken live
+// snapshot must never keep trips and alerts from starting. Until it has
+// loaded, /v1/live and /v1/public answer 503.
+void liveHub.loadInBackground(10_000, () => stopping).then(async () => {
+  if (stopping) return;
+  log.info('live API loaded');
+  await liveHub.listen().catch((err: unknown) => {
     log.error('LISTEN for live changes failed; relying on the periodic reload', { error: errorMessage(err) });
-  }
+  });
+});
+timers.push(every('live reload', config.live.reloadS, async () => {
+  if (!liveHub.loaded) return; // still loading in the background
+  if (!liveHub.listening) await liveHub.listen().catch((err: unknown) => { log.warn('LISTEN for live changes failed', { error: errorMessage(err) }); });
+  await liveHub.reload();
+}));
+void start().then(() => {
   timers.push(
-    every('live reload', config.live.reloadS, async () => {
-      if (!liveHub.listening) await liveHub.listen().catch((err: unknown) => { log.warn('LISTEN for live changes failed', { error: errorMessage(err) }); });
-      await liveHub.reload();
-    }),
     every('cache reload', config.cacheReloadS, () => engine.reload()),
     every('trip instance creation', config.schedulerIntervalS, async () => {
       if (await createInstances() > 0) await engine.reload();
@@ -113,6 +120,7 @@ void start().then(async () => {
 
 function shutdown(signal: string): void {
   log.info('shutting down', { signal });
+  stopping = true;
   for (const t of timers) clearInterval(t);
   // Open SSE streams keep the server from closing: end them first (clients
   // reconnect to the next engine).

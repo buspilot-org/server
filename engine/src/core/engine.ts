@@ -127,7 +127,10 @@ export class Engine {
     const cache = buildCache(rows);
     // The newest fix already processed per vehicle, for deduplication after a
     // restart: vehicle_state is throttled, so an active trip's progress_at
-    // (also a processed fix) can be newer.
+    // (also a processed fix) can be newer. Up to vehicleStateIntervalS (30 s)
+    // of fixes that changed nothing written (no progress, no stop event) can
+    // still be processed again after a restart; that changes nothing either
+    // (forward-only writes, exactly-once alert claims).
     const processed = new Map<string, Date>();
     for (const v of rows.vehicles) if (v.lastFixAt) processed.set(v.id, v.lastFixAt);
     for (const r of rows.instances) {

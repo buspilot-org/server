@@ -56,6 +56,14 @@ function decodePart(part: string): unknown {
   }
 }
 
+/** The algorithm a JWK without `alg` is used with (Supabase's key types). */
+function inferAlg(jwk: Record<string, unknown>): string | null {
+  if (jwk.kty === 'EC' && jwk.crv === 'P-256') return 'ES256';
+  if (jwk.kty === 'RSA') return 'RS256';
+  if (jwk.kty === 'OKP' && jwk.crv === 'Ed25519') return 'EdDSA';
+  return null;
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
@@ -118,14 +126,17 @@ export class TokenVerifier {
     if (!isRecord(body) || !Array.isArray(body.keys)) throw new Error('JWKS response has no keys');
     const keys = new Map<string, Key>();
     for (const jwk of body.keys) {
-      if (!isRecord(jwk) || typeof jwk.kid !== 'string' || typeof jwk.alg !== 'string') continue;
-      const spec = ALGORITHMS[jwk.alg];
+      if (!isRecord(jwk) || typeof jwk.kid !== 'string') continue;
+      // `alg` is optional in a JWK; then it follows from the key type.
+      const alg = typeof jwk.alg === 'string' ? jwk.alg : inferAlg(jwk);
+      if (alg === null) continue;
+      const spec = ALGORITHMS[alg];
       if (!spec || jwk.kty !== spec.kty || (jwk.use !== undefined && jwk.use !== 'sig')) continue;
       if (spec.crv !== undefined && jwk.crv !== spec.crv) continue;
       try {
         const key = createPublicKey({ key: jwk, format: 'jwk' });
         if (key.type !== 'public') continue;
-        keys.set(jwk.kid, { alg: jwk.alg, key });
+        keys.set(jwk.kid, { alg, key });
       } catch {
         // Skip keys Node cannot import.
       }

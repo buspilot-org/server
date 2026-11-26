@@ -323,13 +323,17 @@ export function tripView(ctx: ViewContext, viewer: Viewer, i: LiveInstanceRow, s
   // vehicle the database says runs it (a reassignment by staff wins at once).
   const showVehicle = level >= 2 && st.status === 'active' && st.tracked && !st.offRoute && !st.stale
     && fix !== null && fix.tripInstanceId === i.id && i.vehicleId === fix.vehicleId;
+  // A viewer who reaches a live trip only through its own audiences, on a
+  // pattern of a route they cannot see, gets no pattern stops at all (RLS:
+  // pattern_stop is hidden), only the times and states.
+  const patternHidden = i.patternId !== null && ctx.dir.access.patternAccess(viewer.uid, i.patternId) === 0;
   const stops: StopVisitView[] = [];
   for (const x of visits) {
     const stop = ctx.dir.stops.get(x.v.stopId);
     if (!stop) continue;
     stops.push({
       sequence: x.v.sequence,
-      stop: stopRef(ctx, viewer, stop, stopRefs),
+      stop: patternHidden ? null : stopRef(ctx, viewer, stop, stopRefs),
       state: x.state,
       scheduledArrival: iso(x.scheduledArrival),
       scheduledDeparture: iso(x.scheduledDeparture),
@@ -418,6 +422,8 @@ export function stopView(ctx: ViewContext, viewer: Viewer, stopId: string): Stop
   const routes = new Map<string, RouteRef>();
   for (const i of ctx.dir.instancesAtStop(stopId)) {
     if (ctx.dir.access.tripAccess(viewer.uid, i.id, ctx.now) === 0) continue;
+    // That a hidden pattern serves this stop is not shown either.
+    if (i.patternId !== null && ctx.dir.access.patternAccess(viewer.uid, i.patternId) === 0) continue;
     const st = tripState(ctx, i);
     if (!isCurrent(ctx, i, st.status)) continue;
     const visits = visitsOf(ctx, i, st);

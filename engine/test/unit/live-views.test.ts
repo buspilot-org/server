@@ -113,16 +113,26 @@ describe('live views', () => {
     assert.equal(v.stop.location, null);
   });
 
-  it('a live trip on a pattern for its own audience: stop times, but no stops RLS hides', () => {
+  it('a live trip on a pattern the viewer cannot see: stop times, but no stop at all (strict)', () => {
+    const base = snapshot();
     const s = snapshot({
+      // s2 is also served by a public route, so the tourist may see that stop
+      // as such; on the hidden pattern it is still not named.
+      routes: [...base.routes, { id: 'r-pub', operatorId: OP, slug: 'pub', name: { en: 'Pub' }, shortName: null, color: null, textColor: null, visibility: 'public', active: true }],
+      patterns: [...base.patterns, { id: 'p-pub', operatorId: OP, routeId: 'r-pub' }],
+      patternStops: [...base.patternStops, { patternId: 'p-pub', sequence: 1, stopId: 's2', arrivalOffsetS: 0, departureOffsetS: 0 }],
       instances: [instance('live', { kind: 'live', tripId: null, title: { en: 'Tour' } })],
       memberships: [{ deviceId: 'tourist', audienceId: 'tour' }],
       tripAudiences: [{ tripInstanceId: 'live', audienceId: 'tour', canSeeMap: false }],
     });
-    const v = tripOnlyView(ctx(s, undefined), { uid: 'tourist' }, 'live');
+    const c = ctx(s, undefined);
+    assert.equal(c.dir.access.stopAccess('tourist', 's2', NOW), 2, 'the stop itself is visible (public route)');
+    const v = tripOnlyView(c, { uid: 'tourist' }, 'live');
     assert.ok(v);
     assert.equal(v.route, null);
     assert.deepEqual(v.trip.stops.map((x) => [x.sequence, x.stop, x.state]), [[1, null, 'departed'], [2, null, 'upcoming'], [3, null, 'upcoming']]);
+    // Nor does the stop view reveal that the hidden pattern serves s2.
+    assert.deepEqual(stopView(c, { uid: 'tourist' }, 's2')?.arrivals, []);
     assert.doesNotMatch(JSON.stringify(v), /"s[123]"/);
   });
 

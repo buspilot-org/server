@@ -6,7 +6,8 @@
  */
 import { generateKeyPairSync, randomUUID, sign, type KeyObject } from 'node:crypto';
 import { TokenVerifier } from '../../src/live/auth.ts';
-import type { LiveSnapshot, LiveStore, Visibility } from '../../src/live/types.ts';
+import type { LivePart, LiveSnapshot, LiveStore, Visibility } from '../../src/live/types.ts';
+import { LIVE_PARTS } from '../../src/live/types.ts';
 import { OPERATOR, PATTERN, ROUTE, TZ, type Scenario } from './harness.ts';
 
 export const SUPABASE_URL = 'http://supabase.test';
@@ -82,8 +83,12 @@ export class MemoryLiveStore implements LiveStore {
   readonly s: Scenario;
   extras: LiveExtras;
   loads = 0;
+  /** Parts asked for, per load. */
+  partsLoaded: LivePart[][] = [];
   failNext = 0;
-  #notify: (() => void) | null = null;
+  /** Make every load fail (e.g. a missing migration). */
+  failAlways = false;
+  #notify: ((table: string) => void) | null = null;
 
   constructor(s: Scenario, extras: Partial<LiveExtras> = {}) {
     this.s = s;
@@ -95,8 +100,11 @@ export class MemoryLiveStore implements LiveStore {
     };
   }
 
-  loadLiveSnapshot(): Promise<LiveSnapshot> {
+  /** Always returns everything (a superset of the parts asked for). */
+  loadLiveSnapshot(parts: readonly LivePart[] = LIVE_PARTS): Promise<LiveSnapshot> {
     this.loads++;
+    this.partsLoaded.push([...parts]);
+    if (this.failAlways) return Promise.reject(new Error('relation "public.route" has no column "slug"'));
     if (this.failNext > 0) {
       this.failNext--;
       return Promise.reject(new Error('simulated database failure'));
@@ -147,7 +155,7 @@ export class MemoryLiveStore implements LiveStore {
     } satisfies LiveSnapshot));
   }
 
-  listenLiveChanges(onChange: () => void): Promise<() => Promise<void>> {
+  listenLiveChanges(onChange: (table: string) => void): Promise<() => Promise<void>> {
     this.#notify = onChange;
     return Promise.resolve(() => {
       this.#notify = null;
@@ -155,8 +163,8 @@ export class MemoryLiveStore implements LiveStore {
     });
   }
 
-  /** Simulates a NOTIFY on buspilot_live. */
-  notify(): void {
-    this.#notify?.();
+  /** Simulates a NOTIFY on buspilot_live with the table as payload. */
+  notify(table = 'membership'): void {
+    this.#notify?.(table);
   }
 }

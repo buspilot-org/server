@@ -120,3 +120,17 @@ describe('access token verification (JWKS)', () => {
     }
   });
 });
+
+describe('JWKS keys without "alg"', () => {
+  it('infers ES256 from an EC P-256 key', async () => {
+    const t = new TokenSigner();
+    const jwks = t.jwks() as { keys: Record<string, unknown>[] };
+    const keys = jwks.keys.map((k) => {
+      const copy = { ...k };
+      delete copy.alg;
+      return copy;
+    });
+    const v = new TokenVerifier({ supabaseUrl: SUPABASE_URL, fetcher: () => Promise.resolve({ keys }) });
+    assert.equal((await v.verify(t.token(USER))).sub, USER);
+  });
+});

@@ -149,6 +149,10 @@ export interface AppConfig {
     jwtIssuer: string | null;
     /** Safety-net reload of the live directory (s); changes are also picked up by LISTEN. */
     reloadS: number;
+    /** Members get 503 when access data could not be reloaded for this long (s). */
+    maxAgeS: number;
+    /** Header with the client IP set by a trusted proxy (e.g. CF-Connecting-IP); null: no per-IP stream limit. */
+    clientIpHeader: string | null;
     streams: StreamLimits;
   };
 }
@@ -161,6 +165,13 @@ function int(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
   return value;
+}
+
+function clientIpHeader(env: NodeJS.ProcessEnv): string | null {
+  const h = (env.LIVE_CLIENT_IP_HEADER ?? '').trim();
+  if (h === '') return null;
+  if (!/^[A-Za-z0-9-]+$/.test(h)) throw new Error('LIVE_CLIENT_IP_HEADER must be a header name, e.g. CF-Connecting-IP');
+  return h.toLowerCase();
 }
 
 /** Reads the configuration from the environment. Throws on missing or invalid values. */
@@ -208,10 +219,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       supabaseUrl,
       jwtIssuer: env.SUPABASE_JWT_ISSUER || null,
       reloadS: int(env, 'LIVE_RELOAD_SECONDS', 60),
+      maxAgeS: int(env, 'LIVE_MAX_AGE_SECONDS', 300),
+      clientIpHeader: clientIpHeader(env),
       streams: {
         ...defaultStreamLimits,
         maxTotal: int(env, 'LIVE_STREAMS_MAX', defaultStreamLimits.maxTotal),
         maxPerUser: int(env, 'LIVE_STREAMS_PER_USER', defaultStreamLimits.maxPerUser),
+        maxPerIp: int(env, 'LIVE_STREAMS_PER_IP', defaultStreamLimits.maxPerIp),
         heartbeatS: int(env, 'LIVE_HEARTBEAT_SECONDS', defaultStreamLimits.heartbeatS),
       },
     },

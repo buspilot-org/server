@@ -15,7 +15,7 @@
 import postgres from 'postgres';
 import type { AlertStore, DeliveryClaim, I18nText, Subscription } from '../alerts/types.ts';
 import type { StopState, TripStatus, Writes } from '../core/types.ts';
-import type { LiveSnapshot, LiveStore } from '../live/types.ts';
+import type { LivePart, LiveSnapshotPart, LiveStore } from '../live/types.ts';
 import { listenLiveChanges, loadLiveSnapshot } from './live.ts';
 import type { InstanceRow, PersistResult, SnapshotRows, Store } from './store.ts';
 
@@ -42,11 +42,11 @@ export class PgStore implements Store, AlertStore, LiveStore {
     await this.sql.end({ timeout: 5 });
   }
 
-  loadLiveSnapshot(): Promise<LiveSnapshot> {
-    return loadLiveSnapshot(this.sql);
+  loadLiveSnapshot(parts?: readonly LivePart[]): Promise<LiveSnapshotPart> {
+    return loadLiveSnapshot(this.sql, parts);
   }
 
-  listenLiveChanges(onChange: () => void, onConnect: () => void): Promise<() => Promise<void>> {
+  listenLiveChanges(onChange: (table: string) => void, onConnect: () => void): Promise<() => Promise<void>> {
     return listenLiveChanges(this.sql, onChange, onConnect);
   }
 

@@ -21,7 +21,7 @@ docker run --env-file .env -p 8080:8080 buspilot-engine
 
 | Variable | Default | |
 |---|---|---|
-| `DATABASE_URL` | – | Direct Postgres connection (or the session pooler; not the transaction pooler on port 6543, where `LISTEN` does nothing) with a role that bypasses RLS (as the service role does). Local: `postgres://postgres:postgres@127.0.0.1:55322/postgres` |
+| `DATABASE_URL` | – | Direct Postgres connection, or Supavisor in session mode; **not** transaction mode (port 6543), where `LISTEN` silently receives nothing. A role that bypasses RLS (as the service role does). The engine sets its session time zone to UTC (like Supabase), which the live API's access rules rely on (`current_date`). Local: `postgres://postgres:postgres@127.0.0.1:55322/postgres` |
 | `TRACCAR_FORWARD_SECRET` | – | At least 32 URL-safe characters (`openssl rand -hex 32`) |
 | `PORT`, `HOST` | `8080`, `0.0.0.0` | |
 | `CACHE_RELOAD_SECONDS` | `300` | Safety-net reload of vehicles, shapes, patterns and trip instances |
@@ -36,8 +36,11 @@ docker run --env-file .env -p 8080:8080 buspilot-engine
 | `SUBSCRIPTION_RELOAD_SECONDS` | `60` | Reload of subscriptions, push targets and access |
 | `SUPABASE_URL` | – | Project URL (local: `http://127.0.0.1:55321`). The live API reads the signing keys from `<SUPABASE_URL>/auth/v1/.well-known/jwks.json` to verify members' access tokens. Without it, `/v1/live/…` answers `503`; the public endpoints work |
 | `SUPABASE_JWT_ISSUER` | `<SUPABASE_URL>/auth/v1` | Expected `iss` of access tokens, if the engine reaches Supabase under another URL than the apps do |
-| `LIVE_RELOAD_SECONDS` | `60` | Safety-net reload of the live API's names, trips and access (changes come in at once through `LISTEN buspilot_live`) |
+| `LIVE_RELOAD_SECONDS` | `60` | Full reload of the live API's names, trips and access (changes come in sooner through `LISTEN buspilot_live`, per table) |
+| `LIVE_MAX_AGE_SECONDS` | `300` | If access data could not be reloaded for this long, member endpoints answer `503` (fail closed: a revoked membership must not keep working); public endpoints stay up |
 | `LIVE_STREAMS_MAX`, `LIVE_STREAMS_PER_USER` | `2000`, `4` | Open Server-Sent Event streams in all and per user; more answer `429` |
+| `LIVE_CLIENT_IP_HEADER` | – | Header with the client IP set by the proxy in front of the engine, e.g. `CF-Connecting-IP` behind Cloudflare. Only set it if every request comes through that proxy (otherwise clients can forge it). Enables the per-IP stream limit |
+| `LIVE_STREAMS_PER_IP` | `20` | Open streams per client IP (only with `LIVE_CLIENT_IP_HEADER`). Anonymous accounts cost nothing, so the per-user limit alone does not keep one client from taking every slot |
 | `LIVE_HEARTBEAT_SECONDS` | `20` | Comment line on open streams |
 | `VEHICLE_STATE_INTERVAL_SECONDS` | `30` | `vehicle_state` (admin console) is written at most this often per vehicle |
 
@@ -54,7 +57,7 @@ Matching thresholds (distances, windows, speeds) are in `src/config.ts` (`defaul
 | | |
 |---|---|
 | `POST /v1/traccar/positions/:secret` | Traccar JSON position forwarding (`PositionData`: `{position, device}`). `200` processed / duplicate / invalid, `202` device is not a Buspilot vehicle (dropped), `400` malformed, `401` wrong secret, `503` not ready or the database write failed (Traccar retries) |
-| `GET /healthz` | `200 {"status": "ok", …}` or `503 {"status": "degraded", …}` with database reachability, stale trips and counters about Buspilot vehicles (nothing about other devices on the Traccar server), alert counters (`alerts`: sent, failed, expired, push tokens cleared; `null` when push is off) and the live API (`live`: loaded, members enabled, last reload, open streams) |
+| `GET /healthz` | `200 {"status": "ok", …}` or `503 {"status": "degraded", …}` with database reachability, stale trips and counters about Buspilot vehicles (nothing about other devices on the Traccar server), alert counters (`alerts`: sent, failed, expired, push tokens cleared; `null` when push is off) and the live API (`live`: loaded, fresh, age of the access data in seconds, LISTEN active, members enabled, last reload, reload failures, open streams) |
 | `GET /v1/live/…`, `GET /v1/public/…` | Live API for the rider app and public pages, see [Live API](#live-api) |
 
 ## Traccar setup
@@ -194,7 +197,9 @@ Live positions and ETAs for the rider app and the public web pages, served by th
 - **Arrival-time-only** viewers (`access: "eta"`) get stop states and ETAs, never the bus position, and stop locations only for the first two stops they follow per operator (the mini map), like `stop_location`.
 - **Map** viewers (`access: "map"`: public routes, `invited_map` with `can_see_map`, a live trip's audience with map, staff) get the bus position only while the trip is active, the bus is on route and its position is fresh (less than 2 minutes old), and stop locations.
 - Live trips are visible to their audiences (`trip_instance_audience`) and, if they have a route, to the route's audiences; after `visible_until` to nobody.
-- Membership, audience, staff and trip changes apply within about a second (the database notifies the engine on channel `buspilot_live`), at the latest after `LIVE_RELOAD_SECONDS`. An open stream whose viewer loses access ends with `not_found`.
+- Membership, audience, staff, schedule and trip changes apply within about two seconds: the database notifies the engine on channel `buspilot_live` with the table name, and the engine reloads only that part (at most every 2 s). Everything is reloaded every `LIVE_RELOAD_SECONDS`; subscriptions (which followed stops get a mini-map location) only then, as they change often. An open stream whose viewer loses access ends with `not_found`.
+- If the engine cannot reload access data for `LIVE_MAX_AGE_SECONDS` (database unreachable), member endpoints answer `503` and open streams end with `unavailable`; public endpoints keep working. The live API loads on its own after start: until then (or if its snapshot fails, e.g. before the migration is applied) it answers `503` while positions, trips and alerts work as usual.
+- A live trip reached only through its own audiences, on a pattern of a route the viewer cannot see, comes with `"stop": null` for every stop (as RLS hides that pattern's stops), and the stop endpoint does not list it.
 - A stop the viewer may not see as a row under RLS (e.g. a live trip's own audience on a pattern of a route they are not a member of) comes as `"stop": null`: its times and state, but no name, ID or location.
 - Never history: only the current state, today's stop times, and the latest position.
 
@@ -236,15 +241,16 @@ Live positions and ETAs for the rider app and the public web pages, served by th
 
 ### Polling, caching and streams
 
-- **Members' polling** (home cards, route screen without map): `Cache-Control: private, max-age=5`, `Vary: Authorization`, an `ETag` (send `If-None-Match` for a cheap `304`). Every 10–30 s while visible is plenty.
+- **Members' polling** (home cards, route screen without map): `Cache-Control: private, max-age=5`, `Vary: Authorization`, an `ETag` that ignores `generatedAt` (send `If-None-Match`: `304` while nothing changed). Every 10–30 s while visible is plenty.
 - **Public pages** poll every ~10 s while visible (pause in background tabs). Responses are `Cache-Control: public, max-age=5, s-maxage=5` for Cloudflare, so thousands of visitors cost a few engine computations per minute; `404` is cached for 30 s. CORS is open (`*`, no cookies). Public pages need no Supabase call for live data; timetable, stops and shapes come from Supabase (anon key, RLS) and can be cached longer.
 - **Streams** (`…/stream`, members, while the map or route screen is open; close them when it is not): `text/event-stream`, first `retry: 5000`, then an `event: route` (or `trip`) with the same JSON as polling, again whenever it changes (at most once a second, only real changes), and `: ping` every 20 s. A stream ends with `event: end` and `data: {"reason": …}`:
   - `token_expired`: at the access token's expiry; reconnect with the refreshed token;
   - `not_found`: access lost or the route is gone; stop streaming;
   - `trip_ended` (trip streams): the trip is over and no longer today's; stop streaming;
+  - `unavailable`: the engine cannot read the database for too long; reconnect later (with backoff);
   - `shutdown`: the engine restarts; reconnect after the `retry` delay.
 
-  At most 4 streams per user and 2000 in all (`429` with `Retry-After`). EventSource in browsers cannot send headers: web clients use `fetch` streaming (or poll). The rider app (`http` package or `dio` with a streamed response) sends the header.
+  At most 4 streams per user, 20 per client IP (behind a configured proxy) and 2000 in all (`429` with `Retry-After`). A client that does not read for 30 s is disconnected. EventSource in browsers cannot send headers: web clients use `fetch` streaming (or poll). The rider app (`http` package or `dio` with a streamed response) sends the header.
 - `503` with `Retry-After` while the engine starts (or `SUPABASE_URL` is not set, for member endpoints).
 
 Example (rider app, Dart, simplified):
@@ -279,8 +285,8 @@ npm run test:db   # integration test against the local Supabase database
 - `test/replay/alerts.test.ts`: alerts on replayed trips: minutes and stops before, mute, passed without stopping, a GPS gap (stop passed meanwhile; three stops passed in one update), missed approaching → "at your stop", stale positions, off route held and released, the German School loop, a stop served twice, restart and retried positions, a failed claim, the next day, delayed, cancelled, send retries, invalid tokens.
 - `test/replay/` (scenarios): synthetic tracks with a fake clock and an in-memory store: the German School loop (passing near stop N+2 before N+1, also standing with GPS pulled onto the later pass), a stop served twice on a loop (with and without `dist_along_shape`), a skipped stop, excursions outside any trip, a bus parked at the first stop, GPS jumps, detours off the route, a tracker reporting every minute, two trips of the same pattern back to back, two vehicles on a trip any vehicle may run, cancellation and vehicle reassignment in the database, an engine restart mid-trip, a failed database write, and ETAs.
 - `test/unit/live-*.test.ts`: access token verification (JWKS, rotation, outage, rejected algorithms and claims), the access rules case by case, and the serialisation (scheduled times, delay, positions only from the linked trip, followed-stop locations, the stop window).
-- `test/replay/live-api.test.ts`: the live API over HTTP on replayed trips: arrival-time and map members, stale and off route, the trip end, public routes and stops, 401/404, a revoked membership, a failed reload, a loop's stop visited twice, a live trip with planned stops; Server-Sent Events (updates, heartbeat, limits, access lost, shutdown, token expiry); the `vehicle_state` throttle.
-- `test/db/live-parity.test.ts`: for the seed and a fixture operator (all visibilities, live trips with audiences and planned stops, members, staff, drivers, a revoked membership, followed stops), every viewer's route, trip and stop level and stop location equals what RLS returns for the same user.
+- `test/replay/live-api.test.ts`: the live API over HTTP on replayed trips: arrival-time and map members, stale and off route, the trip end, public routes and stops, 401/404, a revoked membership, a failed reload, failing closed after `LIVE_MAX_AGE_SECONDS`, per-table reloads, starting while the live snapshot fails, a loop's stop visited twice, a live trip with planned stops; Server-Sent Events (updates, heartbeat, per-user, per-IP and total limits, access lost, shutdown, token expiry, early abort); the `vehicle_state` throttle. `test/unit/live-streams.test.ts`: clients that stop reading are dropped.
+- `test/db/live-parity.test.ts`: for the seed and a fixture operator (all visibilities, live trips with audiences and planned stops or on a pattern, members, staff, drivers, a revoked membership, followed and released stops), every viewer's route, trip and stop level and stop location equals what RLS returns for the same user, and trip views name a pattern's stops exactly when RLS shows that pattern's stops.
 - `test/db/`: the seed's loop against the real database: trip instance creation, projection compared with PostGIS, a full trip with a restart, idempotent writes; alert subscriptions with access as RLS decides it, and exactly-once claims with two engines on two connections at the same time.
 
 ## Not yet

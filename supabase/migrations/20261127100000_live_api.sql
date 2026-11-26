@@ -36,10 +36,16 @@ grant select (slug) on public.stop to anon, authenticated;
 -- The engine keeps routes, stops, memberships, audiences and live trips in
 -- memory to answer the live API without database reads, and listens on
 -- channel `buspilot_live` to reload them soon after a change (a revoked
--- membership must not keep showing the bus). Payload: the table name only.
--- Postgres sends one notification per channel and payload per transaction,
--- however many rows change. The engine also reloads every minute, in case a
+-- membership must not keep showing the bus). Payload: the table name, so
+-- the engine reloads only what that table affects. Postgres sends one
+-- notification per channel and payload per transaction, however many rows
+-- change. The engine also reloads everything every minute, in case a
 -- notification is lost (e.g. while it reconnects).
+--
+-- `subscription` does not notify: it changes often (riders following stops)
+-- and only decides the mini-map location of followed stops, which the
+-- minute reload picks up. LISTEN needs a direct or session-mode connection
+-- (not Supavisor's transaction mode).
 create function private.notify_live_change()
 returns trigger
 language plpgsql
@@ -58,7 +64,7 @@ begin
   foreach t in array array[
     'operator', 'route', 'stop', 'trip_pattern', 'pattern_stop', 'trip',
     'audience_route', 'membership', 'staff_role', 'driver_vehicle',
-    'trip_instance_stop', 'trip_instance_audience', 'subscription'
+    'trip_instance_stop', 'trip_instance_audience'
   ] loop
     execute format(
       'create trigger notify_live_change after insert or update or delete or truncate on public.%I '
@@ -69,10 +75,12 @@ begin
 end;
 $$;
 
--- trip_instance is updated by the engine on every position (progress); only
--- the columns the access rules and the live API read matter here: new or
--- deleted trips, cancellations, starts and ends, vehicle, trip, route, date
--- and visibility.
+-- trip_instance is updated by the engine on every position (progress_m,
+-- progress_at, off_route_since, last confirmed stop). Those are not listed:
+-- the live API takes them from the engine's memory. Listed are the columns
+-- the access rules and the trip list read: status (also starts and ends,
+-- with started_at and ended_at), vehicle, trip, pattern, route, service
+-- date, visibility, title and kind.
 create trigger notify_live_change_insert_delete
   after insert or delete or truncate on public.trip_instance
   for each statement execute function private.notify_live_change();
@@ -85,6 +93,7 @@ create trigger notify_live_change_update
     or old.visible_until is distinct from new.visible_until
     or old.vehicle_id is distinct from new.vehicle_id
     or old.trip_id is distinct from new.trip_id
+    or old.started_at is distinct from new.started_at
     or old.service_date is distinct from new.service_date
     or old.ended_at is distinct from new.ended_at
     or old.route_id is distinct from new.route_id

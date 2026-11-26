@@ -16,6 +16,9 @@
 import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import { AccessIndex } from '../../src/live/access.ts';
+import { Directory } from '../../src/live/directory.ts';
+import type { LiveSnapshot } from '../../src/live/types.ts';
+import { tripOnlyView } from '../../src/live/views.ts';
 import { PgStore } from '../../src/store/pg.ts';
 
 const DATABASE_URL = process.env.DATABASE_URL ?? 'postgres://postgres:postgres@127.0.0.1:55322/postgres';
@@ -151,6 +154,7 @@ async function asUser<T>(uid: Claims, query: (tx: typeof sql) => Promise<T>): Pr
 
 describe('live API access = RLS (parity)', () => {
   let index: AccessIndex;
+  let dir: Directory;
   let now: Date;
   const routeIds = [...Object.values(ROUTES), SEED_ROUTE];
   let tripIds: string[] = [];
@@ -161,8 +165,9 @@ describe('live API access = RLS (parity)', () => {
   before(async () => {
     await cleanup();
     await sql.unsafe(FIXTURE);
-    const snapshot = await store.loadLiveSnapshot();
+    const snapshot = (await store.loadLiveSnapshot()) as LiveSnapshot;
     index = new AccessIndex(snapshot);
+    dir = new Directory(snapshot);
     now = snapshot.loadedAt;
     // From the database, not the snapshot: instances the snapshot leaves out are compared too.
     tripIds = (await sql<{ id: string }[]>`select id from public.trip_instance where operator_id in (${OP}, ${SEED_OP})`).map((r) => r.id);
@@ -220,6 +225,26 @@ describe('live API access = RLS (parity)', () => {
         assert.equal(index.stopAccess(uid, r.id, now), r.level, `stop ${r.id}`);
         assert.equal(index.stopLocationVisible(uid, r.id, now), db.located.has(r.id), `stop ${r.id} location`);
       }
+    });
+  }
+
+  for (const [name, uid] of viewers) {
+    it(`${name}: trip views name pattern stops only where RLS shows the pattern's stops`, async () => {
+      const ctx = { dir, runtime: () => undefined, fix: () => undefined, now, staleAfterS: 120 };
+      const trips = [...loaded].map((t) => dir.instances.get(t)).filter((i) => i && (i.operatorId === OP || i.operatorId === SEED_OP) && i.patternId !== null);
+      const patterns = [...new Set(trips.map((i) => i?.patternId ?? ''))];
+      const visible = await asUser(uid, async (tx) => new Set(
+        (await tx<{ pattern_id: string }[]>`select distinct pattern_id from public.pattern_stop where pattern_id = any(${patterns}::uuid[])`).map((r) => r.pattern_id),
+      ));
+      let checked = 0;
+      for (const i of trips) {
+        if (!i?.patternId) continue;
+        const v = tripOnlyView(ctx, { uid }, i.id);
+        if (!v) continue;
+        checked++;
+        assert.equal(v.trip.stops.some((x) => x.stop !== null), visible.has(i.patternId), `trip ${i.id}: stops named`);
+      }
+      if (name === 'tourist') assert.ok(checked > 0, 'the tourist sees the live trip on the hidden pattern');
     });
   }
 

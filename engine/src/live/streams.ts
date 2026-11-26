@@ -7,12 +7,16 @@
  *   most every `minIntervalMs`, and only if the content changed.
  * - A comment line (`: ping`) every `heartbeatS`, so proxies keep the
  *   connection open and clients notice a dead one.
- * - Limits: `maxTotal` open streams in all and `maxPerUser` per user; more
- *   answer 429. A client that does not read for `writeTimeoutS` is dropped.
+ * - Limits: `maxTotal` open streams in all, `maxPerUser` per user and, when
+ *   a trusted proxy header gives the client IP, `maxPerIp` per IP (anonymous
+ *   accounts cost nothing, so the per-user limit alone does not stop one
+ *   client from taking every slot); more answer 429. A client that does not
+ *   read for `writeTimeoutS` is dropped.
  * - The stream ends with `event: end` and `data: {"reason": …}`:
  *   `token_expired` (at the access token's expiry: reconnect with a fresh
  *   token), `not_found` (access lost, or the route is gone), `trip_ended`
- *   (a trip stream's trip is over and no longer today's), `shutdown`
+ *   (a trip stream's trip is over and no longer today's), `unavailable` (the
+ *   engine could not reload access data for too long; reconnect later), `shutdown`
  *   (engine restart: reconnect after the `retry` delay).
  */
 import type { SSEStreamingApi } from 'hono/streaming';
@@ -23,6 +27,8 @@ import type { Change, LiveHub } from './hub.ts';
 export interface StreamLimits {
   maxTotal: number;
   maxPerUser: number;
+  /** Per client IP; only applied when the IP comes from a trusted proxy header (LIVE_CLIENT_IP_HEADER). */
+  maxPerIp: number;
   heartbeatS: number;
   minIntervalMs: number;
   /** Reconnect delay suggested to clients (`retry:`), ms. */
@@ -33,13 +39,14 @@ export interface StreamLimits {
 export const defaultStreamLimits: StreamLimits = {
   maxTotal: 2000,
   maxPerUser: 4,
+  maxPerIp: 20,
   heartbeatS: 20,
   minIntervalMs: 1000,
   retryMs: 5000,
   writeTimeoutS: 30,
 };
 
-export type EndReason = 'token_expired' | 'not_found' | 'trip_ended' | 'shutdown' | 'slow_client';
+export type EndReason = 'token_expired' | 'not_found' | 'trip_ended' | 'unavailable' | 'shutdown' | 'slow_client';
 
 interface Slot {
   user: string;
@@ -52,6 +59,7 @@ export class StreamRegistry {
   readonly limits: StreamLimits;
   readonly #open = new Set<Slot>();
   readonly #perUser = new Map<string, number>();
+  readonly #perIp = new Map<string, number>();
   #closing = false;
   metrics = { opened: 0, rejected: 0 };
 
@@ -63,13 +71,18 @@ export class StreamRegistry {
     return this.#open.size;
   }
 
-  /** Reserves a slot for a user, or null when a limit is reached (or the engine is shutting down). */
-  reserve(user: string): { release(): void; register(s: Omit<Slot, 'user'>): void } | null {
-    if (this.#closing || this.#open.size >= this.limits.maxTotal || (this.#perUser.get(user) ?? 0) >= this.limits.maxPerUser) {
+  /** Reserves a slot for a user (and client IP, if known), or null when a limit is reached (or the engine is shutting down). */
+  reserve(user: string, ip: string | null = null): { release(): void; register(s: Omit<Slot, 'user'>): void } | null {
+    if (
+      this.#closing || this.#open.size >= this.limits.maxTotal
+      || (this.#perUser.get(user) ?? 0) >= this.limits.maxPerUser
+      || (ip !== null && (this.#perIp.get(ip) ?? 0) >= this.limits.maxPerIp)
+    ) {
       this.metrics.rejected++;
       return null;
     }
     this.#perUser.set(user, (this.#perUser.get(user) ?? 0) + 1);
+    if (ip !== null) this.#perIp.set(ip, (this.#perIp.get(ip) ?? 0) + 1);
     let slot: Slot | null = null;
     // Counted at once, so concurrent requests cannot pass the limits.
     const placeholder: Slot = { user, end: () => undefined, done: Promise.resolve() };
@@ -86,9 +99,8 @@ export class StreamRegistry {
         if (released) return;
         released = true;
         this.#open.delete(slot ?? placeholder);
-        const n = (this.#perUser.get(user) ?? 1) - 1;
-        if (n <= 0) this.#perUser.delete(user);
-        else this.#perUser.set(user, n);
+        decrement(this.#perUser, user);
+        if (ip !== null) decrement(this.#perIp, ip);
       },
     };
   }
@@ -105,12 +117,18 @@ export class StreamRegistry {
   }
 }
 
+function decrement(m: Map<string, number>, key: string): void {
+  const n = (m.get(key) ?? 1) - 1;
+  if (n <= 0) m.delete(key);
+  else m.set(key, n);
+}
+
 export interface StreamSpec {
   /** SSE event name of the content messages (`route`, `trip`). */
   event: string;
   /** Builds the current content; null = no longer visible. */
   build(): object | null;
-  /** Why build() returned null (default not_found: access lost or gone). */
+  /** Why build() returned null (not_found: access lost or gone; unavailable; trip_ended). */
   goneReason?(): EndReason;
   /** Whether a change concerns this stream. */
   relevant(c: Change): boolean;

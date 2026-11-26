@@ -32,18 +32,20 @@ interface Setup {
   get(path: string, uid?: string | null, headers?: Record<string, string>): Promise<Response>;
 }
 
-async function setup(opts: { extras?: Partial<LiveExtras>; limits?: Partial<StreamLimits>; route?: 'loop' } = {}): Promise<Setup> {
+async function setup(opts: { extras?: Partial<LiveExtras>; limits?: Partial<StreamLimits>; route?: 'loop'; maxAgeS?: number; clientIpHeader?: string } = {}): Promise<Setup> {
   const trips = [{ id: TRIP, serviceDate: DATE, start: '07:30' }];
   const s = await Scenario.create(opts.route === 'loop' ? loopRoute(trips) : germanSchool(trips));
   const live = new MemoryLiveStore(s, { memberships: [{ deviceId: MEMBER, audienceId: AUDIENCE }], ...opts.extras });
-  const hub = new LiveHub({ store: live, clock: s.clock, log: silentLogger, trips: () => s.engine.trips, staleAfterS: s.thresholds.staleAfterS, debounceMs: 0, minReloadIntervalMs: 0 });
+  const hub = new LiveHub({ store: live, clock: s.clock, log: silentLogger, trips: () => s.engine.trips, staleAfterS: s.thresholds.staleAfterS, debounceMs: 0, minReloadIntervalMs: 0,
+    // The replay clock jumps hours ahead of the last load; freshness has its own test.
+    maxAgeS: opts.maxAgeS ?? 7 * 24 * 3600 });
   s.observers.push(hub);
   await s.restart();
   await hub.reload();
   await hub.listen();
   const signer = new TokenSigner();
   const streams = new StreamRegistry({ ...defaultStreamLimits, minIntervalMs: 0, ...opts.limits });
-  const app = createApp({ engine: s.engine, traccarSecret: 'a'.repeat(40), log: silentLogger, live: { hub, verifier: signer.verifier(), streams, log: silentLogger } });
+  const app = createApp({ engine: s.engine, traccarSecret: 'a'.repeat(40), log: silentLogger, live: { hub, verifier: signer.verifier(), streams, log: silentLogger, clientIpHeader: opts.clientIpHeader ?? null } });
   const get = (path: string, uid: string | null = MEMBER, headers: Record<string, string> = {}): Promise<Response> =>
     Promise.resolve(app.request(path, { headers: { ...(uid ? { Authorization: `Bearer ${signer.token(uid)}` } : {}), ...headers } }));
   return { s, live, hub, signer, streams, app, get };
@@ -98,13 +100,15 @@ describe('live API: members polling a route', () => {
     assert.doesNotMatch(JSON.stringify(body), /"lon"|"lat"/);
   });
 
-  it('answers 304 to a matching If-None-Match (cheap polling)', async () => {
+  it('answers 304 to a matching If-None-Match (cheap polling), also a second later', async () => {
     const t = await setup();
     const first = await t.get(`/v1/live/routes/${ROUTE}`);
     const tag = first.headers.get('etag');
     assert.ok(tag);
+    t.s.clock.set(new Date(t.s.clock.now().getTime() + 1000)); // generatedAt changes
     const again = await t.get(`/v1/live/routes/${ROUTE}`, MEMBER, { 'If-None-Match': tag });
     assert.equal(again.status, 304);
+    assert.equal(again.headers.get('cache-control'), 'private, max-age=5');
   });
 
   it('map member: the position while the trip is active, on route and fresh; never after', async () => {
@@ -170,6 +174,56 @@ describe('live API: members polling a route', () => {
     t.live.extras.memberships = [];
     await changed(t);
     assert.equal((await t.get(`/v1/live/routes/${ROUTE}`)).status, 404);
+  });
+
+  it('fails closed for members when access data could not be reloaded for too long; public stays up', async () => {
+    const t = await setup({ maxAgeS: 300, extras: { visibility: 'public' } });
+    t.live.failAlways = true;
+    t.s.clock.set(new Date(t.s.clock.now().getTime() + 200_000));
+    await assert.rejects(t.hub.reload());
+    assert.equal((await t.get(`/v1/live/routes/${ROUTE}`)).status, 200, 'within the limit');
+    t.s.clock.set(new Date(t.s.clock.now().getTime() + 200_000));
+    const res = await t.get(`/v1/live/routes/${ROUTE}`);
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get('cache-control'), 'no-store');
+    assert.equal((await t.get(`/v1/public/routes/${OPERATOR_SLUG}/${ROUTE_SLUG}`, null)).status, 200, 'public data is not member data');
+    const health = await json<{ live: { fresh: boolean; ageS: number } }>(await t.app.request('/healthz'));
+    assert.equal(health.live.fresh, false);
+    assert.equal(health.live.ageS, 400);
+    t.live.failAlways = false;
+    await t.hub.reload();
+    assert.equal((await t.get(`/v1/live/routes/${ROUTE}`)).status, 200, 'back after a good reload');
+  });
+
+  it('a notification reloads only the part of its table', async () => {
+    const t = await setup();
+    t.live.partsLoaded = [];
+    t.live.notify('membership');
+    t.live.notify('audience_route');
+    await new Promise((r) => setTimeout(r, 10));
+    t.live.notify('trip_instance_stop');
+    await new Promise((r) => setTimeout(r, 10));
+    t.live.notify('unknown_table');
+    await new Promise((r) => setTimeout(r, 10));
+    assert.deepEqual(t.live.partsLoaded, [['access'], ['trips'], ['schedule', 'access', 'trips', 'follows']]);
+  });
+
+  it('starts without the live API when its snapshot fails, answers 503, and loads it later', async () => {
+    const t = await setup();
+    const hub = new LiveHub({ store: t.live, clock: t.s.clock, log: silentLogger, trips: () => t.s.engine.trips, staleAfterS: 120 });
+    const app = createApp({ engine: t.s.engine, traccarSecret: 'a'.repeat(40), log: silentLogger, live: { hub, verifier: t.signer.verifier(), streams: t.streams, log: silentLogger } });
+    t.live.failAlways = true;
+    const loading = hub.loadInBackground(5);
+    // The engine itself works meanwhile.
+    assert.deepEqual(await t.s.feed(firstHalf(t.s).fixes.slice(0, 3)), ['processed', 'processed', 'processed']);
+    const before = await app.request(`/v1/live/routes/${ROUTE}`, { headers: { Authorization: `Bearer ${t.signer.token(MEMBER)}` } });
+    assert.equal(before.status, 503);
+    assert.equal((await app.request(`/v1/public/routes/${OPERATOR_SLUG}/${ROUTE_SLUG}`)).status, 503);
+    t.live.failAlways = false;
+    await loading;
+    assert.equal(hub.loaded, true);
+    const after = await app.request(`/v1/live/routes/${ROUTE}`, { headers: { Authorization: `Bearer ${t.signer.token(MEMBER)}` } });
+    assert.equal(after.status, 200);
   });
 
   it('keeps answering from memory when a reload fails (Supabase outage)', async () => {
@@ -317,6 +371,31 @@ describe('live API: Server-Sent Events', () => {
     await r.cancel();
     await new Promise((res2) => setTimeout(res2, 20));
     assert.equal(t.streams.size, 0, 'the slot is freed when the client goes away');
+  });
+
+  it('limits streams per client IP when a trusted proxy header is configured', async () => {
+    const t = await setup({ limits: { maxPerIp: 2 }, clientIpHeader: 'cf-connecting-ip' });
+    t.live.extras.memberships.push({ deviceId: OTHER, audienceId: AUDIENCE }, { deviceId: TOURIST, audienceId: AUDIENCE });
+    await changed(t);
+    const ip = { 'CF-Connecting-IP': '203.0.113.7' };
+    const a = new SseReader(await t.get(`/v1/live/routes/${ROUTE}/stream`, MEMBER, ip));
+    const b = new SseReader(await t.get(`/v1/live/routes/${ROUTE}/stream`, OTHER, ip));
+    await a.until((x) => x.includes('event: route'));
+    await b.until((x) => x.includes('event: route'));
+    assert.equal((await t.get(`/v1/live/routes/${ROUTE}/stream`, TOURIST, ip)).status, 429, 'third account, same IP');
+    const c = new SseReader(await t.get(`/v1/live/routes/${ROUTE}/stream`, TOURIST, { 'CF-Connecting-IP': '198.51.100.1' }));
+    await c.until((x) => x.includes('event: route'));
+    for (const r of [a, b, c]) await r.cancel();
+    // Without a configured header the header is ignored (it could be forged).
+    const u = await setup({ limits: { maxPerIp: 1 } });
+    u.live.extras.memberships.push({ deviceId: OTHER, audienceId: AUDIENCE });
+    await changed(u);
+    const d = new SseReader(await u.get(`/v1/live/routes/${ROUTE}/stream`, MEMBER, ip));
+    const e = new SseReader(await u.get(`/v1/live/routes/${ROUTE}/stream`, OTHER, ip));
+    await d.until((x) => x.includes('event: route'));
+    await e.until((x) => x.includes('event: route'));
+    await d.cancel();
+    await e.cancel();
   });
 
   it('limits streams per user and in total (429)', async () => {

@@ -5,7 +5,7 @@
 --   Operator L: public route LR, stop LS.
 begin;
 create extension if not exists pgtap with schema extensions;
-select plan(19);
+select plan(20);
 
 insert into public.operator (id, slug, name, default_visibility) values
   ('90000000-0000-4000-8000-000000000001', 'live-test-hotel', '{"en": "Hotel"}', 'invited_eta');
@@ -101,6 +101,7 @@ select ok(
     !~ 'progress_m',
   'progress updates do not notify'
 );
+select hasnt_trigger('public', 'subscription', 'notify_live_change', 'subscriptions (frequent, mini map only) do not notify');
 select lives_ok(
   $$ update public.membership set revoked_at = revoked_at where false $$,
   'the notify trigger runs without errors'

@@ -118,6 +118,9 @@ export function createApp(deps: AppDeps): Hono {
       alerts: deps.alertMetrics ? alertCounters(deps.alertMetrics()) : null,
       live: deps.live ? {
         loaded: deps.live.hub.loaded,
+        fresh: deps.live.hub.fresh,
+        ageS: deps.live.hub.ageS === null ? null : Math.round(deps.live.hub.ageS),
+        listening: deps.live.hub.listening,
         membersEnabled: deps.live.verifier !== null,
         lastReloadAt: deps.live.hub.metrics.lastReloadAt,
         reloadFailures: deps.live.hub.metrics.reloadFailures,

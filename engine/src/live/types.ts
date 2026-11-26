@@ -131,10 +131,31 @@ export interface VehicleFix {
   at: Date;
 }
 
+/**
+ * Parts of the snapshot, reloaded separately after a change notification:
+ * schedule (names, slugs, patterns, trips), access (staff, drivers,
+ * memberships, audiences), trips (trip instances with stop events and planned
+ * stops), follows (subscriptions and the followed-stop log; only reloaded
+ * periodically, see the migration).
+ */
+export type LivePart = 'schedule' | 'access' | 'trips' | 'follows';
+export const LIVE_PARTS: readonly LivePart[] = ['schedule', 'access', 'trips', 'follows'];
+
+/** Which part a notifying table belongs to (payload of buspilot_live). Unknown tables reload everything. */
+export const PART_OF_TABLE: Readonly<Record<string, LivePart>> = {
+  operator: 'schedule', route: 'schedule', stop: 'schedule', trip_pattern: 'schedule', pattern_stop: 'schedule', trip: 'schedule',
+  staff_role: 'access', driver_vehicle: 'access', membership: 'access', audience_route: 'access', trip_instance_audience: 'access',
+  trip_instance: 'trips', trip_instance_stop: 'trips',
+};
+
+/** A loaded snapshot part: `loadedAt` plus the fields of the parts asked for. */
+export type LiveSnapshotPart = Pick<LiveSnapshot, 'loadedAt'> & Partial<Omit<LiveSnapshot, 'loadedAt'>>;
+
 export interface LiveStore {
-  loadLiveSnapshot(): Promise<LiveSnapshot>;
-  /** Calls `onChange` when the database notifies a change (channel buspilot_live). Resolves to an unlisten function. */
-  listenLiveChanges(onChange: () => void, onReconnect: () => void): Promise<() => Promise<void>>;
+  /** Loads the given parts (default: all). */
+  loadLiveSnapshot(parts?: readonly LivePart[]): Promise<LiveSnapshotPart>;
+  /** Calls `onChange(table)` when the database notifies a change (channel buspilot_live). Resolves to an unlisten function. */
+  listenLiveChanges(onChange: (table: string) => void, onReconnect: () => void): Promise<() => Promise<void>>;
 }
 
 export type { StopState, TripStatus };
