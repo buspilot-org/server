@@ -180,7 +180,7 @@ Live positions and ETAs for the rider app and the public web pages, served by th
 |---|---|---|
 | `GET /v1/live/routes/:routeId` | Members | The route with today's trips (operator time zone) and active ones: status, stops with state and ETA, the bus position where allowed |
 | `GET /v1/live/routes/:routeId/stream` | Members | The same as Server-Sent Events while the route or map screen is open |
-| `GET /v1/live/trips/:tripInstanceId` | Members | One of today's or an active trip, e.g. a live trip without a route (a tour) for its audiences; older trips answer `404` (no history) |
+| `GET /v1/live/trips/:tripInstanceId` | Members | One of today's, an active or a future trip, e.g. a live trip without a route (a tour) for its audiences; older trips answer `404` (no history) |
 | `GET /v1/live/trips/:tripInstanceId/stream` | Members | The same as Server-Sent Events |
 | `GET /v1/live/stops/:stopId` | Members | Today's arrivals at a stop (home cards): the latest served visits and what comes next, at most 50 |
 | `GET /v1/public/routes/:operatorSlug/:routeSlug` | Anyone | A `public` route (`buspilot.org/r/<operator>/<route>`) |
@@ -241,6 +241,7 @@ Live positions and ETAs for the rider app and the public web pages, served by th
 - **Streams** (`…/stream`, members, while the map or route screen is open; close them when it is not): `text/event-stream`, first `retry: 5000`, then an `event: route` (or `trip`) with the same JSON as polling, again whenever it changes (at most once a second, only real changes), and `: ping` every 20 s. A stream ends with `event: end` and `data: {"reason": …}`:
   - `token_expired`: at the access token's expiry; reconnect with the refreshed token;
   - `not_found`: access lost or the route is gone; stop streaming;
+  - `trip_ended` (trip streams): the trip is over and no longer today's; stop streaming;
   - `shutdown`: the engine restarts; reconnect after the `retry` delay.
 
   At most 4 streams per user and 2000 in all (`429` with `Retry-After`). EventSource in browsers cannot send headers: web clients use `fetch` streaming (or poll). The rider app (`http` package or `dio` with a streamed response) sends the header.

@@ -211,6 +211,12 @@ function statusOf(ctx: ViewContext, i: LiveInstanceRow): TripStatus {
   return rt;
 }
 
+/** A trip on a later service date (operator time zone). */
+export function isFuture(ctx: ViewContext, i: LiveInstanceRow): boolean {
+  const tz = ctx.dir.operators.get(i.operatorId)?.timezone ?? 'Asia/Tokyo';
+  return i.serviceDate > localDate(ctx.now, tz);
+}
+
 /** Today's trips (operator-local service date) and active ones. */
 function isCurrent(ctx: ViewContext, i: LiveInstanceRow, status: TripStatus): boolean {
   if (status === 'active') return true;
@@ -388,8 +394,9 @@ export function routeView(ctx: ViewContext, viewer: Viewer, routeId: string): Ro
 /** GET /v1/live/trips/:tripInstanceId: null = 404. */
 export function tripOnlyView(ctx: ViewContext, viewer: Viewer, tripInstanceId: string): TripOnlyView | null {
   const i = ctx.dir.instances.get(tripInstanceId);
-  // Only today's and active trips: no history of older ones.
-  if (!i || !isCurrent(ctx, i, statusOf(ctx, i))) return null;
+  // Today's, active and future trips (a tour announced in advance); no
+  // history of older ones.
+  if (!i || !(isCurrent(ctx, i, statusOf(ctx, i)) || isFuture(ctx, i))) return null;
   const trip = tripView(ctx, viewer, i);
   const operator = operatorRef(ctx, i.operatorId);
   if (!trip || !operator) return null;

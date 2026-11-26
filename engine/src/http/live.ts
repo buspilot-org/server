@@ -24,7 +24,7 @@ import { errorMessage } from '../log.ts';
 import type { Claims, TokenVerifier } from '../live/auth.ts';
 import { AuthError } from '../live/auth.ts';
 import type { Change, LiveHub } from '../live/hub.ts';
-import type { StreamRegistry } from '../live/streams.ts';
+import type { EndReason, StreamRegistry } from '../live/streams.ts';
 import { runStream } from '../live/streams.ts';
 import type { ViewContext, Viewer } from '../live/views.ts';
 import { routeView, stopView, tripOnlyView } from '../live/views.ts';
@@ -138,7 +138,10 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
 
   // --- Members: Server-Sent Events --------------------------------------
 
-  const stream = (c: Context<Env>, event: string, build: (ctx: ViewContext, viewer: Viewer) => object | null, relevant: (ch: Change) => boolean): Response => {
+  const stream = (
+    c: Context<Env>, event: string, build: (ctx: ViewContext, viewer: Viewer) => object | null, relevant: (ch: Change) => boolean,
+    goneReason?: (ctx: ViewContext, viewer: Viewer) => EndReason,
+  ): Response => {
     const ctx = hub.context();
     if (!ctx) return notReady(c);
     const viewer = viewerOf(c);
@@ -163,6 +166,7 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
             return now ? build(now, viewer) : null;
           },
           relevant,
+          ...(goneReason ? { goneReason: () => { const now = hub.context(); return now ? goneReason(now, viewer) : 'not_found'; } } : {}),
           expiresAt: claims.exp * 1000,
           drop: () => { outgoing?.destroy(); },
         }, first, hub, slot, streams.limits, log);
@@ -184,7 +188,9 @@ export function registerLiveRoutes(app: Hono, deps: LiveDeps): void {
   live.get('/v1/live/trips/:tripInstanceId/stream', (c) => {
     const id = c.req.param('tripInstanceId').toLowerCase();
     if (!isUuid(id)) return notFound(c, NO_STORE);
-    return stream(c, 'trip', (ctx, viewer) => tripOnlyView(ctx, viewer, id), (ch) => ch.all || ch.tripIds.includes(id));
+    return stream(c, 'trip', (ctx, viewer) => tripOnlyView(ctx, viewer, id), (ch) => ch.all || ch.tripIds.includes(id),
+      // Still visible, only no longer today's: the trip is over.
+      (ctx, viewer) => (ctx.dir.access.tripAccess(viewer.uid, id, ctx.now) >= 1 ? 'trip_ended' : 'not_found'));
   });
 
   // --- Public routes and stops (anyone) ---------------------------------

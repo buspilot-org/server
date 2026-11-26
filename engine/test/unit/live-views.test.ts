@@ -129,6 +129,8 @@ describe('live views', () => {
   it('no trips from before today on the trip endpoint (no history)', () => {
     const s = snapshot({ instances: [instance('old', { serviceDate: '2026-11-25', status: 'completed' })] });
     assert.equal(tripOnlyView(ctx(s, undefined), { uid: MEMBER }, 'old'), null);
+    const future = snapshot({ instances: [instance('next', { serviceDate: '2026-11-29', status: 'planned' })] });
+    assert.equal(tripOnlyView(ctx(future, undefined), { uid: MEMBER }, 'next')?.trip.id, 'next', 'a planned future trip is shown');
   });
 
   it('a trip cancelled in the database is cancelled, even while the engine still runs it', () => {

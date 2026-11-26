@@ -11,7 +11,8 @@
  *   answer 429. A client that does not read for `writeTimeoutS` is dropped.
  * - The stream ends with `event: end` and `data: {"reason": …}`:
  *   `token_expired` (at the access token's expiry: reconnect with a fresh
- *   token), `not_found` (access lost, or the route is gone), `shutdown`
+ *   token), `not_found` (access lost, or the route is gone), `trip_ended`
+ *   (a trip stream's trip is over and no longer today's), `shutdown`
  *   (engine restart: reconnect after the `retry` delay).
  */
 import type { SSEStreamingApi } from 'hono/streaming';
@@ -38,7 +39,7 @@ export const defaultStreamLimits: StreamLimits = {
   writeTimeoutS: 30,
 };
 
-export type EndReason = 'token_expired' | 'not_found' | 'shutdown' | 'slow_client';
+export type EndReason = 'token_expired' | 'not_found' | 'trip_ended' | 'shutdown' | 'slow_client';
 
 interface Slot {
   user: string;
@@ -109,6 +110,8 @@ export interface StreamSpec {
   event: string;
   /** Builds the current content; null = no longer visible. */
   build(): object | null;
+  /** Why build() returned null (default not_found: access lost or gone). */
+  goneReason?(): EndReason;
   /** Whether a change concerns this stream. */
   relevant(c: Change): boolean;
   /** When the viewer's access token expires (ms since epoch). */
@@ -132,6 +135,8 @@ export async function runStream(
   log: Logger,
 ): Promise<void> {
   let finished = false;
+  /** (A function: finish() may set `finished` during an await.) */
+  const isFinished = (): boolean => finished;
   let resolveDone!: () => void;
   const done = new Promise<void>((r) => { resolveDone = r; });
   let lastBody = '';
@@ -187,7 +192,7 @@ export async function runStream(
       return;
     }
     if (content === null) {
-      await finish('not_found');
+      await finish(spec.goneReason?.() ?? 'not_found');
       return;
     }
     await sendContent(content);
@@ -238,6 +243,6 @@ export async function runStream(
   }, limits.heartbeatS * 1000));
   const untilExpiry = Math.min(spec.expiresAt - Date.now(), 2 ** 31 - 1);
   timers.push(setTimeout(() => { void finish('token_expired'); }, Math.max(0, untilExpiry)));
-  if (await write(`retry: ${limits.retryMs}\n\n`)) await sendContent(first);
+  if (await write(`retry: ${limits.retryMs}\n\n`) && !isFinished()) await sendContent(first);
   await done;
 }
