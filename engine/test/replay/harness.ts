@@ -79,7 +79,8 @@ export class MemoryStore implements Store, AlertStore {
     return Promise.resolve(copy);
   }
 
-  persist(w: Writes): Promise<PersistResult> {
+  persist(input: Writes): Promise<PersistResult> {
+    let w = input;
     this.persistCalls++;
     if (this.failNext > 0) {
       this.failNext--;
@@ -88,6 +89,7 @@ export class MemoryStore implements Store, AlertStore {
     const v = w.vehicleId;
     // Same order and guards as PgStore: release, claim, vehicle state, stop events, ETAs, trip.
     let releaseApplied = false;
+    let releasedRow: PersistResult['releasedRow'] = null;
     if (w.release !== null) {
       const row = this.instance(w.release);
       if (row.kind === 'live' && row.status === 'active' && row.vehicleId === v
@@ -96,6 +98,11 @@ export class MemoryStore implements Store, AlertStore {
         for (const e of row.stopEvents) e.eta = null;
         releaseApplied = true;
         this.releases.push(w.release);
+      } else if (row.status === 'planned' && row.vehicleId === v && row.startedAt === null) {
+        releaseApplied = true;
+      } else {
+        releasedRow = { status: row.status, vehicleId: row.vehicleId };
+        w = { ...w, trip: null, stopEvents: [], etas: [] };
       }
     }
     if (w.trip && w.trip.status !== 'planned') {
@@ -142,7 +149,7 @@ export class MemoryStore implements Store, AlertStore {
         this.etaWrites++;
       }
     }
-    let tripApplied = true;
+    let tripApplied = input.trip === null;
     if (w.trip) {
       const tr = w.trip;
       const row = this.instance(tr.id);
@@ -162,7 +169,8 @@ export class MemoryStore implements Store, AlertStore {
         row.endedAt ??= tr.endedAt;
       }
     }
-    return Promise.resolve({ tripApplied, releaseApplied });
+    if (input.release === null) return Promise.resolve({ tripApplied });
+    return Promise.resolve(releaseApplied ? { tripApplied, releaseApplied } : { tripApplied, releaseApplied, releasedRow });
   }
 
   loadSubscriptions(): Promise<Subscription[]> {

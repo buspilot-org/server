@@ -211,9 +211,17 @@ describe('live trips against the seeded database', () => {
     assert.deepEqual(early, { status: 'planned', progress_m: 0, started_at: null, progress_at: null, vehicle_id: VEHICLE });
     const [ev] = await sql<{ state: string; eta: Date | null }[]>`select state::text as state, eta from public.stop_event where trip_instance_id = ${L_EARLY}`;
     assert.deepEqual(ev, { state: 'upcoming', eta: null });
-    assert.equal((await release(L_EARLY)).releaseApplied, false, 'only a running trip');
+    assert.equal((await release(L_EARLY)).releaseApplied, true, 'idempotent: a retried position finds it released');
 
-    assert.equal((await release(L_REACHED)).releaseApplied, false, 'not once it reached a stop');
+    // Refused (it reached a stop): no trip start in the same write.
+    const res = await store.persist({
+      vehicleId: VEHICLE, release: L_REACHED, vehicleState: null,
+      trip: { id: L_TOUR, status: 'active', vehicleId: VEHICLE, startedBy: 'driver', progressM: 0, progressAt: null, lastConfirmedStopSequence: null, offRouteSince: null, startedAt: new Date(), endedAt: null },
+      stopEvents: [], etas: [],
+    });
+    assert.deepEqual(res, { tripApplied: false, releaseApplied: false, releasedRow: { status: 'active', vehicleId: VEHICLE } });
+    const [tour] = await sql<{ status: string; vehicle_id: string | null }[]>`select status::text as status, vehicle_id from public.trip_instance where id = ${L_TOUR}`;
+    assert.deepEqual(tour, { status: 'planned', vehicle_id: null }, 'the start was not written');
     const [reached] = await sql<{ status: string; progress_m: number }[]>`select status::text as status, progress_m from public.trip_instance where id = ${L_REACHED}`;
     assert.deepEqual(reached, { status: 'active', progress_m: 250 });
   });

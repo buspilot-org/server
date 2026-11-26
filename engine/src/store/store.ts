@@ -104,8 +104,15 @@ export interface SnapshotRows {
 
 export interface PersistResult {
   tripApplied: boolean;
-  /** The release (if any) was applied: the live trip is planned again. */
+  /**
+   * The release (if any) holds: the live trip is planned on this vehicle
+   * (now, or already by an earlier attempt of the same position). When it
+   * does not, only the vehicle state was written (no trip start, stop events
+   * or ETAs in the same write) and `releasedRow` is the trip's state in the
+   * database.
+   */
   releaseApplied?: boolean;
+  releasedRow?: { status: TripStatus; vehicleId: string | null } | null;
 }
 
 export interface Store {

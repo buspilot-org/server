@@ -17,7 +17,7 @@ import type { XY } from '../geo/plane.ts';
 import { distance } from '../geo/plane.ts';
 import type { Logger } from '../log.ts';
 import { errorMessage } from '../log.ts';
-import type { Store } from '../store/store.ts';
+import type { PersistResult, Store } from '../store/store.ts';
 import type { StartStreak } from './assigner.ts';
 import {
   activeTrip, chooseStart, evaluateStart, liveStartCandidates, releasedProgress, scheduledInstance, startCandidates, takeoverDue, windowOpen,
@@ -86,6 +86,14 @@ export class Engine {
   readonly #queues = new Map<string, Promise<unknown>>();
   /** Trip starts the database refused (another vehicle runs the trip), per vehicle and trip, until the next reload. */
   readonly #refused = new Set<string>();
+  /**
+   * Live trips the engine released (assigner.ts rule 5), with the start the
+   * database row had: a reload whose snapshot still shows that start (read
+   * before the release committed) is stale and ignored.
+   */
+  readonly #released = new Map<string, Date | null>();
+  /** Releases the database refused while the trip still runs on the vehicle: not tried again until the next reload. */
+  readonly #releaseRefused = new Set<string>();
   /** The last vehicle_state written per vehicle (throttling). */
   readonly #stateWritten = new Map<string, { at: Date; tripInstanceId: string | null; offRoute: boolean }>();
   readonly metrics: EngineMetrics = {
@@ -162,7 +170,16 @@ export class Engine {
       existing.instance = instance;
       existing.scheduledVehicleId = scheduledVehicleId;
       const mem = existing.progress;
-      if (mem.status === 'planned' || mem.status === 'cancelled') {
+      const releasedFrom = this.#released.get(instance.id);
+      if (releasedFrom !== undefined && (row.status !== 'active' || row.startedAt?.getTime() !== releasedFrom?.getTime())) {
+        this.#released.delete(instance.id);
+      }
+      const staleRelease = mem.status === 'planned' && releasedFrom !== undefined && row.status === 'active'
+        && row.vehicleId === mem.vehicleId && row.startedAt?.getTime() === releasedFrom?.getTime();
+      if (staleRelease) {
+        // Read before the release committed: memory is newer.
+        existing.progress = alignStops(mem, { ...row, status: 'planned', startedAt: null, progressM: 0 }, instance, before);
+      } else if (mem.status === 'planned' || mem.status === 'cancelled') {
         // Take the row only if it changed, so a trip start being written
         // right now is not discarded by a stale copy.
         if (row.status !== mem.status || row.vehicleId !== mem.vehicleId) existing.progress = progressFromRow(row, instance);
@@ -199,6 +216,7 @@ export class Engine {
       for (const id of streaks.keys()) if (this.#trips.get(id)?.progress.status !== 'planned') streaks.delete(id);
     }
     this.#refused.clear();
+    this.#releaseRefused.clear();
     this.#cache = cache;
     this.metrics.lastReloadAt = this.#clock.now().toISOString();
     this.#notify((o) => { o.tripsReloaded(this.#trips.values()); });
@@ -350,7 +368,10 @@ export class Engine {
     // A live trip started too early (no first planned time, no stop reached)
     // gives the vehicle back to a scheduled trip that is now due.
     let released: TripRuntime | null = null;
-    if (trip && takeoverDue(trip, this.#trips.values(), vehicle, at, t, (x) => this.#refused.has(`${vehicle.id}:${x.instance.id}`))) {
+    if (
+      trip && !this.#releaseRefused.has(trip.instance.id)
+      && takeoverDue(trip, this.#trips.values(), vehicle, at, t, (x) => this.#refused.has(`${vehicle.id}:${x.instance.id}`))
+    ) {
       writes.release = trip.instance.id;
       updates.set(trip, { base: trip.progress, next: releasedProgress(trip.progress) });
       logs.push(['live trip released for a scheduled trip', { tripInstanceId: trip.instance.id, vehicleId: vehicle.id }]);
@@ -441,11 +462,13 @@ export class Engine {
 
     let tripApplied = true;
     let releaseApplied = true;
+    let releasedRow: PersistResult['releasedRow'] = null;
     if (!isEmpty(writes)) {
       try {
         const res = await this.#store.persist(writes);
         tripApplied = res.tripApplied;
-        releaseApplied = res.releaseApplied ?? writes.release !== null;
+        releaseApplied = res.releaseApplied ?? false;
+        releasedRow = res.releasedRow ?? null;
       } catch (err) {
         this.metrics.positionsFailed++;
         throw err;
@@ -456,13 +479,25 @@ export class Engine {
     // The trip compared next time is the one the engine assigned (not what the
     // database linked), so a refused trip write does not force a write per fix.
     if (writes.vehicleState) this.#stateWritten.set(vehicle.id, { at, tripInstanceId: activeId, offRoute });
-    for (const [tr, u] of updates) {
-      if (tr === released && !releaseApplied) {
-        // The database did not take the release (the trip reached a stop or
-        // ended meanwhile): memory keeps its state; the next reload aligns.
-        this.#log.warn('live trip release not applied', { tripInstanceId: tr.instance.id, vehicleId: vehicle.id });
-        continue;
+    const releaseRefused = released !== null && !releaseApplied;
+    if (releaseRefused && released) {
+      // The database did not take the release, and nothing of a trip start
+      // was written with it. A trip that ended or moved to another vehicle
+      // meanwhile is taken over from the database at once; otherwise memory
+      // keeps its state.
+      this.#log.warn('live trip release not applied', { tripInstanceId: released.instance.id, vehicleId: vehicle.id });
+      const row = releasedRow;
+      if (row && (row.status === 'cancelled' || row.status === 'completed' || row.vehicleId !== vehicle.id)) {
+        released.progress = { ...released.progress, status: row.status, vehicleId: row.vehicleId };
+      } else {
+        this.#releaseRefused.add(released.instance.id);
       }
+    } else if (released && releaseApplied) {
+      this.#released.set(released.instance.id, released.progress.startedAt);
+    }
+    for (const [tr, u] of updates) {
+      // A refused release keeps nothing of this position's trip changes.
+      if (releaseRefused) break;
       if (!tripApplied && writes.trip?.id === tr.instance.id) {
         // Another vehicle runs this trip (or it was cancelled): the database
         // did not take the change, so memory does not either. The next

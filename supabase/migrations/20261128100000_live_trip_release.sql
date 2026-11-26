@@ -24,8 +24,16 @@ begin
     select p.route_id into new.route_id from public.trip_pattern p where p.id = new.pattern_id;
   end if;
 
+  -- The one exception: a running live trip that has reached no stop goes
+  -- back to planned from the start (no progress, not started).
   if tg_op = 'UPDATE' and new.progress_m < old.progress_m
-     and not (new.kind = 'live' and old.status = 'active' and new.status = 'planned') then
+     and not (
+       old.kind = 'live' and new.kind = 'live'
+       and old.status = 'active' and new.status = 'planned'
+       and new.progress_m = 0 and new.started_at is null
+       and not exists (select 1 from public.stop_event se
+                        where se.trip_instance_id = old.id and se.state not in ('upcoming', 'approaching'))
+     ) then
     raise exception 'progress_m only increases (% → %)', old.progress_m, new.progress_m
       using errcode = 'check_violation';
   end if;

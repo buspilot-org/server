@@ -231,6 +231,37 @@ describe('precedence on one vehicle', () => {
     assert.deepEqual(seen, ['active', 'planned', 'active']);
   });
 
+  it('a reload whose snapshot was read before the release does not undo it', async () => {
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s.addLiveTrip({ id: 'L7', serviceDate: DATE, createdAt: local('06:00') });
+    await s.reload();
+    await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
+    const stale = structuredClone(s.store.rows);
+    const run = exampleRun(s, 'T1');
+    await s.feed(run.fixes.slice(0, 1));
+    assert.deepEqual(s.store.releases, ['L7']);
+    const load = s.store.loadSnapshot.bind(s.store);
+    s.store.loadSnapshot = () => Promise.resolve(structuredClone(stale));
+    await s.reload();
+    s.store.loadSnapshot = load;
+    assert.equal(s.engine.trips.get('L7')?.progress.status, 'planned');
+    await s.feed(run.fixes.slice(1));
+    assert.deepEqual(s.transitions('T1'), ALL_SIX);
+    assert.equal(s.store.instance('L7').status, 'active', 'started again after the school run');
+  });
+
+  it('a release the database refuses (staff cancelled the live trip meanwhile) writes no scheduled start with it', async () => {
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s.addLiveTrip({ id: 'L7', serviceDate: DATE, createdAt: local('06:00') });
+    await s.reload();
+    await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
+    s.store.instance('L7').status = 'cancelled'; // Not reloaded yet.
+    await s.feed(exampleRun(s, 'T1').fixes);
+    assert.deepEqual(s.store.releases, []);
+    assert.equal(s.engine.trips.get('L7')?.progress.status, 'cancelled', 'taken from the database at once');
+    assert.deepEqual(s.transitions('T1'), ALL_SIX, 'the school run is followed');
+  });
+
   it('a position-only live trip started early is taken over too; a timed one never', async () => {
     const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
     s.addLiveTrip({ id: 'L7', serviceDate: DATE, createdAt: local('06:00') });

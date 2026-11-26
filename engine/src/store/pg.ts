@@ -178,13 +178,15 @@ export class PgStore implements Store, AlertStore, LiveStore {
     };
   }
 
-  async persist(w: Writes): Promise<PersistResult> {
+  async persist(input: Writes): Promise<PersistResult> {
     return this.sql.begin(async (sql) => {
+      let w = input;
       const v = w.vehicleId;
       // A live trip released for a scheduled trip (before the scheduled trip
       // is claimed): planned again, without progress or ETAs, only while it
       // runs on this vehicle and has reached no stop.
       let releaseApplied = false;
+      let releasedRow: PersistResult['releasedRow'] = null;
       if (w.release !== null) {
         const released = await sql`
           update public.trip_instance ti set
@@ -197,6 +199,19 @@ export class PgStore implements Store, AlertStore, LiveStore {
         releaseApplied = released.length > 0;
         if (releaseApplied) {
           await sql`update public.stop_event set eta = null where trip_instance_id = ${w.release} and eta is not null`;
+        } else {
+          const [row] = await sql<{ status: TripStatus; vehicle_id: string | null; started_at: Date | null }[]>`
+            select status, vehicle_id, started_at from public.trip_instance where id = ${w.release}`;
+          if (row?.status === 'planned' && row.vehicle_id === v && row.started_at === null) {
+            // Already released by an earlier attempt of this position (its
+            // commit was not acknowledged and Traccar retried): it holds.
+            releaseApplied = true;
+          } else {
+            // Not released (cancelled, moved to another vehicle, or it reached
+            // a stop): no trip start in this write either, only the vehicle state.
+            releasedRow = row ? { status: row.status, vehicleId: row.vehicle_id } : null;
+            w = { ...w, trip: null, stopEvents: [], etas: [] };
+          }
         }
       }
       // Claim the trip for this vehicle first. The row lock makes a second
@@ -298,8 +313,9 @@ export class PgStore implements Store, AlertStore, LiveStore {
       // when it is first awaited, and Promise.all awaits in array order).
       const results = await Promise.all(queries);
       const tripRows = tripIndex >= 0 ? results[tripIndex] : undefined;
-      const tripApplied = tripIndex < 0 || (Array.isArray(tripRows) && tripRows.length > 0);
-      return w.release === null ? { tripApplied } : { tripApplied, releaseApplied };
+      const tripApplied = input.trip === null || (tripIndex >= 0 && Array.isArray(tripRows) && tripRows.length > 0);
+      if (input.release === null) return { tripApplied };
+      return releaseApplied ? { tripApplied, releaseApplied } : { tripApplied, releaseApplied, releasedRow };
     });
   }
 
