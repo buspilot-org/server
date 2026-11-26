@@ -17,7 +17,7 @@ import type { AlertStore, DeliveryClaim, I18nText, Subscription } from '../alert
 import type { StopState, TripStatus, Writes } from '../core/types.ts';
 import type { LivePart, LiveSnapshotPart, LiveStore } from '../live/types.ts';
 import { listenLiveChanges, loadLiveSnapshot } from './live.ts';
-import type { InstanceRow, PersistResult, SnapshotRows, Store } from './store.ts';
+import type { InstanceRow, PersistResult, PlannedStopRow, SnapshotRows, Store } from './store.ts';
 
 type Sql = postgres.Sql;
 
@@ -52,7 +52,7 @@ export class PgStore implements Store, AlertStore, LiveStore {
 
   async loadSnapshot(now: Date): Promise<SnapshotRows> {
     const sql = this.sql;
-    const [operators, vehicles, shapes, patterns, patternStops, instances] = await Promise.all([
+    const [operators, vehicles, shapes, patterns, patternStops, instances, live] = await Promise.all([
       sql<{ id: string; timezone: string }[]>`select id, timezone from public.operator`,
       sql<{ id: string; operator_id: string; traccar_device_id: string; recorded_at: Date | null }[]>`
         select v.id, v.operator_id, v.traccar_device_id, vs.recorded_at
@@ -77,15 +77,15 @@ export class PgStore implements Store, AlertStore, LiveStore {
           from public.pattern_stop ps
           join public.stop s on s.id = ps.stop_id`,
       sql<{
-        id: string; operator_id: string; service_date: string; trip_id: string; pattern_id: string;
+        id: string; operator_id: string; service_date: string; trip_id: string; pattern_id: string; route_id: string;
         start_time: number; vehicle_id: string | null; default_vehicle_id: string | null; status: TripStatus; started_by: 'schedule' | 'driver';
         progress_m: number; progress_at: Date | null; last_confirmed_stop_sequence: number | null;
-        off_route_since: Date | null; started_at: Date | null; ended_at: Date | null;
+        off_route_since: Date | null; started_at: Date | null; ended_at: Date | null; created_at: Date;
       }[]>`
-        select ti.id, ti.operator_id, ti.service_date::text as service_date, ti.trip_id, t.pattern_id,
+        select ti.id, ti.operator_id, ti.service_date::text as service_date, ti.trip_id, t.pattern_id, ti.route_id,
                t.start_time, ti.vehicle_id, t.vehicle_id as default_vehicle_id, ti.status, ti.started_by,
                ti.progress_m, ti.progress_at, ti.last_confirmed_stop_sequence, ti.off_route_since,
-               ti.started_at, ti.ended_at
+               ti.started_at, ti.ended_at, ti.created_at
           from public.trip_instance ti
           join public.trip t on t.id = ti.trip_id
           join public.route r on r.id = ti.route_id
@@ -93,21 +93,58 @@ export class PgStore implements Store, AlertStore, LiveStore {
            and r.active
            and ti.service_date between (${now}::timestamptz - interval '2 days')::date
                                    and (${now}::timestamptz + interval '2 days')::date`,
+      // Live trips: on a pattern of an active route, or without a pattern (any route, or none).
+      sql<{
+        id: string; operator_id: string; service_date: string; pattern_id: string | null; route_id: string | null;
+        vehicle_id: string | null; status: TripStatus; started_by: 'schedule' | 'driver';
+        progress_m: number; progress_at: Date | null; last_confirmed_stop_sequence: number | null;
+        off_route_since: Date | null; started_at: Date | null; ended_at: Date | null; created_at: Date;
+        title: I18nText | null; visible_until: Date | null;
+      }[]>`
+        select ti.id, ti.operator_id, ti.service_date::text as service_date, ti.pattern_id, ti.route_id,
+               ti.vehicle_id, ti.status, ti.started_by,
+               ti.progress_m, ti.progress_at, ti.last_confirmed_stop_sequence, ti.off_route_since,
+               ti.started_at, ti.ended_at, ti.created_at, ti.title, ti.visible_until
+          from public.trip_instance ti
+          left join public.route r on r.id = ti.route_id
+         where ti.kind = 'live'
+           and (ti.pattern_id is null or r.active)
+           and ti.service_date between (${now}::timestamptz - interval '2 days')::date
+                                   and (${now}::timestamptz + interval '2 days')::date`,
     ]);
 
-    const ids = instances.map((i) => i.id);
-    const events = ids.length === 0 ? [] : await sql<{
-      trip_instance_id: string; stop_sequence: number; state: StopState; eta: Date | null;
-      arrived_at: Date | null; departed_at: Date | null; passed_at: Date | null;
-    }[]>`
-      select trip_instance_id, stop_sequence, state, eta, arrived_at, departed_at, passed_at
-        from public.stop_event
-       where trip_instance_id = any(${ids}::uuid[])`;
+    const ids = [...instances.map((i) => i.id), ...live.map((i) => i.id)];
+    const [events, planned] = ids.length === 0 ? [[], []] : await Promise.all([
+      sql<{
+        trip_instance_id: string; stop_sequence: number; state: StopState; eta: Date | null;
+        arrived_at: Date | null; departed_at: Date | null; passed_at: Date | null;
+      }[]>`
+        select trip_instance_id, stop_sequence, state, eta, arrived_at, departed_at, passed_at
+          from public.stop_event
+         where trip_instance_id = any(${ids}::uuid[])`,
+      sql<{
+        trip_instance_id: string; stop_sequence: number; lon: number; lat: number;
+        planned_arrival: Date | null; planned_departure: Date | null;
+      }[]>`
+        select tis.trip_instance_id, tis.stop_sequence,
+               extensions.st_x(s.location::extensions.geometry) as lon,
+               extensions.st_y(s.location::extensions.geometry) as lat,
+               tis.planned_arrival, tis.planned_departure
+          from public.trip_instance_stop tis
+          join public.stop s on s.id = tis.stop_id
+         where tis.trip_instance_id = any(${ids}::uuid[])`,
+    ]);
     const eventsByInstance = new Map<string, InstanceRow['stopEvents']>();
     for (const e of events) {
       const list = eventsByInstance.get(e.trip_instance_id) ?? [];
       list.push({ sequence: e.stop_sequence, state: e.state, eta: e.eta, arrivedAt: e.arrived_at, departedAt: e.departed_at, passedAt: e.passed_at });
       eventsByInstance.set(e.trip_instance_id, list);
+    }
+    const plannedByInstance = new Map<string, PlannedStopRow[]>();
+    for (const p of planned) {
+      const list = plannedByInstance.get(p.trip_instance_id) ?? [];
+      list.push({ sequence: p.stop_sequence, lon: p.lon, lat: p.lat, plannedArrival: p.planned_arrival, plannedDeparture: p.planned_departure });
+      plannedByInstance.set(p.trip_instance_id, list);
     }
 
     return {
@@ -119,19 +156,67 @@ export class PgStore implements Store, AlertStore, LiveStore {
         patternId: s.pattern_id, sequence: s.stop_sequence, lon: s.lon, lat: s.lat,
         distAlongShape: s.dist_along_shape, arrivalOffsetS: s.arrival_offset, departureOffsetS: s.departure_offset,
       })),
-      instances: instances.map((i) => ({
-        id: i.id, operatorId: i.operator_id, serviceDate: i.service_date, tripId: i.trip_id, patternId: i.pattern_id,
-        startTimeS: i.start_time, vehicleId: i.vehicle_id, defaultVehicleId: i.default_vehicle_id, status: i.status, startedBy: i.started_by,
-        progressM: i.progress_m, progressAt: i.progress_at, lastConfirmedStopSequence: i.last_confirmed_stop_sequence,
-        offRouteSince: i.off_route_since, startedAt: i.started_at, endedAt: i.ended_at,
-        stopEvents: eventsByInstance.get(i.id) ?? [],
-      })),
+      instances: [
+        ...instances.map((i): InstanceRow => ({
+          id: i.id, operatorId: i.operator_id, serviceDate: i.service_date, kind: 'scheduled', tripId: i.trip_id, patternId: i.pattern_id,
+          routeId: i.route_id, startTimeS: i.start_time, vehicleId: i.vehicle_id, defaultVehicleId: i.default_vehicle_id, status: i.status,
+          startedBy: i.started_by, progressM: i.progress_m, progressAt: i.progress_at, lastConfirmedStopSequence: i.last_confirmed_stop_sequence,
+          offRouteSince: i.off_route_since, startedAt: i.started_at, endedAt: i.ended_at,
+          stopEvents: eventsByInstance.get(i.id) ?? [],
+          title: null, visibleUntil: null, createdAt: i.created_at, plannedStops: [],
+        })),
+        ...live.map((i): InstanceRow => ({
+          id: i.id, operatorId: i.operator_id, serviceDate: i.service_date, kind: 'live', tripId: null, patternId: i.pattern_id,
+          routeId: i.route_id, startTimeS: null, vehicleId: i.vehicle_id, defaultVehicleId: null, status: i.status,
+          startedBy: i.started_by, progressM: i.progress_m, progressAt: i.progress_at, lastConfirmedStopSequence: i.last_confirmed_stop_sequence,
+          offRouteSince: i.off_route_since, startedAt: i.started_at, endedAt: i.ended_at,
+          stopEvents: eventsByInstance.get(i.id) ?? [],
+          title: i.title, visibleUntil: i.visible_until, createdAt: i.created_at,
+          plannedStops: (plannedByInstance.get(i.id) ?? []).sort((a, b) => a.sequence - b.sequence),
+        })),
+      ],
     };
   }
 
-  async persist(w: Writes): Promise<PersistResult> {
+  async persist(input: Writes): Promise<PersistResult> {
     return this.sql.begin(async (sql) => {
+      let w = input;
       const v = w.vehicleId;
+      // A live trip released for a scheduled trip (before the scheduled trip
+      // is claimed): planned again, without progress or ETAs, only while it
+      // runs on this vehicle and has reached no stop.
+      let releaseApplied = false;
+      let releasedRow: PersistResult['releasedRow'] = null;
+      if (w.release !== null) {
+        const released = await sql`
+          update public.trip_instance ti set
+            status = 'planned', progress_m = 0, progress_at = null, last_confirmed_stop_sequence = null,
+            off_route_since = null, started_at = null, ended_at = null
+           where ti.id = ${w.release} and ti.kind = 'live' and ti.status = 'active' and ti.vehicle_id = ${v}
+             and not exists (select 1 from public.stop_event se
+                              where se.trip_instance_id = ti.id and se.state not in ('upcoming', 'approaching'))
+          returning ti.id`;
+        releaseApplied = released.length > 0;
+        if (releaseApplied) {
+          await sql`update public.stop_event set eta = null where trip_instance_id = ${w.release} and eta is not null`;
+        } else {
+          const [row] = await sql<{ status: TripStatus; vehicle_id: string | null; started_at: Date | null }[]>`
+            select status, vehicle_id, started_at from public.trip_instance where id = ${w.release}`;
+          if (row?.status === 'planned' && row.vehicle_id === v && row.started_at === null) {
+            // Already released by an earlier attempt of this position (its
+            // commit was not acknowledged and Traccar retried): it holds.
+            releaseApplied = true;
+          } else {
+            // Not released (cancelled, moved to another vehicle, or it reached
+            // a stop): no trip start in this write either, only the vehicle state.
+            releasedRow = row ? { status: row.status, vehicleId: row.vehicle_id } : null;
+            w = {
+              ...w, trip: null, stopEvents: [], etas: [],
+              vehicleState: w.vehicleState === null ? null : { ...w.vehicleState, tripInstanceId: null },
+            };
+          }
+        }
+      }
       // Claim the trip for this vehicle first. The row lock makes a second
       // vehicle starting the same "any vehicle" trip wait for this
       // transaction, and then see that the trip is taken.
@@ -175,6 +260,11 @@ export class PgStore implements Store, AlertStore, LiveStore {
           select ti.operator_id, ti.id, ${e.sequence}, ${e.state}::public.stop_event_state,
                  ${e.arrivedAt}::timestamptz, ${e.departedAt}::timestamptz, ${e.passedAt}::timestamptz
             from public.trip_instance ti where ti.id = ${e.tripInstanceId} and ${runs(e.tripInstanceId)}
+             -- A trip without a pattern has stop events only for its planned
+             -- stops: none for a planned stop staff removed meanwhile.
+             and (ti.pattern_id is not null
+                  or exists (select 1 from public.trip_instance_stop tis
+                              where tis.trip_instance_id = ti.id and tis.stop_sequence = ${e.sequence}))
           on conflict (trip_instance_id, stop_sequence) do update set
             state = excluded.state,
             arrived_at = coalesce(public.stop_event.arrived_at, excluded.arrived_at),
@@ -226,48 +316,87 @@ export class PgStore implements Store, AlertStore, LiveStore {
       // when it is first awaited, and Promise.all awaits in array order).
       const results = await Promise.all(queries);
       const tripRows = tripIndex >= 0 ? results[tripIndex] : undefined;
-      return { tripApplied: tripIndex < 0 || (Array.isArray(tripRows) && tripRows.length > 0) };
+      const tripApplied = input.trip === null || (tripIndex >= 0 && Array.isArray(tripRows) && tripRows.length > 0);
+      if (input.release === null) return { tripApplied };
+      return releaseApplied ? { tripApplied, releaseApplied } : { tripApplied, releaseApplied, releasedRow };
     });
   }
 
   /**
-   * Subscriptions the engine may alert: the device has a push target, the
-   * route is active, and the device may see it (public, or a membership
-   * whose audience includes the route), as `private.route_access` decides
-   * for riders. Muting is checked when an alert is due.
+   * Subscriptions the engine may alert: the device has a push target, and
+   * - a stop of a pattern: the route is active, and the device may see it
+   *   (public, or a membership whose audience includes the route), as
+   *   `private.route_access` decides for riders;
+   * - a planned stop of a live trip: the device may see the trip (its active
+   *   route as above, or a membership in one of the trip's audiences), as
+   *   `private.device_can_see_trip_instance` decides. visible_until is
+   *   checked when an alert is due.
+   * Muting is checked when an alert is due.
    */
   async loadSubscriptions(): Promise<Subscription[]> {
-    const rows = await this.sql<{
-      id: string; operator_id: string; device_id: string; pattern_id: string; stop_sequence: number;
+    type Row = {
+      id: string; operator_id: string; device_id: string; pattern_id: string | null; trip_instance_id: string | null; stop_sequence: number;
       trigger: 'minutes' | 'stops'; trigger_value: number; notify_passed: boolean; muted_until: Date | null; created_at: Date;
-      push_token: string; language: string | null; timezone: string; route_id: string; route_name: I18nText;
+      push_token: string; language: string | null; timezone: string; route_id: string | null; route_name: I18nText | null;
       route_short_name: string | null; stop_id: string; stop_name: I18nText;
-    }[]>`
-      select s.id, s.operator_id, s.device_id, s.pattern_id, s.stop_sequence, s.trigger::text as trigger,
-             s.trigger_value, s.notify_passed, s.muted_until, s.created_at,
-             d.push_token, d.language, o.timezone, r.id as route_id, r.name as route_name,
-             r.short_name as route_short_name, st.id as stop_id, st.name as stop_name
-        from public.subscription s
-        join public.device d on d.id = s.device_id
-        join public.trip_pattern p on p.id = s.pattern_id
-        join public.route r on r.id = p.route_id
-        join public.operator o on o.id = r.operator_id
-        join public.pattern_stop ps on ps.pattern_id = s.pattern_id and ps.stop_sequence = s.stop_sequence
-        join public.stop st on st.id = ps.stop_id
-       where d.push_token is not null and d.push_token <> ''
-         and r.active
-         and (coalesce(r.visibility, o.default_visibility) = 'public'
-              or exists (select 1
-                           from public.audience_route ar
-                           join public.membership m on m.audience_id = ar.audience_id
-                          where ar.route_id = r.id
-                            and m.device_id = s.device_id
-                            and m.revoked_at is null))`;
-    return rows.map((r) => ({
-      id: r.id, operatorId: r.operator_id, deviceId: r.device_id, patternId: r.pattern_id, stopSequence: r.stop_sequence,
-      trigger: r.trigger, triggerValue: r.trigger_value, notifyPassed: r.notify_passed, mutedUntil: r.muted_until,
-      createdAt: r.created_at, pushToken: r.push_token, language: r.language, timezone: r.timezone, routeId: r.route_id,
-      routeName: r.route_name, routeShortName: r.route_short_name, stopId: r.stop_id, stopName: r.stop_name,
+    };
+    const sql = this.sql;
+    const [ofPatterns, ofTrips] = await Promise.all([
+      sql<Row[]>`
+        select s.id, s.operator_id, s.device_id, s.pattern_id, null::uuid as trip_instance_id, s.stop_sequence, s.trigger::text as trigger,
+               s.trigger_value, s.notify_passed, s.muted_until, s.created_at,
+               d.push_token, d.language, o.timezone, r.id as route_id, r.name as route_name,
+               r.short_name as route_short_name, st.id as stop_id, st.name as stop_name
+          from public.subscription s
+          join public.device d on d.id = s.device_id
+          join public.trip_pattern p on p.id = s.pattern_id
+          join public.route r on r.id = p.route_id
+          join public.operator o on o.id = r.operator_id
+          join public.pattern_stop ps on ps.pattern_id = s.pattern_id and ps.stop_sequence = s.stop_sequence
+          join public.stop st on st.id = ps.stop_id
+         where d.push_token is not null and d.push_token <> ''
+           and r.active
+           and (coalesce(r.visibility, o.default_visibility) = 'public'
+                or exists (select 1
+                             from public.audience_route ar
+                             join public.membership m on m.audience_id = ar.audience_id
+                            where ar.route_id = r.id
+                              and m.device_id = s.device_id
+                              and m.revoked_at is null))`,
+      sql<Row[]>`
+        select s.id, s.operator_id, s.device_id, null::uuid as pattern_id, s.trip_instance_id, s.stop_sequence, s.trigger::text as trigger,
+               s.trigger_value, s.notify_passed, s.muted_until, s.created_at,
+               d.push_token, d.language, o.timezone, r.id as route_id, r.name as route_name,
+               r.short_name as route_short_name, st.id as stop_id, st.name as stop_name
+          from public.subscription s
+          join public.device d on d.id = s.device_id
+          join public.trip_instance ti on ti.id = s.trip_instance_id
+          join public.operator o on o.id = ti.operator_id
+          join public.trip_instance_stop tis on tis.trip_instance_id = s.trip_instance_id and tis.stop_sequence = s.stop_sequence
+          join public.stop st on st.id = tis.stop_id
+          left join public.route r on r.id = ti.route_id
+         where d.push_token is not null and d.push_token <> ''
+           and ti.kind = 'live'
+           and ((r.active
+                 and (coalesce(r.visibility, o.default_visibility) = 'public'
+                      or exists (select 1
+                                   from public.audience_route ar
+                                   join public.membership m on m.audience_id = ar.audience_id
+                                  where ar.route_id = r.id
+                                    and m.device_id = s.device_id
+                                    and m.revoked_at is null)))
+                or exists (select 1
+                             from public.trip_instance_audience tia
+                             join public.membership m on m.audience_id = tia.audience_id
+                            where tia.trip_instance_id = ti.id
+                              and m.device_id = s.device_id
+                              and m.revoked_at is null))`,
+    ]);
+    return [...ofPatterns, ...ofTrips].map((r) => ({
+      id: r.id, operatorId: r.operator_id, deviceId: r.device_id, patternId: r.pattern_id, tripInstanceId: r.trip_instance_id,
+      stopSequence: r.stop_sequence, trigger: r.trigger, triggerValue: r.trigger_value, notifyPassed: r.notify_passed,
+      mutedUntil: r.muted_until, createdAt: r.created_at, pushToken: r.push_token, language: r.language, timezone: r.timezone,
+      routeId: r.route_id, routeName: r.route_name, routeShortName: r.route_short_name, stopId: r.stop_id, stopName: r.stop_name,
     }));
   }
 

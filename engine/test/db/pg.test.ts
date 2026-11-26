@@ -183,6 +183,7 @@ describe('PgStore and engine against the seeded database', () => {
     const oldFix = new Date(START.getTime() - 3600_000);
     const backwards: Writes = {
       vehicleId: VEHICLE,
+      release: null,
       vehicleState: {
         vehicleId: VEHICLE, operatorId: 'd0000000-0000-4000-8000-000000000001', tripInstanceId: null,
         lon: 135.19, lat: 34.7, speedKmh: 0, heading: null, accuracyM: null, recordedAt: oldFix,

@@ -140,9 +140,11 @@ export class MemoryLiveStore implements LiveStore {
       patternStops: s.def.stops.map((st) => ({
         patternId: PATTERN, sequence: st.sequence, stopId: idOf(st.sequence), arrivalOffsetS: st.arrivalOffsetS, departureOffsetS: st.departureOffsetS,
       })),
-      trips: rows.instances.map((i) => ({ id: i.tripId, patternId: PATTERN, startTimeS: i.startTimeS, headsign: { en: 'School' }, vehicleId: i.defaultVehicleId })),
+      trips: rows.instances.filter((i) => i.kind === 'scheduled').map((i) => ({
+        id: i.tripId ?? '', patternId: PATTERN, startTimeS: i.startTimeS ?? 0, headsign: { en: 'School' }, vehicleId: i.defaultVehicleId,
+      })),
       instances: [
-        ...rows.instances.map((i) => ({
+        ...rows.instances.filter((i) => i.kind === 'scheduled').map((i) => ({
           id: i.id, operatorId: OPERATOR, kind: 'scheduled' as const, tripId: i.tripId, patternId: PATTERN, routeId: ROUTE,
           serviceDate: i.serviceDate, status: i.status, vehicleId: i.vehicleId, visibleUntil: null, title: null,
           startedAt: i.startedAt, endedAt: i.endedAt, offRouteSince: i.offRouteSince, stopEvents: i.stopEvents, plannedStops: [],

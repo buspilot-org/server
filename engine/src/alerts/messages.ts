@@ -8,6 +8,7 @@
  *   others get English, no language Japanese), so Android shows it while the
  *   app is in the background without any app code.
  */
+import type { TripKind } from '../core/types.ts';
 import type { AlertVariant, I18nText, PushPayload, Subscription } from './types.ts';
 
 export type Lang = 'ja' | 'en' | 'de';
@@ -28,7 +29,10 @@ export interface MessageInput {
   sub: Subscription;
   tripInstanceId: string;
   serviceDate: string;
-  /** Scheduled start of the trip (for `cancelled`). */
+  tripKind: TripKind;
+  /** Live trips: `trip_instance.title`, the notification title. */
+  tripTitle: I18nText | null;
+  /** Scheduled start of the trip (for `cancelled`); live trips: the first planned time, or when it may start. */
   tripStart: Date;
   eta: Date | null;
   delayS: number | null;
@@ -57,8 +61,10 @@ function minutesUntil(eta: Date, now: Date): number {
 export function notificationText(m: MessageInput): { title: string; body: string } {
   const lang = languageOf(m.sub.language);
   const stop = pick(m.sub.stopName, lang);
-  const routeName = pick(m.sub.routeName, lang);
-  const title = m.sub.routeShortName ? `${m.sub.routeShortName} ${routeName}` : routeName;
+  const routeName = m.sub.routeName === null ? '' : pick(m.sub.routeName, lang);
+  const routeTitle = m.sub.routeShortName ? `${m.sub.routeShortName} ${routeName}` : routeName;
+  // A live trip is known by its title (an away game, a tour), not its route.
+  const title = m.tripKind === 'live' && m.tripTitle !== null ? pick(m.tripTitle, lang) || routeTitle : routeTitle;
   const tz = m.sub.timezone;
   const min = m.eta ? minutesUntil(m.eta, m.now) : null;
   const delayMin = m.delayS === null ? null : Math.round(m.delayS / 60);
@@ -87,7 +93,11 @@ export function notificationText(m: MessageInput): { title: string; body: string
       }[lang];
       break;
     case 'cancelled':
-      body = {
+      body = m.tripKind === 'live' ? {
+        ja: 'この運行は中止になりました。',
+        en: 'This trip is cancelled.',
+        de: 'Diese Fahrt fällt aus.',
+      }[lang] : {
         ja: `${month}月${day}日 ${start}発の便は運休です。`,
         en: `The ${start} trip on ${day}/${month} is cancelled.`,
         de: `Die Fahrt um ${start} am ${day}.${month}. fällt aus.`,
@@ -114,12 +124,13 @@ export function buildPayload(m: MessageInput): PushPayload {
       kind: m.variant,
       alert_id: m.deliveryId,
       operator_id: m.sub.operatorId,
-      route_id: m.sub.routeId,
-      pattern_id: m.sub.patternId,
+      route_id: m.sub.routeId ?? '',
+      pattern_id: m.sub.patternId ?? '',
       stop_id: m.sub.stopId,
       stop_sequence: String(m.sub.stopSequence),
       subscription_id: m.sub.id,
       trip_instance_id: m.tripInstanceId,
+      trip_kind: m.tripKind,
       service_date: m.serviceDate,
       trip_start: m.tripStart.toISOString(),
       eta: m.eta?.toISOString() ?? '',

@@ -2,7 +2,7 @@
  * Types of the alert dispatcher (engine.md, "Alert dispatcher";
  * arrival-alerts.md, "Decisions (2026-11-26)").
  */
-import type { TripInstance, TripProgress, TripRuntime } from '../core/types.ts';
+import type { I18nText, TripInstance, TripProgress, TripRuntime } from '../core/types.ts';
 import type { VehicleFix } from '../live/types.ts';
 
 /** `alert_kind` in the database: part of the exactly-once key. */
@@ -19,19 +19,24 @@ export function kindOf(variant: AlertVariant): AlertKind {
   return variant === 'arrived' ? 'approaching' : variant;
 }
 
-/** Translatable text as stored in the database: language tag → string. */
-export type I18nText = Record<string, string>;
+export type { I18nText };
 
 /**
  * A subscription the engine may alert: the device has a push target and may
  * see the route (active route; public, or a membership whose audience
- * includes it). Loaded with the names needed for the notification text.
+ * includes it), or for a live trip the trip (its route, or one of its
+ * audiences). Loaded with the names needed for the notification text.
+ *
+ * Exactly one of `patternId` (a stop of a pattern: every trip of the
+ * pattern, live trips on the pattern included) and `tripInstanceId` (a
+ * planned stop of one live trip) is set.
  */
 export interface Subscription {
   id: string;
   operatorId: string;
   deviceId: string;
-  patternId: string;
+  patternId: string | null;
+  tripInstanceId: string | null;
   stopSequence: number;
   trigger: 'minutes' | 'stops';
   triggerValue: number;
@@ -43,8 +48,9 @@ export interface Subscription {
   /** BCP 47 tag from `device.language`, or null. */
   language: string | null;
   timezone: string;
-  routeId: string;
-  routeName: I18nText;
+  /** null for a live trip without a route. */
+  routeId: string | null;
+  routeName: I18nText | null;
   routeShortName: string | null;
   stopId: string;
   stopName: I18nText;

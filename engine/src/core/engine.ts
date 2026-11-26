@@ -13,20 +13,26 @@
  */
 import type { TripObserver } from '../alerts/types.ts';
 import type { Thresholds } from '../config.ts';
+import type { XY } from '../geo/plane.ts';
 import { distance } from '../geo/plane.ts';
 import type { Logger } from '../log.ts';
 import { errorMessage } from '../log.ts';
-import type { Store } from '../store/store.ts';
+import type { PersistResult, Store } from '../store/store.ts';
 import type { StartStreak } from './assigner.ts';
-import { activeTrip, chooseStart, evaluateStart, startCandidates, windowOpen } from './assigner.ts';
+import {
+  activeTrip, chooseStart, evaluateStart, liveStartCandidates, ownScheduledDue, releasedProgress, scheduledInstance, startCandidates,
+  takeoverEligible, windowOpen,
+} from './assigner.ts';
 import type { Cache } from './cache.ts';
-import { buildCache, progressFromRow } from './cache.ts';
+import { alignStops, buildCache, progressFromRow } from './cache.ts';
 import { computeEtas, expectedProgressAt } from './eta.ts';
+import { itineraryEtas, updateItinerary } from './itinerary.ts';
 import { matchPosition } from './matcher.ts';
 import type { StopChange } from './stops.ts';
 import { allStopsFinal, lastConfirmedStop, updateStops } from './stops.ts';
 import { secondsBetween } from './time.ts';
 import type {
+  TripStatus,
   PositionInput,
   StopEventWrite,
   TripProgress,
@@ -82,6 +88,30 @@ export class Engine {
   readonly #queues = new Map<string, Promise<unknown>>();
   /** Trip starts the database refused (another vehicle runs the trip), per vehicle and trip, until the next reload. */
   readonly #refused = new Set<string>();
+  /**
+   * Live trips the engine released (assigner.ts rule 5), with the start the
+   * database row had: a reload whose snapshot still shows that start (read
+   * before the release committed) is stale and ignored.
+   */
+  readonly #released = new Map<string, Date | null>();
+  /** Releases the database refused while the trip still runs on the vehicle: not tried again until the next reload. */
+  readonly #releaseRefused = new Set<string>();
+  /**
+   * Trips whose database row is truer than memory: a release whose write
+   * failed (it may have committed), or a release refused because staff moved
+   * the trip. The next reload takes their row as it is.
+   */
+  readonly #trustRow = new Set<string>();
+  /**
+   * A takeover whose write failed (it may have committed), by live trip: the
+   * following positions send the same release and start again at once
+   * (idempotent) instead of waiting for the start to be detected again, so
+   * the released trip is never followed meanwhile. Until a write succeeds or
+   * the next reload.
+   */
+  readonly #pendingTakeover = new Map<string, StartOption>();
+  /** Terminal states taken from a refused release before any reload saw them: an older snapshot does not revive the trip. */
+  readonly #endedSeen = new Map<string, TripStatus>();
   /** The last vehicle_state written per vehicle (throttling). */
   readonly #stateWritten = new Map<string, { at: Date; tripInstanceId: string | null; offRoute: boolean }>();
   readonly metrics: EngineMetrics = {
@@ -147,20 +177,42 @@ export class Engine {
       const scheduledVehicleId = row.vehicleId ?? row.defaultVehicleId;
       const existing = this.#trips.get(instance.id);
       if (!existing) {
-        const progress = progressFromRow(row, instance.pattern);
+        const progress = progressFromRow(row, instance);
         // After a restart: the last fix of the vehicle, not only the last accepted one.
         const vehicleFix = progress.vehicleId === null ? undefined : this.#lastFix.get(progress.vehicleId)?.at;
         if (progress.status === 'active' && vehicleFix && (!progress.lastFixAt || vehicleFix > progress.lastFixAt)) progress.lastFixAt = vehicleFix;
         this.#trips.set(instance.id, { instance, scheduledVehicleId, progress });
         continue;
       }
+      const before = existing.instance;
       existing.instance = instance;
       existing.scheduledVehicleId = scheduledVehicleId;
       const mem = existing.progress;
-      if (mem.status === 'planned' || mem.status === 'cancelled') {
+      if (this.#trustRow.delete(instance.id)) {
+        existing.progress = progressFromRow(row, instance);
+        this.#released.delete(instance.id);
+        this.#endedSeen.delete(instance.id);
+        continue;
+      }
+      const ended = this.#endedSeen.get(instance.id);
+      if (ended !== undefined) {
+        if (row.status === 'planned' || row.status === 'active') continue; // An older snapshot: memory is newer.
+        this.#endedSeen.delete(instance.id);
+      }
+      const releasedFrom = this.#released.get(instance.id);
+      if (releasedFrom !== undefined && (row.status !== 'active' || row.startedAt?.getTime() !== releasedFrom?.getTime())) {
+        this.#released.delete(instance.id);
+      }
+      const staleRelease = mem.status === 'planned' && releasedFrom !== undefined && row.status === 'active'
+        && row.vehicleId === mem.vehicleId && row.startedAt?.getTime() === releasedFrom?.getTime();
+      if (staleRelease) {
+        // Read before the release committed: memory is newer.
+        existing.progress = alignStops(mem, { ...row, status: 'planned', startedAt: null, progressM: 0 }, instance, before);
+      } else if (mem.status === 'planned' || mem.status === 'cancelled') {
         // Take the row only if it changed, so a trip start being written
         // right now is not discarded by a stale copy.
-        if (row.status !== mem.status || row.vehicleId !== mem.vehicleId) existing.progress = progressFromRow(row, instance.pattern);
+        if (row.status !== mem.status || row.vehicleId !== mem.vehicleId) existing.progress = progressFromRow(row, instance);
+        else existing.progress = alignStops(mem, row, instance, before);
       } else if (mem.status === 'active' && (row.status === 'cancelled' || row.status === 'completed')) {
         existing.progress = { ...existing.progress, status: row.status, endedAt: row.endedAt ?? existing.progress.endedAt };
         this.#log.info('trip ended in the database', { tripInstanceId: instance.id, status: row.status });
@@ -172,8 +224,16 @@ export class Engine {
         // start being written right now: memory is newer.)
         // The database disagrees about who runs the trip (a staff assignment
         // or driver start elsewhere, or a lost race): the database wins.
-        existing.progress = progressFromRow(row, instance.pattern);
+        existing.progress = progressFromRow(row, instance);
         this.#log.warn('trip taken over from the database', { tripInstanceId: instance.id, status: row.status });
+      } else if (mem.status === 'active' && instance.kind === 'live' && row.vehicleId === null && row.status === 'active') {
+        // Staff took the vehicle off a running live trip (save_live_trip
+        // with "any vehicle"): the trip is released; the vehicle is free.
+        existing.progress = progressFromRow(row, instance);
+        this.#log.warn('live trip released by staff', { tripInstanceId: instance.id });
+      } else if (mem.status === 'active') {
+        // A live trip's planned stops can change while it runs.
+        existing.progress = alignStops(mem, row, instance, before);
       }
     }
     // Drop instances that left the snapshot (past service dates, inactive
@@ -185,6 +245,8 @@ export class Engine {
       for (const id of streaks.keys()) if (this.#trips.get(id)?.progress.status !== 'planned') streaks.delete(id);
     }
     this.#refused.clear();
+    this.#releaseRefused.clear();
+    this.#pendingTakeover.clear();
     this.#cache = cache;
     this.metrics.lastReloadAt = this.#clock.now().toISOString();
     this.#notify((o) => { o.tripsReloaded(this.#trips.values()); });
@@ -235,12 +297,12 @@ export class Engine {
     const jobs: Promise<unknown>[] = [];
     for (const tr of this.#trips.values()) {
       const vehicleId = tr.progress.vehicleId;
-      if (tr.progress.status !== 'active' || vehicleId === null || windowOpen(tr.instance, now, this.#t)) continue;
+      if (tr.progress.status !== 'active' || vehicleId === null || windowOpen(tr, now, this.#t)) continue;
       jobs.push(this.#enqueue(vehicleId, async () => {
         const base = tr.progress;
-        if (base.status !== 'active' || windowOpen(tr.instance, now, this.#t)) return;
+        if (base.status !== 'active' || windowOpen(tr, now, this.#t)) return;
         const next = complete(base, now);
-        const res = await this.#store.persist({ vehicleId, vehicleState: null, trip: tripWrite(tr, next), stopEvents: [], etas: [] });
+        const res = await this.#store.persist({ vehicleId, release: null, vehicleState: null, trip: tripWrite(tr, next), stopEvents: [], etas: [] });
         if (!res.tripApplied) {
           // Not this vehicle's trip any more: take the database's state.
           tr.progress = { ...base, status: 'completed', endedAt: now };
@@ -318,117 +380,74 @@ export class Engine {
     const xy = operator.plane.toXY(p);
     const updates = new Map<TripRuntime, PendingUpdate>();
     let streaks: Map<string, StartStreak> | null = null;
-    const writes: Writes = { vehicleId: vehicle.id, vehicleState: null, trip: null, stopEvents: [], etas: [] };
-    const logs: [string, Record<string, string | number>][] = [];
+    const writes: Writes = { vehicleId: vehicle.id, release: null, vehicleState: null, trip: null, stopEvents: [], etas: [] };
+    const logs: LogLine[] = [];
     let etas: ReadonlyMap<number, Date> = new Map();
 
     // 1. Trip assignment.
     let trip = activeTrip(this.#trips.values(), vehicle.id);
     let progress: TripProgress | null = null;
     let justStarted = false;
-    if (trip && !windowOpen(trip.instance, at, t)) {
+    if (trip && !windowOpen(trip, at, t)) {
       const done = complete(trip.progress, at);
       writes.trip = tripWrite(trip, done);
       updates.set(trip, { base: trip.progress, next: done });
       logs.push(['trip completed', { tripInstanceId: trip.instance.id, reason: 'window_closed' }]);
       trip = undefined;
     }
+    // A live trip started too early (no first planned time, no stop reached)
+    // gives the vehicle back to a due scheduled trip once the bus actually
+    // starts it (the same start detection as without a live trip).
+    let released: TripRuntime | null = null;
+    let takeover: StartOption | undefined;
+    let takeoverStreaks: Map<string, StartStreak> | null = null;
+    if (trip && !this.#releaseRefused.has(trip.instance.id) && takeoverEligible(trip)) {
+      const own = ownScheduledDue(this.#trips.values(), vehicle, at, t, (x) => this.#refused.has(`${vehicle.id}:${x.instance.id}`));
+      const pending = this.#pendingTakeover.get(trip.instance.id);
+      if (pending !== undefined && pending.trip.progress.status === 'planned') {
+        takeover = pending;
+      } else if (own.length > 0) {
+        streaks = new Map();
+        takeover = this.#evaluateStarts(own, this.#streaks.get(vehicle.id), streaks, xy, at, p.speedKmh);
+        takeoverStreaks = streaks;
+      }
+      if (takeover) {
+        writes.release = trip.instance.id;
+        updates.set(trip, { base: trip.progress, next: releasedProgress(trip.progress) });
+        logs.push(['live trip released for a scheduled trip', { tripInstanceId: trip.instance.id, vehicleId: vehicle.id }]);
+        released = trip;
+        trip = undefined;
+      }
+    }
     if (trip) {
       progress = { ...trip.progress };
     } else if (writes.trip === null) {
-      const prevStreaks = this.#streaks.get(vehicle.id);
-      streaks = new Map();
-      const options: { trip: TripRuntime; startM: number; streak: StartStreak | null }[] = [];
-      for (const cand of startCandidates(this.#trips.values(), vehicle, at, t)) {
-        if (this.#refused.has(`${vehicle.id}:${cand.instance.id}`)) continue;
-        const ev = evaluateStart(cand, prevStreaks?.get(cand.instance.id) ?? null, xy, at, p.speedKmh, t);
-        if (ev.streak) streaks.set(cand.instance.id, ev.streak);
-        if (ev.startM !== null) options.push({ trip: cand, startM: ev.startM, streak: ev.streak });
-      }
-      const chosen = chooseStart(options, at);
-      if (chosen) {
-        trip = chosen.trip;
-        streaks.clear();
-        progress = {
-          ...trip.progress,
-          status: 'active',
-          vehicleId: vehicle.id,
-          startedBy: 'schedule',
-          startedAt: at,
-          progressM: Math.max(trip.progress.progressM, chosen.startM),
-          progressAt: at,
-          lastFixAt: at,
-          lastFixXY: xy,
-          awaySince: null,
-          offRouteSince: null,
-          pendingJump: null,
-        };
-        // The bus stood at the first stop before pulling away: it was arrived there.
-        const firstSeq = trip.instance.pattern.stops[0]?.sequence;
-        const since = chosen.streak?.atFirstStopSince ?? null;
-        if (since !== null) {
-          progress.stops = progress.stops.map((s) => (s.sequence === firstSeq && s.state === 'upcoming' ? { ...s, state: 'arrived', arrivedAt: since } : s));
-          const first = progress.stops.find((s) => s.sequence === firstSeq);
-          if (first?.state === 'arrived') {
-            writes.stopEvents.push(stopEventWrite(trip.instance.id, first));
-            logs.push(['stop event', { tripInstanceId: trip.instance.id, stopSequence: first.sequence, state: 'arrived' }]);
-          }
-        }
+      const started = this.#startTrip(vehicle, xy, at, p.speedKmh, takeover);
+      streaks = started.streaks;
+      if (started.trip) {
+        trip = started.trip;
+        progress = started.progress;
+        writes.stopEvents.push(...started.stopEvents);
+        logs.push(...started.logs);
         justStarted = true;
-        logs.push(['trip started', { tripInstanceId: trip.instance.id, vehicleId: vehicle.id }]);
       }
     }
 
     // 2.–4. Match, stop states, ETAs.
     if (trip && progress) {
       const before = trip.progress;
-      const pattern = trip.instance.pattern;
-      let m: number | null;
-      const changes: StopChange[] = [];
-      if (justStarted) {
-        m = progress.progressM;
-      } else {
-        const { m: matched, confirmedHeld, ...state } = matchPosition(
-          pattern.shape, progress, { xy, at, speedKmh: p.speedKmh, course: p.course }, expectedProgressAt(trip.instance, at), t,
-        );
-        m = matched;
-        const progressBefore = progress.progressM;
-        progress = { ...progress, ...state, stops: progress.stops };
-        // Fixes held for confirmation (e.g. a stop dwell) count now, in order.
-        let heldProgress = progressBefore;
-        const lastStop = pattern.stops[pattern.stops.length - 1];
-        for (const h of confirmedHeld) {
-          heldProgress = Math.max(heldProgress, h.m);
-          if (lastStop && h.m >= lastStop.distM - t.arrivedRadiusM) progress.reachedFinalStop = true;
-          const r = updateStops(pattern.stops, progress.stops, { m: h.m, progressM: heldProgress, speedKmh: h.speedKmh, at: h.at, leftFinalStop: false }, t);
-          progress.stops = r.stops;
-          changes.push(...r.changes);
-        }
-        if (before.offRouteSince === null && progress.offRouteSince !== null) {
-          logs.push(['off route', { tripInstanceId: trip.instance.id }]);
-        } else if (before.offRouteSince !== null && progress.offRouteSince === null) {
-          logs.push(['back on route', { tripInstanceId: trip.instance.id }]);
-        }
-      }
-
-      const finalStop = pattern.stops[pattern.stops.length - 1];
-      if (finalStop && m !== null && m >= finalStop.distM - t.arrivedRadiusM) progress.reachedFinalStop = true;
-      if (progress.reachedFinalStop && finalStop !== undefined) {
-        progress.finalLeaveCount = distance(xy, finalStop.point) > t.finalLeaveM ? progress.finalLeaveCount + 1 : 0;
-      }
-      const leftFinalStop = progress.finalLeaveCount >= t.finalLeaveFixes;
-
-      const current = updateStops(pattern.stops, progress.stops, {
-        m, progressM: progress.progressM, speedKmh: p.speedKmh, at, leftFinalStop,
-      }, t);
-      const stops = current.stops;
-      changes.push(...current.changes);
-      progress.stops = stops;
-      progress.lastConfirmedStopSequence = lastConfirmedStop(stops);
+      const r = trip.instance.pattern !== null
+        ? this.#followShape(trip, progress, xy, at, p, justStarted)
+        : trip.instance.itinerary !== null
+          ? this.#followItinerary(trip, progress, xy, at, p)
+          : { progress, changes: [], etas: new Map<number, Date>(), logs: [] };
+      progress = r.progress;
+      etas = r.etas;
+      logs.push(...r.logs);
       // One write per change, in order (a replayed dwell can arrive and
       // depart a stop within one fix).
-      for (const c of changes) {
-        const s = stops.find((x) => x.sequence === c.sequence);
+      for (const c of r.changes) {
+        const s = progress.stops.find((x) => x.sequence === c.sequence);
         if (!s) continue;
         writes.stopEvents.push(stopEventWrite(trip.instance.id, {
           ...s,
@@ -438,13 +457,12 @@ export class Engine {
         }));
         logs.push(['stop event', { tripInstanceId: trip.instance.id, stopSequence: c.sequence, state: c.to }]);
       }
-
-      if (allStopsFinal(stops)) {
+      if (allStopsFinal(progress.stops)) {
         progress = complete(progress, at);
+        etas = new Map();
         logs.push(['trip completed', { tripInstanceId: trip.instance.id, reason: 'last_stop' }]);
-      } else if (progress.offRouteSince === null) {
-        etas = computeEtas(trip.instance, stops, progress.progressM, at, t);
-        progress.stops = stops.map((s) => {
+      } else {
+        progress.stops = progress.stops.map((s) => {
           const eta = etas.get(s.sequence);
           if (eta === undefined) return s;
           if (s.eta !== null && Math.abs(secondsBetween(s.eta, eta)) < t.etaWriteThresholdS) return s;
@@ -484,11 +502,23 @@ export class Engine {
     };
 
     let tripApplied = true;
+    let releaseApplied = true;
+    let releasedRow: PersistResult['releasedRow'] = null;
     if (!isEmpty(writes)) {
       try {
-        tripApplied = (await this.#store.persist(writes)).tripApplied;
+        const res = await this.#store.persist(writes);
+        tripApplied = res.tripApplied;
+        releaseApplied = res.releaseApplied ?? false;
+        releasedRow = res.releasedRow ?? null;
       } catch (err) {
         this.metrics.positionsFailed++;
+        // The release may have committed with only the acknowledgement lost.
+        // A retry of this position finds it released (idempotent); a reload
+        // before any retry takes the row as it is.
+        if (writes.release !== null) {
+          this.#trustRow.add(writes.release);
+          if (takeover) this.#pendingTakeover.set(writes.release, takeover);
+        }
         throw err;
       }
     }
@@ -497,7 +527,41 @@ export class Engine {
     // The trip compared next time is the one the engine assigned (not what the
     // database linked), so a refused trip write does not force a write per fix.
     if (writes.vehicleState) this.#stateWritten.set(vehicle.id, { at, tripInstanceId: activeId, offRoute });
+    if (released !== null) this.#pendingTakeover.delete(released.instance.id);
+    const releaseRefused = released !== null && !releaseApplied;
+    if (releaseRefused && released) {
+      // The database did not take the release, and nothing of a trip start
+      // was written with it. A trip that ended or moved to another vehicle
+      // meanwhile is taken over from the database at once; otherwise memory
+      // keeps its state.
+      this.#log.warn('live trip release not applied', { tripInstanceId: released.instance.id, vehicleId: vehicle.id });
+      const row = releasedRow;
+      const id = released.instance.id;
+      if (row && (row.status === 'cancelled' || row.status === 'completed')) {
+        released.progress = { ...released.progress, status: row.status, endedAt: released.progress.endedAt ?? at };
+        this.#endedSeen.set(id, row.status);
+        this.#trustRow.delete(id);
+      } else if (row && row.vehicleId !== vehicle.id) {
+        // Moved to another vehicle (or to "any vehicle"): nothing of this
+        // vehicle's run stays; the next reload takes the row as it is.
+        released.progress = { ...releasedProgress(released.progress), status: row.status, vehicleId: row.vehicleId };
+        this.#trustRow.add(id);
+      } else {
+        this.#releaseRefused.add(id);
+        this.#trustRow.delete(id);
+      }
+      const progress = released.progress;
+      this.#notify((o) => { o.tripUpdated({ instance: released.instance, progress, etas: new Map(), fixAt: at }); });
+      // The scheduled start was not written: keep its streak, so it starts
+      // with the next position as it would have without the live trip.
+      if (takeoverStreaks !== null) streaks = takeoverStreaks;
+    } else if (released && releaseApplied) {
+      this.#released.set(released.instance.id, released.progress.startedAt);
+      this.#trustRow.delete(released.instance.id);
+    }
     for (const [tr, u] of updates) {
+      // A refused release keeps nothing of this position's trip changes.
+      if (releaseRefused) break;
       if (!tripApplied && writes.trip?.id === tr.instance.id) {
         // Another vehicle runs this trip (or it was cancelled): the database
         // did not take the change, so memory does not either. The next
@@ -508,10 +572,12 @@ export class Engine {
         continue;
       }
       this.#commit(tr, u);
-      // Alerts only from a state that was written and kept.
-      if (tr === trip && tr.progress === u.next) {
+      // Alerts only from a state that was written and kept. A released live
+      // trip is announced as planned (no alerts are due for it then).
+      if ((tr === trip || tr === released) && tr.progress === u.next) {
         const progress = tr.progress;
-        this.#notify((o) => { o.tripUpdated({ instance: tr.instance, progress, etas, fixAt: at }); });
+        const tripEtas = tr === released ? new Map<number, Date>() : etas;
+        this.#notify((o) => { o.tripUpdated({ instance: tr.instance, progress, etas: tripEtas, fixAt: at }); });
       }
     }
     if (streaks !== null) this.#streaks.set(vehicle.id, streaks);
@@ -527,6 +593,186 @@ export class Engine {
     for (const [msg, fields] of logs) this.#log.info(msg, fields);
     return 'processed';
   }
+
+  /**
+   * Which of the candidates the bus starts with this position, if any.
+   * Records each candidate's start streak in `streaks`.
+   */
+  #evaluateStarts(
+    cands: readonly TripRuntime[], prevStreaks: ReadonlyMap<string, StartStreak> | undefined, streaks: Map<string, StartStreak>,
+    xy: XY, at: Date, speedKmh: number,
+  ): StartOption | undefined {
+    const options: StartOption[] = [];
+    for (const cand of cands) {
+      if (cand.instance.pattern === null) {
+        options.push({ trip: cand, startM: 0, streak: null });
+        continue;
+      }
+      const ev = evaluateStart(cand, prevStreaks?.get(cand.instance.id) ?? null, xy, at, speedKmh, this.#t);
+      if (ev.streak) streaks.set(cand.instance.id, ev.streak);
+      if (ev.startM !== null) options.push({ trip: cand, startM: ev.startM, streak: ev.streak });
+    }
+    // Live trips: the earliest due (candidates come sorted); scheduled: the best fit to the schedule.
+    return options[0]?.trip.instance.kind === 'live' ? options[0] : chooseStart(options, at);
+  }
+
+  /**
+   * Starts a trip for a vehicle without a running one (assigner.ts):
+   * a due live trip of the vehicle first, else a scheduled trip. A live
+   * trip on a pattern starts like a scheduled trip (on the first part of
+   * the route, moving); one with planned stops or neither starts at once
+   * (staff planned it for this vehicle; its stops are only reached in order).
+   * A takeover starts the scheduled trip it detected.
+   */
+  #startTrip(vehicle: Vehicle, xy: XY, at: Date, speedKmh: number, takeover?: StartOption): {
+    trip: TripRuntime | null; progress: TripProgress | null; streaks: Map<string, StartStreak>;
+    stopEvents: StopEventWrite[]; logs: LogLine[];
+  } {
+    const t = this.#t;
+    const prevStreaks = this.#streaks.get(vehicle.id);
+    const streaks = new Map<string, StartStreak>();
+    const refused = (tr: TripRuntime): boolean => this.#refused.has(`${vehicle.id}:${tr.instance.id}`);
+    const evaluate = (cands: TripRuntime[]): StartOption | undefined =>
+      this.#evaluateStarts(cands.filter((c) => !refused(c)), prevStreaks, streaks, xy, at, speedKmh);
+    // A takeover starts the scheduled trip it detected (assigner.ts rule 5).
+    const chosen = takeover
+      ?? evaluate(liveStartCandidates(this.#trips.values(), vehicle, at, t, refused))
+      ?? evaluate(startCandidates(this.#trips.values(), vehicle, at, t));
+    if (!chosen) return { trip: null, progress: null, streaks, stopEvents: [], logs: [] };
+    streaks.clear();
+    const trip = chosen.trip;
+    const live = trip.instance.kind === 'live';
+    const progress: TripProgress = {
+      ...trip.progress,
+      status: 'active',
+      vehicleId: vehicle.id,
+      startedBy: live ? trip.progress.startedBy : 'schedule',
+      startedAt: at,
+      progressM: Math.max(trip.progress.progressM, chosen.startM),
+      progressAt: at,
+      lastFixAt: at,
+      lastFixXY: xy,
+      awaySince: null,
+      offRouteSince: null,
+      pendingJump: null,
+    };
+    const stopEvents: StopEventWrite[] = [];
+    const logs: LogLine[] = [];
+    // A live trip on a pattern has no stop events yet (scheduled trips and
+    // planned stops get them in the database): created with the start.
+    if (live && trip.instance.pattern !== null) {
+      for (const s of progress.stops) if (s.state === 'upcoming') stopEvents.push(stopEventWrite(trip.instance.id, s));
+    }
+    // The bus stood at the first stop before pulling away: it was arrived there.
+    const firstSeq = trip.instance.pattern?.stops[0]?.sequence;
+    const since = chosen.streak?.atFirstStopSince ?? null;
+    if (since !== null) {
+      progress.stops = progress.stops.map((s) => (s.sequence === firstSeq && s.state === 'upcoming' ? { ...s, state: 'arrived', arrivedAt: since } : s));
+      const first = progress.stops.find((s) => s.sequence === firstSeq);
+      if (first?.state === 'arrived') {
+        stopEvents.push(stopEventWrite(trip.instance.id, first));
+        logs.push(['stop event', { tripInstanceId: trip.instance.id, stopSequence: first.sequence, state: 'arrived' }]);
+      }
+    }
+    logs.push(['trip started', { tripInstanceId: trip.instance.id, vehicleId: vehicle.id, kind: trip.instance.kind }]);
+    return { trip, progress, streaks, stopEvents, logs };
+  }
+
+  /** A trip with a shape (scheduled, or live on a pattern): route matcher, stop state machine, ETA v1. */
+  #followShape(trip: TripRuntime, start: TripProgress, xy: XY, at: Date, p: PositionInput, justStarted: boolean): FollowResult {
+    const t = this.#t;
+    const pattern = trip.instance.pattern;
+    if (pattern === null) throw new Error('followShape needs a pattern');
+    const before = trip.progress;
+    const timed = scheduledInstance({ ...trip, progress: start });
+    let progress = start;
+    let m: number | null;
+    const changes: StopChange[] = [];
+    const logs: LogLine[] = [];
+    if (justStarted) {
+      m = progress.progressM;
+    } else {
+      const { m: matched, confirmedHeld, ...state } = matchPosition(
+        pattern.shape, progress, { xy, at, speedKmh: p.speedKmh, course: p.course }, expectedProgressAt(timed, at), t,
+      );
+      m = matched;
+      const progressBefore = progress.progressM;
+      progress = { ...progress, ...state, stops: progress.stops };
+      // Fixes held for confirmation (e.g. a stop dwell) count now, in order.
+      let heldProgress = progressBefore;
+      const lastStop = pattern.stops[pattern.stops.length - 1];
+      for (const h of confirmedHeld) {
+        heldProgress = Math.max(heldProgress, h.m);
+        if (lastStop && h.m >= lastStop.distM - t.arrivedRadiusM) progress.reachedFinalStop = true;
+        const r = updateStops(pattern.stops, progress.stops, { m: h.m, progressM: heldProgress, speedKmh: h.speedKmh, at: h.at, leftFinalStop: false }, t);
+        progress.stops = r.stops;
+        changes.push(...r.changes);
+      }
+      if (before.offRouteSince === null && progress.offRouteSince !== null) {
+        logs.push(['off route', { tripInstanceId: trip.instance.id }]);
+      } else if (before.offRouteSince !== null && progress.offRouteSince === null) {
+        logs.push(['back on route', { tripInstanceId: trip.instance.id }]);
+      }
+    }
+
+    const finalStop = pattern.stops[pattern.stops.length - 1];
+    if (finalStop && m !== null && m >= finalStop.distM - t.arrivedRadiusM) progress.reachedFinalStop = true;
+    if (progress.reachedFinalStop && finalStop !== undefined) {
+      progress.finalLeaveCount = distance(xy, finalStop.point) > t.finalLeaveM ? progress.finalLeaveCount + 1 : 0;
+    }
+    const leftFinalStop = progress.finalLeaveCount >= t.finalLeaveFixes;
+
+    const current = updateStops(pattern.stops, progress.stops, {
+      m, progressM: progress.progressM, speedKmh: p.speedKmh, at, leftFinalStop,
+    }, t);
+    changes.push(...current.changes);
+    progress.stops = current.stops;
+    progress.lastConfirmedStopSequence = lastConfirmedStop(current.stops);
+    const etas = progress.offRouteSince === null && !allStopsFinal(current.stops)
+      ? computeEtas(timed, current.stops, progress.progressM, at, t)
+      : new Map<number, Date>();
+    return { progress, changes, etas, logs };
+  }
+
+  /** A live trip with planned stops and no shape (itinerary.ts). */
+  #followItinerary(trip: TripRuntime, start: TripProgress, xy: XY, at: Date, p: PositionInput): FollowResult {
+    const itin = trip.instance.itinerary;
+    if (itin === null) throw new Error('followItinerary needs planned stops');
+    const r = updateItinerary(itin, {
+      stops: start.stops,
+      itinerary: start.itinerary ?? { touchedSeq: null, touchedAt: null, dwell: null },
+      leaveCount: start.finalLeaveCount,
+      progressM: start.progressM,
+    }, { xy, at, speedKmh: p.speedKmh, prevXY: start.lastFixXY }, this.#t);
+    const progress: TripProgress = {
+      ...start,
+      stops: r.stops,
+      itinerary: r.itinerary,
+      finalLeaveCount: r.leaveCount,
+      progressM: r.progressM,
+      progressAt: at,
+      lastFixAt: at,
+      lastFixXY: xy,
+      lastConfirmedStopSequence: lastConfirmedStop(r.stops),
+    };
+    const etas = allStopsFinal(r.stops) ? new Map<number, Date>() : itineraryEtas(itin, r.stops, xy, at, this.#t);
+    return { progress, changes: r.changes, etas, logs: [] };
+  }
+}
+
+type LogLine = [string, Record<string, string | number>];
+
+interface StartOption {
+  trip: TripRuntime;
+  startM: number;
+  streak: StartStreak | null;
+}
+
+interface FollowResult {
+  progress: TripProgress;
+  changes: StopChange[];
+  etas: ReadonlyMap<number, Date>;
+  logs: LogLine[];
 }
 
 function complete(progress: TripProgress, at: Date): TripProgress {

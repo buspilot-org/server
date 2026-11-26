@@ -2,42 +2,204 @@
  * Trip assigner (engine.md, "Trip assigner"): which trip instance a vehicle
  * is running. No candidate → no trip, which is what keeps excursions and
  * extra trips from producing stop events.
+ *
+ * Live trips (engine/README.md, "Live trips") and precedence on one vehicle:
+ * 1. A running (active) trip keeps its vehicle until it ends (last stop,
+ *    window closed, cancelled or completed by staff), whatever its kind:
+ *    nothing pre-empts it.
+ * 2. A vehicle without a running trip starts a due live trip of its own
+ *    before any scheduled trip: staff planned it for this vehicle on purpose
+ *    (an away game after the morning run).
+ * 3. Except: a live trip without a planned time at its first stop (this
+ *    includes every live trip on a pattern) yields to the vehicle's
+ *    scheduled trips. It does not start while a scheduled trip of that
+ *    vehicle is due (window open, not started), only once none is (decided
+ *    2026-11-26). Once started in a gap it keeps the vehicle (rule 1),
+ *    also through later scheduled trips.
+ * 4. So while a live trip runs, no scheduled trip starts on its vehicle; a
+ *    scheduled trip that was not started in its window stays planned.
+ * 5. Except: a running live trip without a planned time at its first stop
+ *    that has reached no stop yet (position-only trips included) is taken
+ *    over when the bus actually starts a due scheduled trip of the vehicle
+ *    (as in rule 3), detected as any scheduled start is (evaluateStart: on
+ *    the first part of the route, moving in route direction). A window
+ *    alone is not enough: a bus far away on an away game is never taken
+ *    over. The live trip goes back to `planned` (its vehicle kept, no
+ *    progress, no ETAs, no alerts) and starts again by rule 3 once no
+ *    scheduled trip is due. Decided 2026-11-26.
+ * Live trips are only followed with a vehicle (`trip_instance.vehicle_id`);
+ * one saved for "any vehicle" waits until staff choose one.
  */
 import type { Thresholds } from '../config.ts';
 import type { XY } from '../geo/plane.ts';
 import { distance } from '../geo/plane.ts';
 import { expectedProgressAt } from './eta.ts';
 import { addSeconds } from './time.ts';
-import type { TripInstance, TripRuntime, Vehicle } from './types.ts';
+import type { TripInstance, TripProgress, TripRuntime, Vehicle } from './types.ts';
 
-export function windowOpen(inst: TripInstance, at: Date, t: Thresholds): boolean {
-  return at >= addSeconds(inst.startAt, -t.tripWindowBeforeS) && at <= addSeconds(inst.endAt, t.tripWindowAfterS);
+/**
+ * When a trip may run: it starts only inside the window, and a running trip
+ * is completed once the window has closed.
+ * - Scheduled: tripWindowBeforeS before the scheduled start to
+ *   tripWindowAfterS after the scheduled end.
+ * - Live: from tripWindowBeforeS before the first planned stop's time, or
+ *   without one from when it was saved (startAt); to tripWindowAfterS after
+ *   the last planned stop's time, or without one after the end of its
+ *   service day; a live trip on a pattern, once started, until its start
+ *   plus the pattern's running time plus tripWindowAfterS.
+ * - Live: never after visible_until (riders no longer see the trip).
+ */
+export function tripWindow(tr: TripRuntime, t: Thresholds): { from: Date; to: Date } {
+  const i = tr.instance;
+  if (i.kind === 'scheduled') return { from: addSeconds(i.startAt, -t.tripWindowBeforeS), to: addSeconds(i.endAt, t.tripWindowAfterS) };
+  const from = i.timedStart ? addSeconds(i.startAt, -t.tripWindowBeforeS) : i.startAt;
+  let to = addSeconds(i.endAt, t.tripWindowAfterS);
+  const started = tr.progress.startedAt;
+  if (!i.timedEnd && i.pattern !== null && started !== null) {
+    to = addSeconds(started, (i.pattern.stops[i.pattern.stops.length - 1]?.arrivalOffsetS ?? 0) + t.tripWindowAfterS);
+  }
+  if (i.visibleUntil !== null && i.visibleUntil < to) to = i.visibleUntil;
+  return { from, to };
 }
 
-/** The vehicle's active trip, if any (the one started first if there are several). */
+export function windowOpen(tr: TripRuntime, at: Date, t: Thresholds): boolean {
+  const w = tripWindow(tr, t);
+  return at >= w.from && at <= w.to;
+}
+
+/**
+ * The time a trip's schedule counts from. Scheduled trips: the scheduled
+ * start. A live trip on a pattern has no start time: the pattern's offsets
+ * count from when it started (before that, from when it may start).
+ */
+export function scheduleStart(tr: TripRuntime): Date {
+  return tr.instance.kind === 'live' ? tr.progress.startedAt ?? tr.instance.startAt : tr.instance.startAt;
+}
+
+/** The instance with startAt moved to scheduleStart, for the pattern-based ETA and tie breaks. */
+export function scheduledInstance(tr: TripRuntime): TripInstance {
+  const startAt = scheduleStart(tr);
+  return startAt === tr.instance.startAt ? tr.instance : { ...tr.instance, startAt };
+}
+
+/**
+ * The vehicle's active trip, if any. Should there be several (only through
+ * changes made in the database), a live trip wins, then the one started first.
+ */
 export function activeTrip(trips: Iterable<TripRuntime>, vehicleId: string): TripRuntime | undefined {
   let found: TripRuntime | undefined;
+  const rank = (tr: TripRuntime): number => (tr.instance.kind === 'live' ? 0 : 1);
   for (const tr of trips) {
     if (tr.progress.status !== 'active' || tr.progress.vehicleId !== vehicleId) continue;
-    if (!found || (tr.progress.startedAt ?? tr.instance.startAt) < (found.progress.startedAt ?? found.instance.startAt)) found = tr;
+    if (
+      !found || rank(tr) < rank(found)
+      || (rank(tr) === rank(found) && (tr.progress.startedAt ?? tr.instance.startAt) < (found.progress.startedAt ?? found.instance.startAt))
+    ) found = tr;
   }
   return found;
 }
 
 /**
- * Planned trips this vehicle may start now: for this vehicle (the instance's
- * vehicle if staff set one, else the trip's default vehicle, else any vehicle
- * of the operator) with an open window.
+ * Planned scheduled trips this vehicle may start now: for this vehicle (the
+ * instance's vehicle if staff set one, else the trip's default vehicle, else
+ * any vehicle of the operator) with an open window.
  */
 export function startCandidates(trips: Iterable<TripRuntime>, vehicle: Vehicle, at: Date, t: Thresholds): TripRuntime[] {
   const out: TripRuntime[] = [];
   for (const tr of trips) {
-    if (tr.progress.status !== 'planned' || tr.instance.operatorId !== vehicle.operatorId) continue;
+    if (tr.instance.kind !== 'scheduled' || tr.progress.status !== 'planned' || tr.instance.operatorId !== vehicle.operatorId) continue;
     const v = tr.progress.vehicleId ?? tr.scheduledVehicleId;
     if (v !== null && v !== vehicle.id) continue;
-    if (windowOpen(tr.instance, at, t)) out.push(tr);
+    if (windowOpen(tr, at, t)) out.push(tr);
   }
   return out;
+}
+
+/**
+ * Planned live trips of this vehicle with an open window, earliest first.
+ * They go before scheduled trips (rule 2 above), except that one without a
+ * first planned time is left out while a scheduled trip of this vehicle is
+ * due (rule 3).
+ */
+export function liveStartCandidates(
+  trips: Iterable<TripRuntime>,
+  vehicle: Vehicle,
+  at: Date,
+  t: Thresholds,
+  /** Scheduled trips the database refused to this vehicle: not due for it. */
+  refused: (tr: TripRuntime) => boolean = () => false,
+): TripRuntime[] {
+  const all = [...trips];
+  const out: TripRuntime[] = [];
+  let scheduledDue: boolean | null = null;
+  for (const tr of all) {
+    if (tr.instance.kind !== 'live' || tr.progress.status !== 'planned' || tr.progress.vehicleId !== vehicle.id) continue;
+    if (tr.instance.operatorId !== vehicle.operatorId || !windowOpen(tr, at, t)) continue;
+    if (!tr.instance.timedStart) {
+      scheduledDue ??= scheduledTripDue(all, vehicle, at, t, refused);
+      if (scheduledDue) continue;
+    }
+    out.push(tr);
+  }
+  return out.sort((a, b) => a.instance.startAt.getTime() - b.instance.startAt.getTime());
+}
+
+/**
+ * Rule 5: this running live trip may be taken over (untimed, reached no
+ * stop). It is, once a due scheduled trip of the vehicle (ownScheduledDue)
+ * actually starts.
+ */
+export function takeoverEligible(tr: TripRuntime): boolean {
+  if (tr.instance.kind !== 'live' || tr.instance.timedStart || tr.progress.status !== 'active') return false;
+  return tr.progress.stops.every((s) => s.state === 'upcoming' || s.state === 'approaching');
+}
+
+/** The state a released live trip goes back to: planned, its vehicle kept, nothing else. */
+export function releasedProgress(p: TripProgress): TripProgress {
+  return {
+    ...p,
+    status: 'planned',
+    startedAt: null,
+    endedAt: null,
+    progressM: 0,
+    progressAt: null,
+    lastFixAt: null,
+    lastFixXY: null,
+    lastConfirmedStopSequence: null,
+    awaySince: null,
+    offRouteSince: null,
+    pendingJump: null,
+    reachedFinalStop: false,
+    finalLeaveCount: 0,
+    stops: p.stops.map((s) => (s.eta === null ? s : { ...s, eta: null })),
+    itinerary: p.itinerary === null ? null : { touchedSeq: null, touchedAt: null, dwell: null },
+  };
+}
+
+/**
+ * A scheduled trip of this vehicle (staff set it for the day, or the trip's
+ * default vehicle) is due: planned, window open. Trips any vehicle may run
+ * do not count.
+ */
+export function scheduledTripDue(
+  trips: Iterable<TripRuntime>,
+  vehicle: Vehicle,
+  at: Date,
+  t: Thresholds,
+  refused: (tr: TripRuntime) => boolean = () => false,
+): boolean {
+  return ownScheduledDue(trips, vehicle, at, t, refused).length > 0;
+}
+
+/** The due scheduled trips of this vehicle (as scheduledTripDue counts them). */
+export function ownScheduledDue(
+  trips: Iterable<TripRuntime>,
+  vehicle: Vehicle,
+  at: Date,
+  t: Thresholds,
+  refused: (tr: TripRuntime) => boolean = () => false,
+): TripRuntime[] {
+  return startCandidates(trips, vehicle, at, t).filter((tr) => (tr.progress.vehicleId ?? tr.scheduledVehicleId) === vehicle.id && !refused(tr));
 }
 
 /** A vehicle's streak of fixes towards starting one trip (kept per vehicle and trip, outside the trip's state). */
@@ -76,6 +238,7 @@ export function evaluateStart(
   t: Thresholds,
 ): StartEvaluation {
   const pattern = tr.instance.pattern;
+  if (pattern === null) return { streak: null, startM: null };
   const proj = pattern.shape.nearest(xy, 0, t.autoStartMaxProgressM);
   if (proj === null || proj.distance > t.onRouteM) return { streak: null, startM: null };
   const first = pattern.stops[0];
@@ -100,7 +263,7 @@ export function chooseStart<T extends { trip: TripRuntime; startM: number }>(opt
   let best: T | undefined;
   let bestScore = Infinity;
   for (const o of options) {
-    const score = Math.abs(expectedProgressAt(o.trip.instance, at) - o.startM);
+    const score = Math.abs(expectedProgressAt(scheduledInstance(o.trip), at) - o.startM);
     if (score < bestScore || (score === bestScore && best && o.trip.instance.startAt < best.trip.instance.startAt)) {
       best = o;
       bestScore = score;

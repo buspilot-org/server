@@ -3,6 +3,10 @@ import type { LocalPlane, Polyline, XY } from '../geo/plane.ts';
 export type StopState = 'upcoming' | 'approaching' | 'arrived' | 'departed' | 'passed';
 export type TripStatus = 'planned' | 'active' | 'completed' | 'cancelled';
 export type StartedBy = 'schedule' | 'driver';
+export type TripKind = 'scheduled' | 'live';
+
+/** Translatable text as stored in the database: language tag → string. */
+export type I18nText = Record<string, string>;
 
 /** Order of `stop_event_state` in the database enum. States only move forward. */
 export const stopStateRank: Record<StopState, number> = {
@@ -50,17 +54,63 @@ export interface Pattern {
   stops: readonly PatternStop[];
 }
 
-/** The static part of a trip instance (from the schedule). */
+/** A planned stop of a live trip without a pattern (`trip_instance_stop`). */
+export interface ItineraryStop {
+  sequence: number;
+  /** Stop position in the operator's plane. */
+  point: XY;
+  /** The stop's location (the plane can change between reloads). */
+  lon: number;
+  lat: number;
+  plannedArrival: Date | null;
+  plannedDeparture: Date | null;
+  /** Straight-line distance from the first planned stop through all stops before (m): progress_m of a trip without a shape. */
+  distM: number;
+}
+
+/** The planned stops of a live trip without a pattern, sorted by sequence (a tour itinerary). */
+export interface Itinerary {
+  stops: readonly ItineraryStop[];
+}
+
+/**
+ * The static part of a trip instance (from the schedule, or a live trip as
+ * staff saved it). How the engine follows it:
+ * - `pattern` set (scheduled trips, live trips on a pattern): the shape;
+ * - else `itinerary` set (live trip with planned stops): the planned stops
+ *   in order (itinerary.ts);
+ * - neither (live trip without route or stops): position only.
+ */
 export interface TripInstance {
   id: string;
   operatorId: string;
   serviceDate: string;
-  tripId: string;
-  pattern: Pattern;
-  /** Scheduled start (instant). */
+  kind: TripKind;
+  /** null for live trips. */
+  tripId: string | null;
+  routeId: string | null;
+  pattern: Pattern | null;
+  itinerary: Itinerary | null;
+  /** Live trips: the title riders see. */
+  title: I18nText | null;
+  /** Live trips: riders see the trip (and get alerts) until then; the engine stops following it then. */
+  visibleUntil: Date | null;
+  /**
+   * Scheduled trips: the scheduled start. Live trips: when the trip may
+   * start: the first planned stop's time if it has one (`timedStart`), else
+   * when it was saved (not before its service day).
+   */
   startAt: Date;
-  /** Scheduled arrival at the last stop. */
+  /**
+   * Scheduled trips: the scheduled arrival at the last stop. Live trips: the
+   * last planned stop's time if it has one (`timedEnd`), else the end of the
+   * service day.
+   */
   endAt: Date;
+  /** Live trips: startAt is the first planned stop's time. */
+  timedStart: boolean;
+  /** Live trips: endAt is the last planned stop's time. */
+  timedEnd: boolean;
 }
 
 export interface StopProgress {
@@ -118,14 +168,26 @@ export interface TripProgress {
   pendingJump: PendingJump | null;
   /** The bus came within arrivedRadiusM of the final stop. */
   reachedFinalStop: boolean;
-  /** Consecutive fixes away from the final stop after reaching it. */
+  /** Consecutive fixes away from the final stop after reaching it (itinerary: from the stop the bus is at). */
   finalLeaveCount: number;
   stops: StopProgress[];
+  /** Live trips without a pattern: matching state along the planned stops (itinerary.ts). */
+  itinerary: ItineraryProgress | null;
+}
+
+/** Order-aware matching state of a trip that follows planned stops (no shape). */
+export interface ItineraryProgress {
+  /** The next stop (sequence) the bus has come near without stopping; null: none. */
+  touchedSeq: number | null;
+  /** When the bus was last near that stop (its `passed_at` if it drives on). */
+  touchedAt: Date | null;
+  /** The bus has been slow near this later stop since `since` (a skip being confirmed). */
+  dwell: { sequence: number; since: Date } | null;
 }
 
 export interface TripRuntime {
   instance: TripInstance;
-  /** Vehicle from the schedule (null = any vehicle of the operator). */
+  /** Vehicle from the schedule (null = any vehicle of the operator). Live trips: the vehicle staff set. */
   scheduledVehicleId: string | null;
   progress: TripProgress;
 }
@@ -194,6 +256,12 @@ export interface Writes {
    * apply to a trip instance this vehicle runs (or that no vehicle runs yet).
    */
   vehicleId: string;
+  /**
+   * A running live trip of this vehicle to put back to `planned` (a due
+   * scheduled trip takes over, assigner.ts rule 5): no progress, no ETAs.
+   * Applied first, only while it has reached no stop.
+   */
+  release: string | null;
   vehicleState: VehicleStateWrite | null;
   trip: TripWrite | null;
   stopEvents: StopEventWrite[];
@@ -201,5 +269,5 @@ export interface Writes {
 }
 
 export function isEmpty(w: Writes): boolean {
-  return w.vehicleState === null && w.trip === null && w.stopEvents.length === 0 && w.etas.length === 0;
+  return w.release === null && w.vehicleState === null && w.trip === null && w.stopEvents.length === 0 && w.etas.length === 0;
 }

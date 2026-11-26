@@ -2,7 +2,7 @@
  * Persistence boundary. `PgStore` (pg.ts) is the real one; tests use an
  * in-memory store with the same semantics.
  */
-import type { StartedBy, StopState, TripStatus, Writes } from '../core/types.ts';
+import type { I18nText, StartedBy, StopState, TripKind, TripStatus, Writes } from '../core/types.ts';
 
 export interface OperatorRow {
   id: string;
@@ -52,14 +52,27 @@ export interface StopEventRow {
   eta: Date | null;
 }
 
+/** A planned stop of a live trip (`trip_instance_stop` with the stop's location). */
+export interface PlannedStopRow {
+  sequence: number;
+  lon: number;
+  lat: number;
+  plannedArrival: Date | null;
+  plannedDeparture: Date | null;
+}
+
 export interface InstanceRow {
   id: string;
   operatorId: string;
   serviceDate: string;
-  tripId: string;
-  patternId: string;
-  /** `trip.start_time`, seconds since the service day start. */
-  startTimeS: number;
+  kind: TripKind;
+  /** null for live trips. */
+  tripId: string | null;
+  /** null for a live trip without a pattern. */
+  patternId: string | null;
+  routeId: string | null;
+  /** `trip.start_time`, seconds since the service day start; null for live trips. */
+  startTimeS: number | null;
   /** Vehicle that runs (or ran) this instance: set when it starts, or by staff for one day. */
   vehicleId: string | null;
   /** The trip's default vehicle (`trip.vehicle_id`), used while the instance has none. */
@@ -73,6 +86,11 @@ export interface InstanceRow {
   startedAt: Date | null;
   endedAt: Date | null;
   stopEvents: StopEventRow[];
+  /** Live trips: title, visible_until, created_at and planned stops (sorted by sequence; empty for scheduled trips). */
+  title: I18nText | null;
+  visibleUntil: Date | null;
+  createdAt: Date;
+  plannedStops: PlannedStopRow[];
 }
 
 export interface SnapshotRows {
@@ -86,13 +104,22 @@ export interface SnapshotRows {
 
 export interface PersistResult {
   tripApplied: boolean;
+  /**
+   * The release (if any) holds: the live trip is planned on this vehicle
+   * (now, or already by an earlier attempt of the same position). When it
+   * does not, only the vehicle state was written (no trip start, stop events
+   * or ETAs in the same write) and `releasedRow` is the trip's state in the
+   * database.
+   */
+  releaseApplied?: boolean;
+  releasedRow?: { status: TripStatus; vehicleId: string | null } | null;
 }
 
 export interface Store {
   /**
    * Everything the engine caches: active vehicles, shapes, patterns and the
-   * scheduled trip instances (any status, so cancellations and completions
-   * made elsewhere are seen) on service dates around `now`.
+   * scheduled and live trip instances (any status, so cancellations and
+   * completions made elsewhere are seen) on service dates around `now`.
    */
   loadSnapshot(now: Date): Promise<SnapshotRows>;
   /**

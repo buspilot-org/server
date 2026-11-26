@@ -19,7 +19,7 @@
  * Whether an alert was already sent is not decided here: the dispatcher
  * claims each one in `alert_delivery` (exactly once).
  */
-import type { Pattern, StopProgress, TripStatus } from '../core/types.ts';
+import type { StopProgress, TripStatus } from '../core/types.ts';
 import { isFinalStopState } from '../core/types.ts';
 import type { AlertVariant, Subscription } from './types.ts';
 
@@ -34,12 +34,13 @@ export interface DueConfig {
 
 export interface DueInput {
   sub: Subscription;
-  pattern: Pattern;
+  /** The trip's stop sequences in order (pattern or planned stops). */
+  sequences: readonly number[];
   tripStatus: TripStatus;
   stops: readonly StopProgress[];
   etas: ReadonlyMap<number, Date>;
-  /** Scheduled arrival at the subscribed stop. */
-  scheduledArrival: Date;
+  /** Scheduled (or planned) arrival at the subscribed stop; null: none, so no `delayed`. */
+  scheduledArrival: Date | null;
   offRoute: boolean;
   fixAt: Date;
   now: Date;
@@ -80,7 +81,7 @@ export function dueAlert(input: DueInput, cfg: DueConfig): DueAlert | null {
   const eta = input.etas.get(sub.stopSequence) ?? null;
   if (triggerReached(input, eta)) return { variant: 'approaching', eta, delayS: null };
 
-  if (cfg.delayThresholdS > 0 && eta !== null && !input.approachingClaimed) {
+  if (cfg.delayThresholdS > 0 && eta !== null && input.scheduledArrival !== null && !input.approachingClaimed) {
     const delayS = (eta.getTime() - input.scheduledArrival.getTime()) / 1000;
     if (delayS >= cfg.delayThresholdS) return { variant: 'delayed', eta, delayS };
   }
@@ -89,20 +90,20 @@ export function dueAlert(input: DueInput, cfg: DueConfig): DueAlert | null {
 
 /**
  * "N minutes before": the ETA is N minutes away or less (inclusive).
- * "N stops before": the stop N places earlier in the pattern is departed or
+ * "N stops before": the stop N places earlier in the trip is departed or
  * passed. Near the start of the trip (fewer than N stops before), the first
  * stop is the trigger (assumption; open point in arrival-alerts.md). The
  * first stop itself has no stop before it: it only gets "the bus is at your
  * stop".
  */
-export function triggerReached(input: Pick<DueInput, 'sub' | 'pattern' | 'stops' | 'now'>, eta: Date | null): boolean {
+export function triggerReached(input: Pick<DueInput, 'sub' | 'sequences' | 'stops' | 'now'>, eta: Date | null): boolean {
   const { sub } = input;
   if (sub.trigger === 'minutes') {
     return eta !== null && eta.getTime() - input.now.getTime() <= sub.triggerValue * 60_000;
   }
-  const idx = input.pattern.stops.findIndex((p) => p.sequence === sub.stopSequence);
+  const idx = input.sequences.indexOf(sub.stopSequence);
   if (idx <= 0) return false;
-  const trigger = input.pattern.stops[Math.max(0, idx - sub.triggerValue)];
-  const state = input.stops.find((s) => s.sequence === trigger?.sequence)?.state;
+  const trigger = input.sequences[Math.max(0, idx - sub.triggerValue)];
+  const state = input.stops.find((s) => s.sequence === trigger)?.state;
   return state !== undefined && isFinalStopState(state);
 }

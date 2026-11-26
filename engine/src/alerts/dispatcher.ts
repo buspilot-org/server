@@ -1,10 +1,12 @@
 /**
  * Alert dispatcher (engine.md, "Alert dispatcher").
  *
- * - Keeps the subscriptions the engine may alert in memory, by pattern
- *   (reloaded every SUBSCRIPTION_RELOAD_SECONDS).
- * - After each processed position, evaluates the subscriptions of the trip's
- *   pattern (due.ts) and, for each due alert, claims it in `alert_delivery`
+ * - Keeps the subscriptions the engine may alert in memory, by pattern and
+ *   by live trip (reloaded every SUBSCRIPTION_RELOAD_SECONDS).
+ * - After each processed position, evaluates the subscriptions of the trip:
+ *   those of its pattern (every trip of the pattern, live trips on it
+ *   included) and those of the trip instance itself (a planned stop of a
+ *   live trip) (due.ts), and, for each due alert, claims it in `alert_delivery`
  *   (`INSERT … ON CONFLICT DO NOTHING`). Only the caller that inserted the
  *   row sends; the result is stored on the row. This makes every alert
  *   exactly-once across positions, retries, restarts and several engine
@@ -15,11 +17,14 @@
  *   `device.push_token`.
  * - On each cache reload: `cancelled` alerts for trip instances staff
  *   cancelled.
+ * - Live trips: nothing once `visible_until` has passed (riders no longer
+ *   see the trip); `delayed` only against planned arrival times.
  *
  * Never blocks or fails position processing: all database and FCM work runs
  * in the background, errors are logged. Logs contain IDs and results, never
  * push targets or positions.
  */
+import { stopSequences } from '../core/cache.ts';
 import type { Clock } from '../core/engine.ts';
 import { addSeconds } from '../core/time.ts';
 import type { StopProgress, TripInstance, TripProgress, TripRuntime } from '../core/types.ts';
@@ -102,6 +107,7 @@ export class AlertDispatcher implements TripObserver {
   readonly #sleep: (ms: number) => Promise<void>;
   readonly #limiter: Limiter;
   #byPattern = new Map<string, Subscription[]>();
+  #byTrip = new Map<string, Subscription[]>();
   /** Keys claimed (or being claimed) by this process, per trip instance: `subscription:stop:kind`. */
   readonly #claimed = new Map<string, Set<string>>();
   /** Latest state per trip instance, to drop retries of alerts that are no longer useful. */
@@ -139,12 +145,16 @@ export class AlertDispatcher implements TripObserver {
   async reloadSubscriptions(): Promise<void> {
     const subs = await this.#store.loadSubscriptions();
     const byPattern = new Map<string, Subscription[]>();
+    const byTrip = new Map<string, Subscription[]>();
     for (const s of subs) {
-      const list = byPattern.get(s.patternId) ?? [];
+      const [map, key] = s.patternId !== null ? [byPattern, s.patternId] : [byTrip, s.tripInstanceId];
+      if (key === null) continue;
+      const list = map.get(key) ?? [];
       list.push(s);
-      byPattern.set(s.patternId, list);
+      map.set(key, list);
     }
     this.#byPattern = byPattern;
+    this.#byTrip = byTrip;
     this.#invalidTargets.clear();
     this.metrics.subscriptions = subs.length;
     this.metrics.lastSubscriptionReloadAt = this.#clock.now().toISOString();
@@ -158,19 +168,19 @@ export class AlertDispatcher implements TripObserver {
   tripUpdated(u: TripUpdate): void {
     try {
       this.#latest.set(u.instance.id, { status: u.progress.status, stops: u.progress.stops });
-      const subs = this.#byPattern.get(u.instance.pattern.id);
-      if (!subs) return;
+      const subs = this.#subsOf(u.instance);
       const now = this.#clock.now();
+      if (subs.length === 0 || hidden(u.instance, now)) return;
+      const sequences = stopSequences(u.instance);
       for (const sub of subs) {
-        const ps = u.instance.pattern.stops.find((p) => p.sequence === sub.stopSequence);
-        if (ps === undefined) continue;
+        if (!sequences.includes(sub.stopSequence)) continue;
         const due = dueAlert({
           sub,
-          pattern: u.instance.pattern,
+          sequences,
           tripStatus: u.progress.status,
           stops: u.progress.stops,
           etas: u.etas,
-          scheduledArrival: addSeconds(u.instance.startAt, ps.arrivalOffsetS),
+          scheduledArrival: scheduledArrival(u.instance, sub.stopSequence),
           offRoute: u.progress.offRouteSince !== null,
           fixAt: u.fixAt,
           now,
@@ -207,19 +217,27 @@ export class AlertDispatcher implements TripObserver {
     }
   }
 
+  #subsOf(instance: TripInstance): Subscription[] {
+    const ofPattern = instance.pattern === null ? undefined : this.#byPattern.get(instance.pattern.id);
+    const ofTrip = this.#byTrip.get(instance.id);
+    return [...(ofPattern ?? []), ...(ofTrip ?? [])];
+  }
+
   #cancelled(instance: TripInstance, progress: TripProgress, now: Date): void {
-    if ((instance.startAt.getTime() - now.getTime()) / 1000 > this.#cfg.cancelLookaheadS) return;
+    if ((instance.startAt.getTime() - now.getTime()) / 1000 > this.#cfg.cancelLookaheadS || hidden(instance, now)) return;
     this.#latest.set(instance.id, { status: progress.status, stops: progress.stops });
-    for (const sub of this.#byPattern.get(instance.pattern.id) ?? []) {
-      const ps = instance.pattern.stops.find((p) => p.sequence === sub.stopSequence);
+    const sequences = stopSequences(instance);
+    for (const sub of this.#subsOf(instance)) {
       const state = progress.stops.find((s) => s.sequence === sub.stopSequence)?.state;
-      if (ps === undefined || state === undefined || isFinalStopState(state) || isMuted(sub, now)) continue;
+      if (!sequences.includes(sub.stopSequence) || state === undefined || isFinalStopState(state) || isMuted(sub, now)) continue;
       // A trip that ran: every stop not yet served (it may run late). A trip
-      // that never started: not once the bus would have been there already.
-      const scheduled = addSeconds(instance.startAt, ps.arrivalOffsetS);
+      // that never started: not once the bus would have been there already
+      // (a live trip without planned times: until the end of its service day).
+      const scheduled = scheduledArrival(instance, sub.stopSequence) ?? instance.endAt;
       const started = progress.startedAt !== null;
       if (!started && scheduled <= now) continue;
-      const expiresAt = started && scheduled < addSeconds(now, 30 * 60) ? addSeconds(now, 30 * 60) : scheduled;
+      let expiresAt = started && scheduled < addSeconds(now, 30 * 60) ? addSeconds(now, 30 * 60) : scheduled;
+      if (instance.visibleUntil !== null && instance.visibleUntil < expiresAt) expiresAt = instance.visibleUntil;
       this.#dispatch({ variant: 'cancelled', sub, instance, eta: null, delayS: null, expiresAt });
     }
   }
@@ -280,8 +298,10 @@ export class AlertDispatcher implements TripObserver {
    */
   #check(p: Pending, now: Date): Pending | null {
     if (now > p.expiresAt) return null;
-    const sub = this.#byPattern.get(p.sub.patternId)?.find((s) => s.id === p.sub.id && s.stopSequence === p.sub.stopSequence);
+    const list = p.sub.patternId !== null ? this.#byPattern.get(p.sub.patternId) : this.#byTrip.get(p.sub.tripInstanceId ?? '');
+    const sub = list?.find((s) => s.id === p.sub.id && s.stopSequence === p.sub.stopSequence);
     if (sub === undefined || isMuted(sub, now) || (p.variant === 'passed' && !sub.notifyPassed)) return null;
+    if (hidden(p.instance, now)) return null;
     if (p.variant === 'passed' || p.variant === 'cancelled') return { ...p, sub };
     const trip = this.#latest.get(p.instance.id);
     if (trip?.status !== 'active') return null;
@@ -305,7 +325,7 @@ export class AlertDispatcher implements TripObserver {
         if (this.#invalidTargets.get(p.sub.deviceId) === p.sub.pushToken) return 'invalid_token';
         const payload = buildPayload({
           variant: p.variant, sub: p.sub, tripInstanceId: p.instance.id, serviceDate: p.instance.serviceDate,
-          tripStart: p.instance.startAt, eta: p.eta, delayS: p.delayS, deliveryId: id, now,
+          tripKind: p.instance.kind, tripTitle: p.instance.title, tripStart: p.instance.startAt, eta: p.eta, delayS: p.delayS, deliveryId: id, now,
           ttlS: (p.expiresAt.getTime() - now.getTime()) / 1000,
         });
         return this.#sender.send({ target: p.sub.pushToken, payload });
@@ -360,4 +380,23 @@ export class AlertDispatcher implements TripObserver {
       this.#log.warn('storing an alert result failed', { alertId: id, result, error: errorMessage(err) });
     }
   }
+}
+
+/** A live trip past visible_until: riders no longer see it, so no alerts. */
+function hidden(instance: TripInstance, now: Date): boolean {
+  return instance.visibleUntil !== null && instance.visibleUntil <= now;
+}
+
+/**
+ * When the bus should be at a stop by the plan: scheduled trips from the
+ * schedule, live trips from the planned arrival (falling back to the
+ * planned departure). A live trip on a pattern has no plan: null.
+ */
+export function scheduledArrival(instance: TripInstance, sequence: number): Date | null {
+  if (instance.kind === 'scheduled') {
+    const ps = instance.pattern?.stops.find((p) => p.sequence === sequence);
+    return ps === undefined ? null : addSeconds(instance.startAt, ps.arrivalOffsetS);
+  }
+  const planned = instance.itinerary?.stops.find((p) => p.sequence === sequence);
+  return planned?.plannedArrival ?? planned?.plannedDeparture ?? null;
 }
