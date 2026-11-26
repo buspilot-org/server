@@ -177,7 +177,7 @@ function buildItinerary(r: InstanceRow, op: Operator): Itinerary {
     const point = op.plane.toXY({ lon: p.lon, lat: p.lat });
     if (prev !== null) distM += distance(prev, point);
     prev = point;
-    return { sequence: p.sequence, point, plannedArrival: p.plannedArrival, plannedDeparture: p.plannedDeparture, distM };
+    return { sequence: p.sequence, point, lon: p.lon, lat: p.lat, plannedArrival: p.plannedArrival, plannedDeparture: p.plannedDeparture, distM };
   });
   return { stops };
 }
@@ -237,11 +237,13 @@ export function progressFromRow(row: InstanceRow, instance: TripInstance): TripP
  */
 export function alignStops(progress: TripProgress, row: InstanceRow, instance: TripInstance, before: TripInstance): TripProgress {
   const sequences = stopSequences(instance);
-  const pointOf = (inst: TripInstance, q: number): XY | undefined => inst.itinerary?.stops.find((s) => s.sequence === q)?.point;
+  // Compared by location, not plane coordinates: the plane of an operator
+  // without shapes moves with the planned stops in the snapshot.
+  const stopOf = (inst: TripInstance, q: number): { lon: number; lat: number } | undefined => inst.itinerary?.stops.find((s) => s.sequence === q);
   const moved = (q: number): boolean => {
-    const a = pointOf(before, q);
-    const b = pointOf(instance, q);
-    return a !== undefined && b !== undefined && distance(a, b) > 1;
+    const a = stopOf(before, q);
+    const b = stopOf(instance, q);
+    return a !== undefined && b !== undefined && (Math.abs(a.lon - b.lon) > 1e-5 || Math.abs(a.lat - b.lat) > 1e-5);
   };
   const same = sequences.length === progress.stops.length && sequences.every((q, i) => progress.stops[i]?.sequence === q && !moved(q));
   if (same && (instance.itinerary === null) === (progress.itinerary === null)) return progress;

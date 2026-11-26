@@ -609,7 +609,7 @@ export class Engine {
       itinerary: start.itinerary ?? { touchedSeq: null, touchedAt: null, dwell: null },
       leaveCount: start.finalLeaveCount,
       progressM: start.progressM,
-    }, { xy, at, speedKmh: p.speedKmh }, this.#t);
+    }, { xy, at, speedKmh: p.speedKmh, prevXY: start.lastFixXY }, this.#t);
     const progress: TripProgress = {
       ...start,
       stops: r.stops,

@@ -59,6 +59,9 @@ export interface ItineraryStop {
   sequence: number;
   /** Stop position in the operator's plane. */
   point: XY;
+  /** The stop's location (the plane can change between reloads). */
+  lon: number;
+  lat: number;
   plannedArrival: Date | null;
   plannedDeparture: Date | null;
   /** Straight-line distance from the first planned stop through all stops before (m): progress_m of a trip without a shape. */

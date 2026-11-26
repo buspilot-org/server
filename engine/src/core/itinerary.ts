@@ -11,16 +11,19 @@
  *   except for the explicit skip rule below.
  * - **Near:** within itineraryArrivedRadiusM of the stop. **Arrived:** near
  *   and slower than arrivedMaxSpeedKmh.
- * - **Passed:** the bus came near the next stop without stopping and then
- *   left it (farther than itineraryLeaveM for itineraryLeaveFixes fixes),
- *   or came nearer to the stop after it; `passed_at` is the last time it
- *   was near.
+ * - **Passed:** the bus came near the next stop without stopping (also
+ *   between two fixes) and then left it (farther than itineraryLeaveM for
+ *   itineraryLeaveFixes fixes), or came nearer to the stop after it;
+ *   `passed_at` is the last time it was near. A drive-by no fix came near:
+ *   passed once the bus, moving, is beyond it on the leg from the stop
+ *   before and comes near the stop after it.
  * - **Skip:** a later stop the bus did not reach in order (a GPS gap, a stop
  *   the bus never came near) is arrived at only after the bus has stood
  *   near it for itinerarySkipDwellS: with a planned time, not earlier than
  *   itinerarySkipEarlyS before it (any later stop); without one, at most
  *   itinerarySkipStops places after the next stop. The stops between are
- *   passed.
+ *   passed. No skip while the bus stands at the stop it is at, and none to
+ *   a stop at the same place as the last stop reached (a loop tour's hotel).
  * - **Departed:** only by leaving: farther than itineraryLeaveM from the
  *   stop for itineraryLeaveFixes fixes in a row, or arriving at a later stop.
  *   Never by time: a long planned stay (10:30–12:00) stays `arrived` however
@@ -46,7 +49,12 @@ export interface ItineraryFix {
   xy: XY;
   at: Date;
   speedKmh: number;
+  /** The previous fix of the trip, if known: a stop between two fixes counts as come near. */
+  prevXY: XY | null;
 }
+
+/** Longest movement between two fixes looked at for "came near" (m). */
+const MAX_SEGMENT_M = 1000;
 
 export interface ItineraryState {
   stops: readonly StopProgress[];
@@ -87,6 +95,18 @@ export function updateItinerary(itin: Itinerary, prev: ItineraryState, fix: Itin
     return p === undefined ? Infinity : distance(fix.xy, p.point);
   };
   const near = (i: number): boolean => dist(i) <= t.itineraryArrivedRadiusM;
+  // Came near between the previous fix and this one (fixes far apart at speed).
+  const seg = fix.prevXY !== null && distance(fix.prevXY, fix.xy) <= MAX_SEGMENT_M ? fix.prevXY : null;
+  const touches = (i: number): boolean => {
+    const p = plan[i];
+    if (p === undefined) return false;
+    return near(i) || (seg !== null && segmentDistance(p.point, seg, fix.xy) <= t.itineraryArrivedRadiusM);
+  };
+  const samePlace = (i: number, j: number): boolean => {
+    const a = plan[i];
+    const b = plan[j];
+    return a !== undefined && b !== undefined && distance(a.point, b.point) <= t.itineraryArrivedRadiusM;
+  };
   const slow = fix.speedKmh < t.arrivedMaxSpeedKmh;
   const set = (i: number, next: Partial<StopProgress>): void => {
     const s = stops[i];
@@ -125,6 +145,9 @@ export function updateItinerary(itin: Itinerary, prev: ItineraryState, fix: Itin
   if (anchor >= 0) {
     leaveCount = dist(anchor) > t.itineraryLeaveM ? leaveCount + 1 : 0;
     if (leaveCount >= t.itineraryLeaveFixes) {
+      // The next stop, come near while the bus stood at this one, stays come near
+      // (passed at the departure at the earliest).
+      const kept = anchor === atStop && touchedAt !== null ? touchedSeq : null;
       if (anchor === atStop) {
         closeBefore(atStop, fix.at);
         set(atStop, { state: 'departed', departedAt: fix.at });
@@ -137,6 +160,10 @@ export function updateItinerary(itin: Itinerary, prev: ItineraryState, fix: Itin
       base = lastReached(stops);
       atStop = -1;
       nxt = base + 1;
+      if (kept !== null && kept === plan[nxt]?.sequence) {
+        touchedSeq = kept;
+        touchedAt = fix.at;
+      }
     }
   } else {
     leaveCount = 0;
@@ -149,7 +176,17 @@ export function updateItinerary(itin: Itinerary, prev: ItineraryState, fix: Itin
     reset();
     nxt++;
   }
-  if (nxt < n && near(nxt)) {
+  // A drive-by no fix came near (fixes far apart, a GPS gap): passed once the
+  // bus, moving, is beyond it on its way from the stop before and comes near
+  // the stop after it. A later stop's circle entered on the way *to* the
+  // next stop does not count: the bus is not beyond the next stop then.
+  if (touchedAt === null && atStop < 0 && !slow && nxt >= 1 && nxt + 1 < n && touches(nxt + 1) && beyond(plan[nxt - 1], plan[nxt], fix.xy)) {
+    closeBefore(nxt, fix.at);
+    set(nxt, { state: 'passed', passedAt: fix.at });
+    reset();
+    nxt++;
+  }
+  if (nxt < n && touches(nxt)) {
     touchedSeq = plan[nxt]?.sequence ?? null;
     touchedAt = fix.at;
   }
@@ -157,22 +194,21 @@ export function updateItinerary(itin: Itinerary, prev: ItineraryState, fix: Itin
   // 3. Arrival: the first stop in plan order the bus may arrive at and is slow near.
   let target = -1;
   let skip = false;
+  // Standing at the stop it is at, the bus skips nothing (the hotel at the end of a loop tour).
+  const standing = atStop >= 0 && near(atStop);
   if (slow) {
     for (let j = nxt; j < n; j++) {
       if (!near(j)) continue;
       if (j === nxt) {
         // At the stop it is at, the bus arrives at the next one only once it is
         // closer to it; at the same place, once its planned time has come.
-        const here = plan[atStop];
-        const there = plan[j];
-        const samePlace = here !== undefined && there !== undefined && distance(here.point, there.point) <= t.itineraryArrivedRadiusM;
-        if (atStop < 0 || !near(atStop) || (samePlace ? due(there, here, fix.at) : dist(j) < dist(atStop))) {
+        if (atStop < 0 || !near(atStop) || (samePlace(j, atStop) ? due(plan[j], plan[atStop], fix.at) : dist(j) < dist(atStop))) {
           target = j;
           break;
         }
         continue;
       }
-      if (skipAllowed(plan[j], j - nxt, fix.at, t)) {
+      if (!standing && (base < 0 || !samePlace(j, base)) && skipAllowed(plan[j], j - nxt, fix.at, t)) {
         target = j;
         skip = true;
         break;
@@ -186,7 +222,8 @@ export function updateItinerary(itin: Itinerary, prev: ItineraryState, fix: Itin
     // A skip: confirmed by standing there.
     if (dwell?.sequence !== targetSeq) dwell = { sequence: targetSeq, since: fix.at };
     if (secondsBetween(dwell.since, fix.at) >= t.itinerarySkipDwellS) arrive(target, dwell.since);
-  } else {
+  } else if (dwell !== null && !near(plan.findIndex((p) => p.sequence === dwell?.sequence))) {
+    // Still standing there with a jittery GPS speed keeps the skip being confirmed.
     dwell = null;
   }
 
@@ -201,6 +238,24 @@ export function updateItinerary(itin: Itinerary, prev: ItineraryState, fix: Itin
     changes.push({ sequence: s.sequence, from: before.state, to: s.state });
   });
   return { stops, itinerary: { touchedSeq, touchedAt, dwell }, leaveCount, progressM, changes };
+}
+
+/** Distance from p to the segment a–b. */
+function segmentDistance(p: XY, a: XY, b: XY): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const len2 = dx * dx + dy * dy;
+  const f = len2 === 0 ? 0 : Math.min(1, Math.max(0, ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2));
+  return distance(p, { x: a.x + f * dx, y: a.y + f * dy });
+}
+
+/** The position projects beyond `to` on the leg from → to. */
+function beyond(from: ItineraryStop | undefined, to: ItineraryStop | undefined, xy: XY): boolean {
+  if (from === undefined || to === undefined) return false;
+  const dx = to.point.x - from.point.x;
+  const dy = to.point.y - from.point.y;
+  const len2 = dx * dx + dy * dy;
+  return len2 > 0 && ((xy.x - from.point.x) * dx + (xy.y - from.point.y) * dy) / len2 > 1;
 }
 
 /** The next stop's planned time (or the current stop's planned departure) has come. */

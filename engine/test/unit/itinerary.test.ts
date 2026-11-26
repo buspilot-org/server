@@ -24,7 +24,7 @@ function itinerary(stops: { sequence: number; at: XY; arr?: Date | null; dep?: D
   const out: ItineraryStop[] = stops.map((s) => {
     if (prev) d += distance(prev, s.at);
     prev = s.at;
-    return { sequence: s.sequence, point: s.at, plannedArrival: s.arr ?? null, plannedDeparture: s.dep ?? null, distM: d };
+    return { sequence: s.sequence, point: s.at, lon: 0, lat: 0, plannedArrival: s.arr ?? null, plannedDeparture: s.dep ?? null, distM: d };
   });
   return { stops: out };
 }
@@ -36,6 +36,7 @@ class Run {
   last: ItineraryResult | null = null;
   time: Date;
   pos: XY;
+  prev: XY | null = null;
   readonly itin: Itinerary;
 
   constructor(itin: Itinerary, start: Date, pos: XY) {
@@ -53,7 +54,8 @@ class Run {
   fix(xy: XY, speedKmh: number, stepS = 10): this {
     this.time = new Date(this.time.getTime() + stepS * 1000);
     this.pos = xy;
-    const r = updateItinerary(this.itin, this.state, { xy, at: this.time, speedKmh }, t);
+    const r = updateItinerary(this.itin, this.state, { xy, at: this.time, speedKmh, prevXY: this.prev }, t);
+    this.prev = xy;
     assert.ok(r.progressM >= this.state.progressM, 'progress only grows');
     for (const c of r.changes) this.log.push(`${c.sequence}:${c.to}`);
     this.state = { stops: r.stops, itinerary: r.itinerary, leaveCount: r.leaveCount, progressM: r.progressM };
@@ -174,7 +176,7 @@ describe('itinerary: order-aware stops without a shape', () => {
     r.drive({ x: 1600, y: 0 }, 30);
     assert.equal(r.stateOf(2), 'passed');
     const passedAt = r.state.stops[1]?.passedAt?.getTime() ?? 0;
-    assert.ok(passedAt >= atB.getTime() && passedAt < atB.getTime() + 15_000, 'passed_at: when the bus was last near the stop');
+    assert.ok(passedAt >= atB.getTime() && passedAt <= atB.getTime() + 30_000, 'passed_at: when the bus was last near the stop');
     r.drive(C, 30).stand(20);
     assert.deepEqual(r.log, ['1:arrived', '1:departed', '2:passed', '3:arrived']);
   });
@@ -226,6 +228,38 @@ describe('itinerary: order-aware stops without a shape', () => {
     assert.equal(r.stateOf(2), 'departed');
     const pickUp = r.state.stops[2]?.arrivedAt?.getTime() ?? 0;
     assert.ok(pickUp >= at(120).getTime() && pickUp < at(121).getTime());
+  });
+
+  it('a loop tour waiting at the hotel: the hotel at the end is not skipped to (untimed, or within an hour of its time)', () => {
+    const untimed = itinerary([{ sequence: 1, at: HOTEL }, { sequence: 2, at: { x: 5000, y: 0 } }, { sequence: 3, at: HOTEL }]);
+    const r = new Run(untimed, T0, HOTEL).stand(20 * 60);
+    assert.deepEqual(r.log, ['1:arrived']);
+    const timed = itinerary([{ sequence: 1, at: HOTEL, dep: at(0) }, { sequence: 2, at: { x: 3000, y: 0 }, arr: at(15) }, { sequence: 3, at: HOTEL, arr: at(45) }]);
+    const r2 = new Run(timed, at(-14), HOTEL).stand(14 * 60);
+    assert.deepEqual(r2.log, ['1:arrived']);
+  });
+
+  it('a drive-by stop next to the stop the bus stood at: passed after the bus left both (not lost)', () => {
+    const plan = itinerary([{ sequence: 1, at: { x: 0, y: 0 } }, { sequence: 2, at: { x: 100, y: 0 } }, { sequence: 3, at: { x: 3000, y: 0 } }]);
+    const r = new Run(plan, T0, { x: 0, y: 0 }).stand(60).drive({ x: 1000, y: 0 }, 30);
+    assert.deepEqual(r.log, ['1:arrived', '1:departed', '2:passed']);
+    const s = r.state.stops;
+    assert.ok((s[1]?.passedAt?.getTime() ?? 0) >= (s[0]?.departedAt?.getTime() ?? Infinity), 'passed after the departure before it');
+  });
+
+  it('drive-bys no fix came near (60 km/h, 10 s fixes): passed once the bus is beyond them; no freeze', () => {
+    const plan = itinerary([
+      { sequence: 1, at: { x: 0, y: 0 } }, { sequence: 2, at: { x: 1083, y: 40 } }, { sequence: 3, at: { x: 3000, y: 0 } },
+      { sequence: 4, at: { x: 5000, y: 0 } }, { sequence: 5, at: { x: 9000, y: 0 } },
+    ]);
+    const r = new Run(plan, T0, { x: 0, y: 0 }).stand(30).drive({ x: 9000, y: 0 }, 60).stand(60);
+    assert.deepEqual(r.log, ['1:arrived', '1:departed', '2:passed', '3:passed', '4:passed', '5:arrived']);
+  });
+
+  it('a later stop whose circle is entered on the way to the next stop, driving through: nothing (the bus is not beyond the next stop)', () => {
+    const plan = itinerary([{ sequence: 1, at: { x: 0, y: 0 } }, { sequence: 2, at: { x: 2000, y: 0 } }, { sequence: 3, at: { x: 1000, y: 40 } }]);
+    const r = new Run(plan, T0, { x: 0, y: 0 }).stand(30).drive({ x: 1500, y: 0 }, 60);
+    assert.deepEqual(r.log, ['1:arrived', '1:departed']);
   });
 
   it('a timed stop far ahead can be skipped to after a GPS gap (standing there, close to its planned time)', () => {
