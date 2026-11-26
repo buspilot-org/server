@@ -67,6 +67,24 @@ describe('precedence', () => {
     assert.deepEqual(startCandidates(all, vehicle, min(1), t).map((x) => x.instance.id), ['S']);
   });
 
+  it('a live trip without a first planned time yields while a scheduled trip of the vehicle is due; a timed one does not', () => {
+    const untimed = trip('L', { kind: 'live', tripId: null, timedStart: false, timedEnd: false, startAt: min(-60), endAt: min(24 * 60) }, { vehicleId: 'v1' });
+    const timed = trip('LT', { kind: 'live', tripId: null, pattern: null, startAt: min(5), endAt: min(60) }, { vehicleId: 'v1' });
+    const ofVehicle = trip('S', {});
+    ofVehicle.scheduledVehicleId = 'v1';
+    const ids = (trips: TripRuntime[], at: Date): string[] => liveStartCandidates(trips, vehicle, at, t).map((x) => x.instance.id);
+    assert.deepEqual(ids([untimed, timed, ofVehicle], min(1)), ['LT'], 'S due (window −15…+40 min)');
+    assert.deepEqual(ids([untimed, ofVehicle], min(-20)), ['L'], 'before S is due');
+    assert.deepEqual(ids([untimed, ofVehicle], min(41)), ['L'], 'after S\'s window');
+    ofVehicle.progress = { ...ofVehicle.progress, status: 'completed' };
+    assert.deepEqual(ids([untimed, ofVehicle], min(1)), ['L'], 'S ended');
+    const anyVehicle = trip('S2', {});
+    assert.deepEqual(ids([untimed, anyVehicle], min(1)), ['L'], 'a trip any vehicle may run does not count');
+    const otherVehicle = trip('S3', {});
+    otherVehicle.scheduledVehicleId = 'v2';
+    assert.deepEqual(ids([untimed, otherVehicle], min(1)), ['L']);
+  });
+
   it('several active trips on one vehicle (only through database changes): the live trip wins', () => {
     const sched = trip('S', {}, { status: 'active', vehicleId: 'v1', startedAt: min(0) });
     const live = trip('L', { kind: 'live', tripId: null, timedStart: false, timedEnd: false }, { status: 'active', vehicleId: 'v1', startedAt: min(5) });

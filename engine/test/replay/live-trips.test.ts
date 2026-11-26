@@ -94,15 +94,56 @@ describe('live trip on a pattern', () => {
 });
 
 describe('precedence on one vehicle', () => {
-  it('both due at once: the live trip starts, the scheduled trip stays planned', async () => {
+  it('both due at once: a live trip with a first planned time starts, the scheduled trip stays planned', async () => {
     const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
-    s.addLiveTrip({ id: 'L1', serviceDate: DATE, onPattern: true });
+    s.addLiveTrip({
+      id: 'L2', serviceDate: DATE, stops: [
+        { sequence: 1, at: { x: 0, y: 0 }, plannedDeparture: local('07:35') },
+        { sequence: 2, at: { x: 2400, y: 0 }, plannedArrival: local('07:45') },
+        { sequence: 3, at: { x: 4000, y: 0 }, plannedArrival: local('07:50') },
+      ],
+    });
     await s.reload();
-    await s.feed(exampleRun(s, 'T1').fixes);
-    assert.equal(s.store.instance('L1').status, 'completed');
+    const run = exampleRun(s, 'T1');
+    await s.feed(run.fixes);
     assert.equal(s.store.instance('T1').status, 'planned');
     assert.deepEqual(s.transitions('T1'), []);
+    assert.equal(s.store.instance('L2').startedAt?.getTime(), run.fixes[0]?.t.getTime());
+    assert.deepEqual(s.transitions('L2').slice(0, 4), ['1:arrived', '1:departed', '2:arrived', '2:departed']);
+  });
+
+  it('a live trip without a first planned time, saved ahead, yields: the due scheduled trip runs; the live trip starts after it', async () => {
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s.addLiveTrip({ id: 'L1', serviceDate: DATE, onPattern: true, createdAt: local('06:00') });
+    await s.reload();
+    await s.feed(exampleRun(s, 'T1').fixes);
+    assert.equal(s.store.instance('T1').status, 'completed');
+    assert.deepEqual(s.transitions('T1'), ALL_SIX);
+    assert.equal(s.store.instance('L1').status, 'planned');
+    // Later that day the bus drives the route again: now the live trip starts.
+    await s.feed(runPattern(s, local('10:00')).fixes);
+    assert.equal(s.store.instance('L1').status, 'completed');
     assert.deepEqual(s.transitions('L1'), ALL_SIX);
+  });
+
+  it('an untimed live trip waits while a scheduled trip of the vehicle is due, even one that never starts, and starts once its window has closed', async () => {
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
+    s.addLiveTrip({ id: 'L3', serviceDate: DATE, createdAt: local('07:00') }); // Position only.
+    await s.reload();
+    // Parked at the depot all morning: T1 (window 07:15–08:16) never starts.
+    await s.feed(new Track(s.shape, local('07:16'), { intervalS: 60 }).dwell(80 * 60).fixes);
+    assert.equal(s.store.instance('T1').status, 'planned');
+    const l3 = s.store.instance('L3');
+    assert.equal(l3.status, 'active');
+    assert.ok(l3.startedAt && l3.startedAt > local('08:16') && l3.startedAt <= local('08:18'), `started ${l3.startedAt?.toISOString() ?? ''}`);
+  });
+
+  it('a trip any vehicle may run does not hold back an untimed live trip', async () => {
+    const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30', vehicleId: null }]));
+    s.addLiveTrip({ id: 'L3', serviceDate: DATE, createdAt: local('07:00') });
+    await s.reload();
+    await s.feed(new Track(s.shape, local('07:20'), { intervalS: 60 }).dwell(120).fixes);
+    assert.equal(s.store.instance('L3').status, 'active');
   });
 
   it('a running scheduled trip is not pre-empted; the live trip starts once it has ended', async () => {
@@ -127,6 +168,9 @@ describe('precedence on one vehicle', () => {
     const s = await Scenario.create(exampleRoute([{ id: 'T1', serviceDate: DATE, start: '07:30' }]));
     s.addLiveTrip({ id: 'L3', serviceDate: DATE }); // Positions only, until the end of the day.
     await s.reload();
+    // Started at 06:30, when no scheduled trip of the vehicle was due.
+    await s.feed(new Track(s.shape, local('06:30'), { intervalS: 60 }).dwell(60).fixes);
+    assert.equal(s.store.instance('L3').status, 'active');
     await s.feed(exampleRun(s, 'T1').fixes);
     assert.equal(s.store.instance('L3').status, 'active');
     assert.equal(s.store.instance('T1').status, 'planned');
