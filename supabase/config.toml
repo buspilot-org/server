@@ -458,7 +458,8 @@ project_id = "xamiinjzlreewnxrwvhx"
 [remotes.demo.db.seed]
 enabled = false
 
-# Pooler size is set by Supabase for the compute size; keep the hosted values.
+# Pinned to the hosted values for the current (free) compute size. Every deploy
+# applies them, so update them here when the compute size changes.
 [remotes.demo.db.pooler]
 default_pool_size = 15
 max_client_conn = 200

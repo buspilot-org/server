@@ -82,13 +82,13 @@ The script replaces the listed years and stops on a holiday name it has no Engli
 | Project | `buspilot-demo`, ref `xamiinjzlreewnxrwvhx` |
 | Plan, region | Free, Tokyo (`ap-northeast-1`), Postgres 17 |
 
-**Deploys.** The Supabase GitHub integration deploys `main` (working directory `.`): merging a pull request applies its new migrations, and the db, api, auth and storage settings of `supabase/config.toml` with the `[remotes.demo]` overrides on top (site URL, redirect URLs, email frequency, pooler size, no vector buckets, no seed). `seed.sql` never runs on the hosted project. Before merging a change to `config.toml`, check what it would change (read-only):
+**Deploys.** The Supabase GitHub integration deploys `main` (working directory `.`): merging a pull request applies its new migrations, and the db, api, auth and storage settings of `supabase/config.toml` with the `[remotes.demo]` overrides on top (for example site URL, redirect URLs, email frequency, pooler size, TOTP, no vector buckets, no seed). `seed.sql` never runs on the hosted project. Before merging a change to `config.toml`, check what it would change (read-only):
 
 ```bash
 npx supabase config diff --remote=xamiinjzlreewnxrwvhx
 ```
 
-Don't run `config push` or `db push` by hand; merging deploys.
+`config diff` compares the email template subject but not the body: after a deploy that changes `supabase/templates/`, check Authentication → Emails → Magic Link (the body must contain `{{ .Token }}`). Don't run `config push` or `db push` by hand; merging deploys, so run `npx supabase db reset` and `npx supabase test db` before merging (there is no CI).
 
 **Set by hand in the dashboard** (not in `config.toml`, so the integration leaves them alone):
 
@@ -97,9 +97,9 @@ Don't run `config push` or `db push` by hand; merging deploys.
 
 Anonymous sign-ins on, email confirmation off, sign-ups allowed and the 6-digit email OTP were also first set by hand; `config.toml` declares the same values.
 
-**Keep-alive.** Free projects are paused after about a week of low database activity. A pg_cron job (`buspilot-keep-alive`, every 6 hours) updates the one row of `private.heartbeat` so the demo stays up between uses (`20261129100000_keep_alive.sql`).
+**Keep-alive.** Free projects are paused after about a week of low database activity. A pg_cron job (`buspilot-keep-alive`, every 6 hours) updates the one row of `private.heartbeat` so the demo stays up between uses (`20261129100000_keep_alive.sql`). Supabase does not define exactly what counts as activity: if the project still pauses after a week without use, add an external ping.
 
-**RLS.** The hosted project enables row-level security on new tables automatically; the local database does not. `supabase/tests/12_hosted_parity_test.sql` fails if a table in `public` has RLS off, so every migration enables it explicitly.
+**RLS.** The hosted project has "enable RLS on new tables automatically" turned on; the local database does not. `supabase/tests/12_hosted_parity_test.sql` fails if a table in `public` has RLS off, so every migration enables it explicitly.
 
 ## Engine
 

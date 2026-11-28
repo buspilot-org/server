@@ -43,7 +43,8 @@ select ok(
 );
 select ok(
   not has_table_privilege('anon', 'private.heartbeat', 'select,insert,update,delete')
-  and not has_table_privilege('authenticated', 'private.heartbeat', 'select,insert,update,delete'),
+  and not has_table_privilege('authenticated', 'private.heartbeat', 'select,insert,update,delete')
+  and not has_table_privilege('service_role', 'private.heartbeat', 'select,insert,update,delete'),
   'API roles have no privileges on heartbeat'
 );
 
