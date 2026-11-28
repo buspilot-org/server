@@ -71,9 +71,35 @@ node supabase/scripts/national-holidays.mjs 2027 2028 > supabase/migrations/<new
 
 The script replaces the listed years and stops on a holiday name it has no English and German translation for (add it to `NAMES` in the script).
 
-### Staff sign-in email (hosted project)
+### Staff sign-in email
 
-`supabase/templates/magic_link.html` puts the code (`{{ .Token }}`) into the sign-in email; `config.toml` uses it locally. In the hosted project set the same template under **Authentication → Emails → Magic Link**: subject `Buspilot ログインコード / sign-in code / Anmeldecode`, body from the file. (`npx supabase config push` also pushes it, together with the rest of `config.toml`; check the diff it shows before confirming.)
+`supabase/templates/magic_link.html` puts the code (`{{ .Token }}`) into the sign-in email (subject `Buspilot ログインコード / sign-in code / Anmeldecode`). `config.toml` uses it locally and on the hosted project.
+
+## Hosted project (demo)
+
+| | |
+|---|---|
+| Project | `buspilot-demo`, ref `xamiinjzlreewnxrwvhx` |
+| Plan, region | Free, Tokyo (`ap-northeast-1`), Postgres 17 |
+
+**Deploys.** The Supabase GitHub integration deploys `main` (working directory `.`): merging a pull request applies its new migrations, and the db, api, auth and storage settings of `supabase/config.toml` with the `[remotes.demo]` overrides on top (site URL, redirect URLs, email frequency, pooler size, no vector buckets, no seed). `seed.sql` never runs on the hosted project. Before merging a change to `config.toml`, check what it would change (read-only):
+
+```bash
+npx supabase config diff --remote=xamiinjzlreewnxrwvhx
+```
+
+Don't run `config push` or `db push` by hand; merging deploys.
+
+**Set by hand in the dashboard** (not in `config.toml`, so the integration leaves them alone):
+
+- custom SMTP through Cloudflare Email Sending (`smtp.mx.cloudflare.net:465`, user `api_token`, sender `noreply@mail.buspilot.org`); the token is only in the dashboard and the team password manager. Keep `[auth.email.smtp]` out of `config.toml`;
+- the email rate limit (Authentication → Rate Limits, 30 emails per hour): the CLI only applies `email_sent` together with SMTP settings.
+
+Anonymous sign-ins on, email confirmation off, sign-ups allowed and the 6-digit email OTP were also first set by hand; `config.toml` declares the same values.
+
+**Keep-alive.** Free projects are paused after about a week of low database activity. A pg_cron job (`buspilot-keep-alive`, every 6 hours) updates the one row of `private.heartbeat` so the demo stays up between uses (`20261129100000_keep_alive.sql`).
+
+**RLS.** The hosted project enables row-level security on new tables automatically; the local database does not. `supabase/tests/12_hosted_parity_test.sql` fails if a table in `public` has RLS off, so every migration enables it explicitly.
 
 ## Engine
 
