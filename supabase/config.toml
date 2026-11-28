@@ -469,8 +469,10 @@ max_client_conn = 200
 enabled = false
 
 [remotes.demo.auth]
-# Until the admin console has a hosted address.
-site_url = "https://buspilot.org"
+# The admin console. Staff sign in with an email code verified in the console
+# (signInWithOtp + verifyOtp), with no redirect back from the email, so no
+# extra redirect URLs are needed.
+site_url = "https://office.buspilot.org"
 additional_redirect_urls = []
 
 [remotes.demo.auth.rate_limit]

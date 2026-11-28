@@ -82,7 +82,7 @@ The script replaces the listed years and stops on a holiday name it has no Engli
 | Project | `buspilot-demo`, ref `xamiinjzlreewnxrwvhx` |
 | Plan, region | Free, Tokyo (`ap-northeast-1`), Postgres 17 |
 
-**Deploys.** The Supabase GitHub integration deploys `main` (working directory `.`): merging a pull request applies its new migrations, and the db, api, auth and storage settings of `supabase/config.toml` with the `[remotes.demo]` overrides on top (for example site URL, redirect URLs, email frequency, pooler size, TOTP, no vector buckets, no seed). `seed.sql` never runs on the hosted project. Before merging a change to `config.toml`, check what it would change (read-only):
+**Deploys.** The Supabase GitHub integration deploys `main` (working directory `.`): merging a pull request applies its new migrations, and the db, api, auth and storage settings of `supabase/config.toml` with the `[remotes.demo]` overrides on top (for example site URL, redirect URLs, email frequency, pooler size, TOTP, no vector buckets, no seed). The site URL is the admin console, `https://office.buspilot.org`; there are no extra redirect URLs, because staff sign in with a code entered in the console, not a link. Emails sent from the dashboard (invite, reset) link to the site URL. `seed.sql` never runs on the hosted project. Before merging a change to `config.toml`, check what it would change (read-only):
 
 ```bash
 npx supabase config diff --remote=xamiinjzlreewnxrwvhx
