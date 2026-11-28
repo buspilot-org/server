@@ -254,8 +254,8 @@ otp_expiry = 3600
 
 # Staff sign in with a 6-digit one-time code (admin console, signInWithOtp
 # with shouldCreateUser: false). The default magic-link email has only a link,
-# so the code ({{ .Token }}) is in our template. The hosted project needs the
-# same template set in the dashboard (README, "Staff sign-in email").
+# so the code ({{ .Token }}) is in our template. The hosted project gets it
+# from here too (see [remotes.demo] at the end of this file).
 [auth.email.template.magic_link]
 subject = "Buspilot ログインコード / sign-in code / Anmeldecode"
 content_path = "./supabase/templates/magic_link.html"
@@ -435,3 +435,60 @@ enabled = true
 # formatted with uppercase keywords, indent 2, max width 180, trailing commas,
 # and column/key alignment. Set to "null" to emit raw, unformatted SQL.
 # format_options = "{\"keywordCase\":\"upper\",\"indent\":2,\"maxWidth\":180,\"commaStyle\":\"trailing\"}"
+
+# ---------------------------------------------------------------------------
+# Hosted project buspilot-demo (free plan, Tokyo). See README, "Hosted project
+# (demo)".
+#
+# The Supabase GitHub integration deploys `main` to this project. On a
+# production deploy it applies new migrations, and it applies this config
+# (db, api, auth, storage) only because this `remotes` entry names the
+# project ID. `supabase config diff` / `config push` against this project use
+# the root config above with the values below on top.
+#
+# Override every local-only value that differs from what hosted needs. Keep
+# SMTP undeclared: it is set by hand in the dashboard (Cloudflare Email
+# Sending), and its token must never be in this file.
+# Check with `npx supabase config diff --remote=xamiinjzlreewnxrwvhx`.
+# ---------------------------------------------------------------------------
+[remotes.demo]
+project_id = "xamiinjzlreewnxrwvhx"
+
+# Never load seed.sql (fictional demo operator, invite code) into hosted.
+[remotes.demo.db.seed]
+enabled = false
+
+# Pinned to the hosted values for the current (free) compute size. Every deploy
+# applies them, so update them here when the compute size changes.
+[remotes.demo.db.pooler]
+default_pool_size = 15
+max_client_conn = 200
+
+# Vector buckets are not available on the free plan.
+[remotes.demo.storage.vector]
+enabled = false
+
+[remotes.demo.auth]
+# The admin console. Staff sign in with an email code verified in the console
+# (signInWithOtp + verifyOtp), with no redirect back from the email, so no
+# extra redirect URLs are needed.
+site_url = "https://office.buspilot.org"
+additional_redirect_urls = []
+
+[remotes.demo.auth.rate_limit]
+# Hosted sends through custom SMTP (Cloudflare), so more than the local 2/hour.
+# The CLI only applies email_sent together with a declared [auth.email.smtp],
+# and SMTP stays undeclared, so this documents the value set by hand in the
+# dashboard (Authentication -> Rate Limits); `config diff` does not compare it.
+email_sent = 30
+
+[remotes.demo.auth.email]
+max_frequency = "60s"
+
+# Keep the hosted defaults (TOTP is free on hosted; SMS is off anyway).
+[remotes.demo.auth.mfa.totp]
+enroll_enabled = true
+verify_enabled = true
+
+[remotes.demo.auth.sms]
+enable_confirmations = true
